@@ -25,6 +25,7 @@ class _TasksPageState extends State<TasksPage> {
   DateTime _selectedDate = DateTime.now();
   DateTime _visibleMonth = DateTime(DateTime.now().year, DateTime.now().month, 1);
   TaskSortMode _sortMode = TaskSortMode.defaultOrder;
+  bool _calendarCollapsed = false;
 
   @override
   void initState() {
@@ -230,16 +231,40 @@ class _TasksPageState extends State<TasksPage> {
       ),
       child: Column(
         children: [
-          _calendar(context),
+          if (!_calendarCollapsed) _calendar(context),
           Padding(
             padding: const EdgeInsets.fromLTRB(20, 2, 20, 10),
             child: Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                Text(
-                  _dayLabel(),
-                  style: const TextStyle(
-                      fontSize: 16, fontWeight: FontWeight.w600),
+                GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: () => setState(
+                      () => _calendarCollapsed = !_calendarCollapsed),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        CupertinoIcons.calendar,
+                        size: 15,
+                        color: CupertinoTheme.of(context).primaryColor,
+                      ),
+                      const SizedBox(width: 6),
+                      Text(
+                        _dayLabel(),
+                        style: const TextStyle(
+                            fontSize: 16, fontWeight: FontWeight.w600),
+                      ),
+                      const SizedBox(width: 4),
+                      Icon(
+                        _calendarCollapsed
+                            ? CupertinoIcons.chevron_down
+                            : CupertinoIcons.chevron_up,
+                        size: 14,
+                        color: CupertinoColors.systemGrey.resolveFrom(context),
+                      ),
+                    ],
+                  ),
                 ),
                 Row(
                   mainAxisSize: MainAxisSize.min,

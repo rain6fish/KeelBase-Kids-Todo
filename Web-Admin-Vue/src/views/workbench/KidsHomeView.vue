@@ -28,6 +28,7 @@
               type="date"
               value-format="YYYY-MM-DD"
               :clearable="false"
+              :editable="false"
               style="width: 150px"
               @change="load"
             />
@@ -89,7 +90,7 @@
           </el-select>
         </el-form-item>
         <el-form-item label="日期">
-          <el-date-picker v-model="editForm.taskDate" type="date" value-format="YYYY-MM-DD" style="width: 100%" />
+          <el-date-picker v-model="editForm.taskDate" type="date" value-format="YYYY-MM-DD" :editable="false" style="width: 100%" />
         </el-form-item>
         <el-form-item label="重复">
           <el-select v-model="editForm.repeatRule" style="width: 100%">
@@ -121,7 +122,7 @@
           </el-select>
         </el-form-item>
         <el-form-item label="日期">
-          <el-date-picker v-model="form.taskDate" type="date" value-format="YYYY-MM-DD" style="width: 100%" />
+          <el-date-picker v-model="form.taskDate" type="date" value-format="YYYY-MM-DD" :editable="false" style="width: 100%" />
         </el-form-item>
         <el-form-item label="重复">
           <el-select v-model="form.repeatRule" style="width: 100%">

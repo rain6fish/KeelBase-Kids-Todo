@@ -228,7 +228,6 @@ class _FamilySettingsPageState extends State<FamilySettingsPage> {
               CupertinoTextField(
                 controller: nicknameCtrl,
                 placeholder: l10n.childNickname,
-                autofocus: true,
                 padding:
                     const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
               ),
