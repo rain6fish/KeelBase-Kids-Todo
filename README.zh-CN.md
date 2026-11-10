@@ -1,356 +1,162 @@
-# KeelBase — 构建并安全运行业务 AI 应用
+# 小计划（Kids Todo）—— 家长和孩子一起用的家庭任务应用
 
-> **构建企业可以信任的 AI 应用——从零构建，或从存量系统出发。** 默认可治理、可审计、可私有部署。
+> **家长安排今天，孩子勾掉今天，两个人在同一条任务里说清楚。** 积分、徽章和奖励，把每天的
+> 小目标变成全家都愿意坚持的小游戏。
 
-<p align="center">
-  <img src="docs/branding/keelbase-governance-landscape-zh.svg" alt="KeelBase 企业 AI 治理架构与价值全景 —— 企业应用（存量 + AI 化，可由 KeelBase 构建）→ Business-safe AI Runtime → AI Agent 与模型服务" width="840">
-</p>
+小计划是基于 [KeelBase](https://github.com/rain6fish/KeelBase) 平台做出来的真实家庭产品。一个家庭
+共用一块任务板：家长布置任务（孩子也可以自己建），孩子完成后打勾，任务下面可以像聊天一样留备注、
+发照片和文件。Web 工作台让家长在电脑上管理同一块板，管理台负责平台侧的用户与数据。
 
-> **开源业务安全 AI 运行时（Business-safe AI Runtime）**——连接 AI Agent 与现有业务系统，**不替换现有技术体系**。
-
-**KeelBase DNA** —— *AI Generates. Architecture Constrains. Runtime Governs. Tests Verify. Humans Decide.*（AI 生成，架构约束，运行时治理，测试验证，人来决断。）业务边界由**运行时**强制，而非提示词；Agent 的**能力 ≠ 它的权限**；信任靠**可运行的验证**证明、不靠声称；重要动作**可恢复**。完整工程哲学见 [docs/keelbase-dna.md](docs/keelbase-dna.md)。
-
-**系列长文** —— 这些决定背后的长文，分「AI 执行治理」「AI 审计证据」两条线：[OSChina 文集](https://my.oschina.net/u/4166179/blog)。
+- 手机 App：Flutter，中文优先
+- 网页工作台 + 管理台：Vue 3 + Element Plus（`/user/`、`/admin/`）
+- 接口：NestJS + TypeORM（生产 PostgreSQL，本地开发 SQLite）
 
 ---
 
-## 🚀 60 秒体验
+## 项目简介
 
-> 想立刻体验？**打开在线演示** → [keelbase-demo](https://demo.keelbase.com.cn/user/)（`alex/Alex@2026$Demo` 工作台，问「哪些客户值得跟进」）。访问指南：[demo-live.md](docs/manual/demo-live.md)。
->
-> 或者**在线观看演示视频** → [官方中文演示（国内）](https://demo.keelbase.com.cn/demo/video-zh.html) · [GitHub Pages](https://rain6fish.github.io/KeelBase/video-zh.html)（约 4 分钟，含真实系统演示；下载：GitHub release）。
->
-> 或者**读系列文章** → [Runtime over Prompt：为什么 System Prompt 不是安全边界](https://rain6fish.github.io/KeelBase/blog/runtime-over-prompt-zh.html) · [为什么 AI 写数据要先分级？R0-R5 工具风险模型](https://rain6fish.github.io/KeelBase/blog/why-ai-writes-need-risk-tiers-zh.html)。
+**小计划**面向 3–12 岁孩子的家庭：家长把每天的学习、生活任务排进日历，孩子用自己的登录账号和
+PIN 登录后完成任务、和家长留言互动；完成任务累计积分与连签，可以兑换家庭奖励。家长可以开启
+「孩子创建的任务需审批」，也能随时修改孩子的登录账号或 PIN。
 
-只装 Docker，一条命令起完整应用（后端 + 工作台 + 管理台 + 移动预览），免构建：
+产品有三种入口：手机上的 Flutter App、浏览器里的 Web 工作台，以及一个只加载网页版 App 的
+Android WebView 壳（日常 UI 改动只需更新网页，不用重打 APK）。
 
-```bash
-docker run -d --name keelbase -p 3000:3000 ghcr.io/rain6fish/keelbase:latest
-```
+## 功能
 
-> 无需 LLM API Key 即可体验：未配置云端/本地模型时，AI 以**确定性演示模式**运行——黄金流程（分析→确认→创建→审计→撤销）开箱即用。配置 DeepSeek/Qwen/OpenAI/Ollama Key（`-e DEEPSEEK_API_KEY=...`）后自动切换真实 LLM。
->
-> **随时重置到干净演示状态**：`docker rm -f keelbase && docker run -d --name keelbase -p 3000:3000 ghcr.io/rain6fish/keelbase:latest`——数据在容器内 SQLite（无 volume），删除容器即清空演示数据，下次启动自动重新 seed。
+**家长**
+- 创建、编辑任务：标题、描述、优先级、日期、预计时长、重复规则、附件。
+- 把任务指派给孩子；开启审批模式后，审批或驳回孩子创建的任务。
+- 管理家庭：家庭名称、邀请码、审批模式、可用时段、家庭状态。
+- 添加孩子（昵称 + 登录账号 + 4–6 位 PIN），随时重置 PIN。
+- 奖励与兑换、每日评价、积分、连签与徽章。
 
-然后按 6 步走完黄金路径：
+**孩子**
+- 用「登录账号 + PIN」登录（首次可填家庭邀请码，之后免填）。
+- 查看今日任务与月历，完成任务、标记未完成、请求帮助。
+- 在任务备注里和家长对话，发送图片和文件。
+- 只能编辑或删除自己创建的任务。
+- 用积分兑换家庭奖励（兑换入口在 Web 工作台）。
+
+**任务列表**
+- 按当前展示顺序自动编号（1、2、3…）。
+- 支持本地排序：优先级（高→低）、状态（待办→进行中→已完成→已取消）、创建时间（新→旧）；
+  默认保持服务端顺序。
+
+**通用**
+- Flutter App 支持离线队列：断网时的改动会在恢复网络后补推。
+- 任务更新走乐观锁（`version`）：携带旧版本的写入会返回 409，而不是无声覆盖别人的修改。
+
+## 任务权限
+
+任务创建者记在 `tasks.user_id`。
+
+| 操作 | 家长 | 孩子 |
+|------|------|------|
+| 编辑 / 撤销完成 / 删除 | 家庭内任何任务 | 只有自己创建的任务（否则 **403**） |
+| 完成 | 可以 | 可以——家长布置给孩子的任务本来就由孩子勾选完成 |
+| 审批 / 驳回 | 可以 | 不可以 |
+
+服务端在 `TasksService` 中强制这套规则；Flutter App 与 Web 工作台按同一规则隐藏不可用的入口。
+家庭边界本身由基于 `familyId` 的 CASL 规则把关。
+
+## 架构
 
 ```text
-1. 打开 http://localhost:3000           （工作台）——/admin 是管理台
-2. 登录——alex/Alex@2026$Demo，或 admin/Admin@2026$KeelBase（所有环境一致）
-3. 提问：「本周哪些客户风险最高？」
-4. 看 AI 分析真实业务数据
-5. 批准一个跟进任务             （人工确认）
-6. 打开审计轨迹                 （每个动作都可查、可撤销）
+Front-Flutter（Android / iOS / Web）─┐
+Web-Admin-Vue（/user/、/admin/）   ──┼── REST /api/v1 ── NestJS + TypeORM ── PostgreSQL（生产）/ SQLite（开发）
+Front-Taro（H5）                   ──┘                          │
+                                                       Redis（可选：缓存 / 队列）
+Front-Shell：Android WebView 壳，加载托管在 /app/ 的 Flutter Web 产物
 ```
-
-想要只读演示站？`./deploy/demo.sh` → http://localhost:8080。
-
----
-
-## 🎯 看 AI 真正干业务
-
-旗舰应用 **AI CRM** 不是 Demo，而是一个可工作的产品闭环：
-
-```text
-你：
-「本周哪些客户风险最高？」
-
-KeelBase AI：
-3 个客户需要关注…
-  → 分析客户风险
-  → 读取授权的订单与跟进记录
-  → 创建跟进任务
-  → 请求你确认
-  → 写入 CRM
-  → 记录审计
-  → 可撤销
-```
-
-一个真实业务场景，胜过罗列二十个功能。
-
----
-
-## 🎯 面向谁
-
-同一个底座，两种用法。
-
-**给 AI 原生开发者**——快速构建 AI 业务应用，而不是从零搭地基：
-- 从一份协议约 30 分钟生成完整业务模块（实体 / CRUD / 权限 / AI 工具 / 审计）——真实、可编辑的代码，不是低代码引擎
-- 自带大模型（云端或本地），数据始终由你掌控
-
-**给已有业务系统的团队 / 集成商**——已有 CRM / ERP / OA 或十年前的 Java 系统，想让它们拥有 AI 能力：
-- 把存量系统桥接进来（OpenAPI / SQL 结构 / Java 服务），无需推翻重来
-- AI 在你真实数据之上做业务助手——风险分析、跟进建议、自动总结、审批
-- 私有化部署：Docker / 离线 / 本地模型——数据不出域
-
-> **独立平台，或连接存量系统**——KeelBase 本身即完整的应用开发平台（从协议生成全栈业务应用），同时也是面向存量系统的业务安全 AI 运行时。无需已有系统。
-
----
-
-## 🔐 业务安全的设计
-
-```text
-用户请求 → AI 理解 → 业务数据 → 工具调用
-        → 权限校验 → 人工确认
-        → 副作用 → 审计 → 撤销
-```
-
-> **AI 可以行动——但只能在明确的业务边界内。**
-
-- **数据范围限定**——每次工具调用携带登录用户上下文；AI 在**该用户的数据范围内**行动（本人的记录，以及在资源为组织级时其所在组织的记录），不出此范围
-- **写操作人工确认**——**风险等级较高**的写操作执行前需人工明确批准；低风险的写按既定策略执行
-- **审计与撤销**——**被审计的动作**落在篡改即断链的审计哈希链上（**审计粒度可配置，默认全记**；应用边界内可验证）；AI 创建的副作用可追踪，**声明了撤销路径的工具**才可撤销
-- **可解释**——「AI 为什么这么做？」由决策轨迹回答，不是黑盒
-
----
-
-## 🏗 Build — 协议驱动生成
-
-从新业务模型或已有系统构建 AI 应用：
-
-- **Application Protocol**——描述应用的人机可读 schema
-- **`keelbase init`**——自然语言 / SQL 结构 / OpenAPI → 协议 → 带权限、AI 工具、确认、审计的完整业务模块
-- **AI Bridge**——连接 Java/存量系统；AI 在治理约束下读写它
-
-> 生成的产物是**普通源代码**。无专有运行时元数据。无拖拽锁定。
-
----
-
-## ▶️ Run — AI 真正干业务
-
-- 工具调用、RAG、记忆、子代理、主动 AI
-- AI 读写**业务数据**——不只是聊天
-- 每个工具调用限定范围、每个写操作确认、每个动作审计
-
----
-
-## 🔒 Trust — 治理与审计
-
-KeelBase 与普通 Agent 框架的区别所在：
-
-- CASL 行级权限 · 工具治理 · 写操作确认
-- 审计哈希链（篡改即断链）· 副作用幂等 · 撤销
-- 决策轨迹 · AI 评测 · 提示词注入防御
-
-### 企业安全验证（Enterprise Safety Validation）
-
-这些不只是承诺——每一项都由仓库自带的可执行测试验证：
-
-- ✓ **权限边界测试**——跨用户访问经 CASL 一律拒绝（越权矩阵逐例断言）
-- ✓ **工具治理测试**——工具滥用 / 确认绕过 / 提示词注入全阻断（安全评测 —— `scripts/verify-security-eval.sh`）
-- ✓ **人工审批测试**——人工确认前写操作绝不落库（Golden Flow e2e）
-- ✓ **审计完整性测试**——审计哈希链可验证、篡改即失败（`/audit/verify`）
-- ✓ **Agent 行为测试**——决策轨迹 + 业务安全 Agent 基准（Run/Trust/Safety 三维，`scripts/benchmark/agent-benchmark.mjs`）
-- ✓ **端到端业务流**——AI CRM：读 → 风险 → 建任务 → 确认 → 写 → 审计 → 撤销（确定性 e2e）
-
-> **边界同样重要**——「审计 / 撤销 / 篡改即断链」承诺什么、**不**承诺什么（如仅应用边界内、不防 DBA/root；撤销按 `revokeClass` 档位，不是跨系统回滚）：[SECURITY.md → 信任边界与不承诺清单（Not-a-*）](SECURITY.md)
-
----
-
-## 🏠 Deploy — 私有化设计
-
-```text
-云端 LLM  或  本地模型 / Ollama
-        → 本地 Embedding → 本地 RAG → 业务安全 Agent → 本地审计
-```
-
-> **当你的数据不能离开环境时，整个 AI 应用都可以本地运行。**
-
-Docker 单容器 · 内网/离线部署 · 本地模型与 Embedding。
-
----
-
-## 🛠 构建你的第一个应用
-
-```bash
-git clone --recurse-submodules https://github.com/rain6fish/KeelBase.git && cd KeelBase
-cd Server-NestJS && npm install && cp .env.example .env && cd ..
-npm run preflight    # 动手前先自检：Node / Docker / 端口 / .env / 契约 submodule
-node scripts/keelbase-init.mjs --spec specs/invoices.json
-```
-
-> `--recurse-submodules` 是必需的：`Server-NestJS/specs/protocol` 是 submodule，存放 wire schema 与协议向量，供**各测试套件**读取。已经 clone 过但漏了参数（或下载的 ZIP —— 压缩包从不含 submodule）？跑 `git submodule update --init --recursive` 补上。`npm run preflight` 会在动手前把这一项与其它环境缺口一并报出来。
-
-自然语言 → 模块规格 → 协议 → 应用代码 → AI 工具 → 治理。CLI 随仓库提供（`scripts/keelbase-init.mjs`），**无需全局安装**；`--desc "…"` 用一句话生成（需配置模型密钥）。
-
-完整流程：[30 分钟验收](docs/manual/30min-acceptance.md) · [开发挑战](docs/manual/dev-challenge.md)
-
----
-
-## 📦 存量系统 AI 化
-
-```text
-已有 DB / OpenAPI / Java 系统
-        → Application Protocol → 生成模块
-        → AI 工具 + 治理 → 业务 Agent
-```
-
-让十年前的业务系统拥有 AI 能力，而无需推翻重来。
-
-### Java Starter（Spring Boot 接入）
-
-面向 Java/Spring 团队：给现有 `@RestController` 方法加 `@KeelbaseTool` 注解，即成为 KeelBase 治理型 AI 工具——委托身份、写操作人工确认、审计与撤销均由 KeelBase 运行时自动落。无需推翻重来。要求 Spring Boot 3.x + Java 17+（Boot 2 / Java 8 走 API 代理路径）。
-
-**入口** —— Maven `cn.com.keelbase:keelbase-spring-boot-starter`（[Maven Central](https://central.sonatype.com/artifact/cn.com.keelbase/keelbase-spring-boot-starter)）→ [github.com/rain6fish/KeelBase-java-starter](https://github.com/rain6fish/KeelBase-java-starter) —— 5 分钟试用、参考项目（CRM / PM / Approval）、开发手册。
-
----
-
-## 🧩 架构
-
-一条主线——**Build → Run → Trust → Private Deploy**：
-
-- **Build（协议驱动生成）**：Application Protocol（约定）；AI 生成业务模块——**AI-native Application Engineering，非传统低代码引擎**
-- **Run（业务安全 Agent 运行时）**：工具调用限定数据范围、写操作人工确认、全链路审计 + 可撤销
-- **Trust / Private Deploy（数据主权）**：数据不出域，AI 每步可查、可撤销
-
-核心与 UI 框架无关；Flutter / Vue / React 都是 Renderer（[架构边界](docs/architecture-boundary.md)）。
-
-## 📍 KeelBase 的位置
-
-> **KeelBase 是业务安全 AI 运行时（Business-safe AI Runtime）**——连接 AI Agent 与现有业务系统，在不替换现有技术体系的前提下，提供身份、治理、审计与私有部署能力。
-
-```text
-      AI 应用 / Agent
-      Agent 框架
-  LangGraph · AutoGen · CrewAI
-  自定义 Agent · MCP 客户端
-                    ▲
-                    │ identity · policy · governance
-                    │ audit · runtime · deployment
-              ┌─────────────┐
-              │  KeelBase   │
-              └─────────────┘
-                    │
-                    │ bridge · protocol · capability mapping
-                    ▼
-      现有业务系统
-      CRM · ERP · OA · MES · Database
-```
-
-- **上（AI 世界，northbound）**：任何 Agent 都能进入治理。Agent 框架经**开放标准（MCP / OpenAPI / 函数调用）**接入——KeelBase 不重造编排、Agent 循环或记忆策略
-- **下（企业世界，southbound）**：任何业务系统都能具备 AI 能力。业务系统经 **Bridge（协议 + 能力映射）** 接入——无需替换
-- **中间（信任层）**：identity · policy · permission · 人工确认 · 副作用控制 · 审计与撤销 · 私有部署
-
----
-
-<!-- BEGIN keelbase-family:zh sha256:7870abdc3207482b1d3d1a8f7018f0479182ac0d42b052cd6496d3be34f4eba1 -->
-## 🧬 KeelBase 家族
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/rain6fish/KeelBase/main/docs/branding/keelbase-family-zh.svg" alt="KeelBase 家族架构图——宿主适配、两个互为平行的 runtime、桥接，以及它们共同消费的契约" width="880">
-</p>
-
-> KeelBase 是**一套协议、多个实现与多种宿主**——不是几个互相竞争的产品。契约是唯一真源，
-> 各 runtime 与各宿主消费它，**谁也不拥有它**。这里每个仓都是 **Apache-2.0**。
-
-```text
-  宿主适配   KeelBase-YuDao
-             └ 在成熟企业平台上补治理层（芋道）
-
-  runtime    KeelBase（TypeScript）  ·  KeelBase4J（Java / Spring）
-             └ 同一协议的两个载体——互为平行，不是翻译关系
-
-  桥接       KeelBase-java-starter
-             └ 把存量 Java/Spring 系统接成受治理的 AI 工具
-
-  契约       keelbase-contract
-             └ 线缆 schema + 一致性向量 + 两者共用的版本线
-```
-
-| 仓 | 角色 | 技术栈 | 状态 |
-|---|---|---|---|
-| [`KeelBase`](https://github.com/rain6fish/KeelBase) | 参考实现 · 产品文档 · 演示 | TypeScript · NestJS · Vue · Flutter · Taro | 活跃 |
-| [`KeelBase4J`](https://github.com/rain6fish/KeelBase4J) | 同一协议的 Java 载体 | Java 17 · Spring Boot | 活跃 |
-| [`KeelBase-java-starter`](https://github.com/rain6fish/KeelBase-java-starter) | 把存量 Java/Spring 系统接成受治理的 AI 工具 | Maven · Gradle | 0.1.x |
-| [`KeelBase-YuDao`](https://github.com/rain6fish/KeelBase-YuDao) | 宿主适配——芋道平台上的治理层 | Java · Vue 3 | 活跃 |
-| [`keelbase-contract`](https://github.com/rain6fish/keelbase-contract) | 协议本体——schema、向量、版本线 | JSON Schema | v1.x |
-
-**从哪里开始** —— 想看它跑起来：[`KeelBase`](https://github.com/rain6fish/KeelBase)（60 秒
-Docker）· 想让存量 Java 系统具备 AI 能力：
-[`KeelBase-java-starter`](https://github.com/rain6fish/KeelBase-java-starter) · 你已经在用芋道：
-[`KeelBase-YuDao`](https://github.com/rain6fish/KeelBase-YuDao) · 想实现这个协议：
-[`keelbase-contract`](https://github.com/rain6fish/keelbase-contract)。
-
-**系列长文** —— 这些决定背后的长文，分「AI 执行治理」「AI 审计证据」两条线：
-[OSChina 文集](https://my.oschina.net/u/4166179/blog)。
-
-每个 runtime 对着哪一版契约应答，**只在主仓维护一处**——见
-[兼容矩阵](https://github.com/rain6fish/KeelBase/blob/main/README.zh-CN.md#-兼容矩阵)。此处不重复。
-<!-- END keelbase-family:zh -->
-
-## 🧭 兼容矩阵
-
-协议有自己的一条版本线，独立于任何 runtime 的版本。下表说明**每个 runtime 对着哪一版契约应答**——
-也就是它已承诺会说哪些对象。这张表**从第一个发布版起就维护**，而不是等有人问才临时拼。
-
-| Runtime | Runtime 版本 | Contract 版本 |
-|---|---|---|
-| **KeelBase**（TypeScript） | `v1.3.0` | **v1.16.0**——以 submodule 绑定 |
-| **KeelBase**（TypeScript） | `v1.2.0` | **v1.12.0**——以 submodule 绑定 |
-| **KeelBase**（TypeScript） | `v1.1.0` | **v1.6.0**——以 submodule 绑定 |
-| **KeelBase**（TypeScript） | `main`，**未发布** | **v1.16.0**——以 submodule 绑定 |
-| **KeelBase**（TypeScript） | `v1.0.11`，已被取代 | **v1.0.1**——树内携带；该发布早于契约仓的建立 |
-| [`KeelBase4J`](https://github.com/rain6fish/KeelBase4J)（Java） | `v0.1.0` | **v1.1.0**——vendor 快照，取自契约仓 |
-
-**落后于当前契约的 runtime 不是坏了**，它只是还没对更新版本的对象应答。推动一个 runtime 前进是
-**自觉的动作**——契约从不自己伸进 runtime。
-
-「未发布」那一行是故意留的：你在挑要部署什么的时候，**已发布的与 `main` 上的差距**正是你需要看见的东西。
-
----
-
-## 📚 文档
-
-> 所有手册提供**中文与 English** 双版本，按需选择。
-
-- **快速开始 快速上手** — [中文](docs/manual/quickstart.md) · [English](docs/manual/quickstart-en.md)
-- **从零到部署教程** — [中文](docs/manual/tutorial.md) · [English](docs/manual/tutorial-en.md)
-- **概念地图** — [中文](docs/manual/concepts.md) · [English](docs/manual/concepts-en.md)
-- **规则地图** — [中文](docs/manual/rules-map.md) · [English](docs/manual/rules-map-en.md)
-- **30 分钟构建 AI CRM** — [中文](docs/manual/onboarding-30min.md) · [English](docs/manual/onboarding-30min-en.md)
-- **30 分钟验收** — [中文](docs/manual/30min-acceptance.md) · [English](docs/manual/30min-acceptance-en.md)
-- **开发者 30 分钟挑战** — [中文](docs/manual/dev-challenge.md) · [English](docs/manual/dev-challenge-en.md)
-- **FAQ 常见问题** — [中文](docs/manual/faq.md) · [English](docs/manual/faq-en.md)
-- **运维手册** — [中文](docs/manual/operations-zh.md) · [English](docs/manual/operations.md)
-- **开发手册** — [中文](docs/manual/development-zh.md) · [English](docs/manual/development.md)
-- **私有 AI 验证** — [中文](docs/manual/private-ai-verification.md) · [English](docs/manual/private-ai-verification-en.md)
-- **三旗舰应用规格** — [中文](docs/flagship-applications.md) · [English](docs/flagship-applications-en.md)
-- **企业能力声明** — [中文](docs/enterprise-capabilities.md) · [English](docs/enterprise-capabilities-en.md)
-- **合规映射** — [中文](docs/manual/compliance-mapping.md) · [English](docs/manual/compliance-mapping-en.md)
-- **产品语言词汇表** — [中文](docs/manual/product-language.md) · [English](docs/manual/product-language-en.md)
-- **架构边界** — [中文](docs/architecture-boundary.md) · [English](docs/architecture-boundary-en.md)
-- **权限架构** — [中文](docs/authorization-architecture.md) · [English](docs/authorization-architecture-en.md)
-- **外部系统对接**
-  - **AI Bridge 存量系统 AI 化** — [中文](docs/manual/ai-bridge.md) · [English](docs/manual/ai-bridge-en.md)
-  - **轻量能力声明** — [中文](docs/manual/capability-declaration.md) · [English](docs/manual/capability-declaration-en.md)
-  - **外部 CRM 接入演示** — [中文](docs/manual/external-crm-demo.md) · [English](docs/manual/external-crm-demo-en.md)
-  - **Agent 框架接入** — [中文](docs/manual/framework-adapter.md) · [English](docs/manual/framework-adapter-en.md)
-  - **Java Starter（Spring Boot 接入）** — 给 Java/Spring 方法加 `@KeelbaseTool` 注解即声明为 KeelBase 治理型 AI 工具：委托身份、读写确认、审计与撤销由 KeelBase 运行时自动落。 → [GitHub: rain6fish/KeelBase-java-starter](https://github.com/rain6fish/KeelBase-java-starter)
-  - **客户场景样板 —— 存量 Java CRM × LangChain4j agent** — 一页拓扑 + 分期 PoC 计划（中英双语）→ [integrator-kit/java-crm-langchain4j-solution.md](docs/integrator-kit/java-crm-langchain4j-solution.md)
-- [CLAUDE.md](CLAUDE.md)（架构与约定）· [AGENTS.md](AGENTS.md)（AI 构建规则）· [SECURITY.md](SECURITY.md)
-- **威胁模型与信任边界** — [中文](docs/security/threat-model.md) · [English](docs/security/threat-model-en.md)
-- **版本策略（公开版本计划）** — [docs/versioning.md](docs/versioning.md)（中英双语）
-- **浏览全部能力 →** [docs/](docs/)
-
----
-
-## 🤝 社区与贡献
-
-- [贡献指南](CONTRIBUTING.md) · [行为准则](CODE_OF_CONDUCT.md) · **Apache-2.0** 协议
-- **问题与需求** → [github.com/rain6fish/KeelBase/issues](https://github.com/rain6fish/KeelBase/issues)
-- 演示账号：`alex/Alex@2026$Demo`（工作台 / 移动端）· `admin/Admin@2026$KeelBase`（管理台）——所有环境一致
 
 ## 目录结构
 
-| 目录 | 说明 |
-|-----------|-------------|
-| `Server-NestJS/` | NestJS 后端（REST API） |
-| `Front-Flutter/` | 主用户 App（Flutter，iOS/Android/Web） |
-| `Front-Taro/` | 主 App 的 H5/小程序端（Taro） |
-| `Web-Admin-Vue/` | Web 端宿主：工作台 + 管理台同一壳（Vue3 + Element Plus） |
-| `Web-Admin-React/` | 管理台 React 预览版（React 19 + MUI） |
-| `docs/` | 规格、需求、手册 |
+| 路径 | 说明 |
+|------|------|
+| `Server-NestJS/` | NestJS 接口：认证、家庭、任务、任务备注、奖励、积分/徽章、统计、离线同步 |
+| `Front-Flutter/` | Flutter App（手机）以及部署到 `/app/` 的 Flutter Web 产物 |
+| `Front-Shell/` | 只加载网页版 App 的 Android WebView 壳 |
+| `Web-Admin-Vue/` | Vue 3 工作台（`/user/`）与管理台（`/admin/`） |
+| `Front-Taro/` | Taro H5 客户端 |
+| `specs/` | 生成小计划业务模块所用的模块协议 |
+| `docs/` | 产品需求、实现规格与平台文档 |
+| `deploy/`、`Dockerfile`、`docker-compose.yml` | 容器构建与部署 |
 
-## 技术栈
+## 快速开始
 
-Flutter 3.x · Vue3 + Element Plus · React 19（预览）· NestJS 11 + TypeORM · SQLite / PostgreSQL · Redis + BullMQ · JWT + CASL · OpenAI 兼容 LLM（DeepSeek / Qwen / OpenAI / Claude / Gemini）· pino + Prometheus + OpenTelemetry · Docker / Nginx · CI（GitHub Actions）
+### Docker
+
+```bash
+cp Server-NestJS/.env.production.example Server-NestJS/.env.production
+# 编辑 .env.production：JWT 密钥、数据库密码等
+docker compose up -d --build
+```
+
+- 接口与健康检查：<http://localhost:3000/api/v1/health>
+- 网页工作台 / 管理台：<http://localhost/user/>、<http://localhost/admin/>
+
+服务启动时自动执行数据库迁移；首次启动会创建平台管理员（见 `Server-NestJS/src/common/seed.ts`）。
+
+### 本地开发
+
+```bash
+# 后端（默认 SQLite）
+cd Server-NestJS
+cp .env.example .env
+npm ci
+npm run start:dev
+
+# Web 工作台 + 管理台
+cd Web-Admin-Vue
+npm ci
+npm run dev                 # http://localhost:10086/admin/
+npm run dev -- --mode user  # http://localhost:10086/user/
+
+# Flutter App
+cd Front-Flutter
+flutter pub get
+flutter run                 # 或：flutter run -d chrome
+```
+
+在 App 里注册家长账号会自动创建家庭和邀请码；在「家庭」页添加孩子后，孩子即可用登录账号 + PIN
+登录。
+
+## 测试
+
+```bash
+cd Server-NestJS && npm run build && npx jest src/tasks --forceExit
+cd Front-Flutter && flutter analyze && flutter test
+cd Web-Admin-Vue && npm run typecheck && npm run build
+cd Front-Taro && npm run build:h5
+```
+
+## 部署要点
+
+- **后端**：`docker build --platform linux/amd64 --target server -t <tag> .`，把镜像推到服务器后
+  修改 `docker-compose.yml` 的镜像 tag；容器需要 `Server-NestJS/.env.production`。
+- **网页**：`npm run build:user`（base `/user/`）与 `npm run build:admin`（base `/admin/`），
+  把两个 `dist/` 目录交给 nginx 托管。
+- **手机端**：从 `Front-Flutter` 打 APK；或者保留 `Front-Shell` 壳，日常 UI 改动只更新 `/app/`
+  下的 Flutter Web 产物，不重打 APK。
+- Flutter Web 构建：
+  `flutter build web --release --base-href /app/ --pwa-strategy=none --dart-define=API_BASE_URL=<接口地址>`
+
+## 文档
+
+- [需求确认书](docs/kids-todo-requirements.md)
+- [实现规格](docs/kids-todo.spec.md)
+- [平台开发指南](CLAUDE.md)与 [Agent 规则](AGENTS.md)
+
+## 当前状态
+
+已实现：任务、备注与附件、审批、家庭管理、积分/徽章/奖励、统计、Flutter 端离线同步、任务权限、
+列表序号与排序。
+
+未实现：任务定时提醒（需要 Redis + `QUEUE_ENABLED=true`）、Web 与 Taro 端的离线队列、徽章管理界面。
+
+## 许可证与致谢
+
+Apache License 2.0，见 [LICENSE](LICENSE)。本项目构建在 KeelBase 平台
+（<https://github.com/rain6fish/KeelBase>）之上，上游版权与声明继续有效；第三方组件见
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
