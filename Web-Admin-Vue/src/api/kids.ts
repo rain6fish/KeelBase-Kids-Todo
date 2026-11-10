@@ -71,7 +71,8 @@ export interface KidsStats {
 }
 
 export const kidsApi = {
-  tasks: () => api.get('/tasks') as Promise<KidsTask[]>,
+  tasks: (date?: string) =>
+    api.get('/tasks', date ? { date } : undefined) as Promise<KidsTask[]>,
   createTask: (payload: Record<string, unknown>) => api.post('/tasks', payload),
   updateTask: (id: number, payload: Record<string, unknown>) => api.patch(`/tasks/${id}`, payload),
   completeTask: (id: number) => api.patch(`/tasks/${id}/complete`, {}),
@@ -94,6 +95,7 @@ export const kidsApi = {
   reviews: () => api.get('/daily_reviews') as Promise<KidsReview[]>,
   createReview: (payload: Record<string, unknown>) => api.post('/daily_reviews', payload),
 
-  stats: () => api.get('/stats/overview') as Promise<KidsStats>,
+  stats: (date?: string) =>
+    api.get('/stats/overview', date ? { date } : undefined) as Promise<KidsStats>,
   streak: () => api.get('/stats/streak') as Promise<Record<string, unknown>>,
 }

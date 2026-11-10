@@ -5,7 +5,7 @@
 
     <el-row :gutter="16">
       <el-col :xs="24" :sm="12" :md="6">
-        <StatCard label="今日完成" :value="`${stats.done} / ${stats.total}`" icon="mdi-check-circle-outline" color="success" />
+        <StatCard :label="selectedDate === todayLocal ? '今日完成' : '当日完成'" :value="`${stats.done} / ${stats.total}`" icon="mdi-check-circle-outline" color="success" />
       </el-col>
       <el-col :xs="24" :sm="12" :md="6">
         <StatCard label="完成率" :value="`${Math.round(stats.completionRate * 100)}%`" icon="mdi-chart-donut" color="primary" />
@@ -21,7 +21,18 @@
     <el-card class="mt-4" shadow="never">
       <template #header>
         <div class="d-flex align-center justify-space-between">
-          <span class="text-h6">今日任务</span>
+          <div class="d-flex align-center" style="gap: 12px">
+            <span class="text-h6">{{ cardTitle }}</span>
+            <el-date-picker
+              v-model="selectedDate"
+              type="date"
+              value-format="YYYY-MM-DD"
+              :clearable="false"
+              style="width: 150px"
+              @change="load"
+            />
+            <el-button v-if="selectedDate !== todayLocal" size="small" text @click="goToday">回到今天</el-button>
+          </div>
           <el-button type="primary" @click="openCreate">
             <AppIcon icon="mdi-plus" class="mr-1" />新建任务
           </el-button>
@@ -54,7 +65,7 @@
           </template>
         </el-table-column>
       </el-table>
-      <el-empty v-if="!tasks.length" description="今天还没有任务" />
+      <el-empty v-if="!tasks.length" :description="selectedDate === todayLocal ? '今天还没有任务' : '这一天还没有任务'" />
     </el-card>
 
     <el-dialog v-model="editOpen" title="编辑任务" width="480">
@@ -138,12 +149,22 @@ const stats = ref<KidsStats>({ total: 0, done: 0, completionRate: 0, members: 0,
 const createOpen = ref(false)
 const editOpen = ref(false)
 const editRow = ref<KidsTask | null>(null)
-const today = new Date().toISOString().slice(0, 10)
+
+/** 按本地时区取日期，避免 toISOString() 在 UTC 下把凌晨算成昨天。 */
+function localDateString(d: Date) {
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+}
+const todayLocal = computed(() => localDateString(new Date()))
+const selectedDate = ref(todayLocal.value)
+const cardTitle = computed(() =>
+  selectedDate.value === todayLocal.value ? '今日任务' : `${selectedDate.value} 任务`,
+)
 const form = reactive({
   title: '',
   priority: 'medium',
   assigneeId: undefined as number | undefined,
-  taskDate: today,
+  taskDate: selectedDate.value,
   estimatedMinutes: 20,
 })
 const editForm = reactive({
@@ -151,7 +172,7 @@ const editForm = reactive({
   description: '',
   priority: 'medium',
   assigneeId: undefined as number | undefined,
-  taskDate: today,
+  taskDate: selectedDate.value,
 })
 const children = computed(() => members.value.filter((m) => m.familyRole === 'child'))
 
@@ -187,8 +208,8 @@ async function load() {
   loading.value = true
   try {
     const [taskList, overview, family] = await Promise.all([
-      kidsApi.tasks(),
-      kidsApi.stats(),
+      kidsApi.tasks(selectedDate.value),
+      kidsApi.stats(selectedDate.value),
       kidsApi.family(),
     ])
     tasks.value = taskList
@@ -201,11 +222,16 @@ async function load() {
   }
 }
 
+function goToday() {
+  selectedDate.value = todayLocal.value
+  load()
+}
+
 function openCreate() {
   form.title = ''
   form.priority = 'medium'
   form.assigneeId = children.value[0]?.id
-  form.taskDate = today
+  form.taskDate = selectedDate.value
   form.estimatedMinutes = 20
   createOpen.value = true
 }
@@ -244,7 +270,7 @@ function openEdit(row: KidsTask) {
   editForm.description = row.description ?? ''
   editForm.priority = row.priority
   editForm.assigneeId = row.assigneeId ?? undefined
-  editForm.taskDate = (row.taskDate ?? today).slice(0, 10)
+  editForm.taskDate = (row.taskDate ?? todayLocal.value).slice(0, 10)
   editOpen.value = true
 }
 
