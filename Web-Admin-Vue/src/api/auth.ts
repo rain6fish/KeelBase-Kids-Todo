@@ -1,0 +1,92 @@
+// SPDX-License-Identifier: Apache-2.0
+
+import { api } from './client'
+import type { AuthUser, LoginResult } from '@/types/api'
+
+/** Explainable Authz：对 action×resource 的服务端决策 + 依据（POST /auth/permissions/explain） */
+export interface ExplainResult {
+  action: string
+  subject: string
+  allowed: boolean
+  reason: string
+  deniedBy: 'casl' | null
+}
+
+/** B1：管理员为目标用户反查权限决策依据（POST /auth/permissions/explain/target） */
+export interface ExplainTargetResult extends ExplainResult {
+  userId: number
+  username: string
+}
+
+/** Explainable Authz：当前用户能力清单（GET /auth/me/permissions，wire schema 见 specs/protocol/schemas/v1/permission-capability-list.schema.json） */
+export interface MyPermissions {
+  role: string
+  basis: string
+  resources: { subject: string; scope: 'all' | 'own'; actions: string[]; reason: string }[]
+}
+
+/** §internal.16 A-5 授权链图：授权者→被授权者→策略→资源→生效期 */
+export interface AuthorizationChain {
+  user: { id: number; username: string | null; role: string }
+  grants: Array<{ policy: string; resource: string; scope: string }>
+  toolPolicies: Array<{ toolName: string; enabled: boolean; allowedRoles: string[]; riskLevel?: string }>
+  effectiveSince: string | null
+}
+
+/** 孩子登录接口要求 deviceId（/^[A-Za-z0-9-]{1,64}$/）：浏览器持久化一个稳定值。 */
+function browserDeviceId(): string {
+  const key = 'kids_device_id'
+  let id = localStorage.getItem(key)
+  if (!id) {
+    id = `web-${crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2)}`
+    localStorage.setItem(key, id)
+  }
+  return id.slice(0, 64)
+}
+
+export const authApi = {
+  login(username: string, password: string): Promise<LoginResult> {
+    return api.post<LoginResult>('/auth/login', { username, password })
+  },
+  /** 孩子登录：登录账号 + PIN（邀请码选填，接口要求 deviceId，浏览器端持久化一个） */
+  childLogin(username: string, pin: string, inviteCode?: string): Promise<LoginResult> {
+    return api.post<LoginResult>('/auth/child-login', {
+      ...(inviteCode ? { inviteCode } : {}),
+      username,
+      pin,
+      deviceId: browserDeviceId(),
+    })
+  },
+  /** 登录页访问统计：记录 IP/OS/浏览器/时间（服务端写文件，失败静默不影响登录） */
+  loginStats(): Promise<{ ok: boolean }> {
+    return api.post('/auth/login-stats', { userAgent: navigator.userAgent })
+  },
+  me(): Promise<AuthUser> {
+    return api.get<AuthUser>('/auth/me')
+  },
+  myPermissions(): Promise<MyPermissions> {
+    return api.get<MyPermissions>('/auth/me/permissions')
+  },
+  /** §internal.16 A-5 授权链图：本人（或 admin ?userId 反查）完整授权链 */
+  authorizationChain(userId?: number): Promise<AuthorizationChain> {
+    return api.get<AuthorizationChain>('/auth/permissions/chain', { ...(userId ? { userId } : {}) })
+  },
+  logout(): Promise<null> {
+    return api.post<null>('/auth/logout')
+  },
+  explain(action: string, subject: string): Promise<ExplainResult> {
+    return api.post<ExplainResult>('/auth/permissions/explain', { action, subject })
+  },
+  explainTarget(userId: number, action: string, subject: string): Promise<ExplainTargetResult> {
+    return api.post<ExplainTargetResult>('/auth/permissions/explain/target', { userId, action, subject })
+  },
+  oauthProviders(): Promise<{ enabledProviders: string[]; providers: unknown[]; groups: Record<string, unknown[]> }> {
+    return api.get('/auth/oauth/providers')
+  },
+  oidcUrl(redirectUri: string): Promise<{ url: string }> {
+    return api.get('/auth/oauth/oidc/url', { redirectUri })
+  },
+  oidcLogin(code: string, redirectUri: string): Promise<LoginResult> {
+    return api.post<LoginResult>('/auth/oauth', { provider: 'oidc', authorizationCode: code, redirectUri })
+  },
+}

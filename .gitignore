@@ -1,0 +1,109 @@
+# Dependencies
+node_modules/
+.pub-cache/
+
+# Python（scripts/subset-cjk-font.py 等工具脚本的字节码缓存）
+__pycache__/
+*.pyc
+
+# Build output
+dist/
+build/
+*.js.map
+*.d.ts
+
+# Environment
+.env
+.env.local
+.env.test
+.env.staging
+.env.production
+.env.private-ai
+
+# IDE
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+
+# AI Tooling / Agent workspace
+# .claude/ 其余内容保留本地状态不追踪；但项目技能目录（AGENTS.md §skill / ecosystem-pack 指引 stranger 复制）整体纳入版本控制
+.claude/*
+!.claude/skills/
+claude/
+.codebase-memory/
+task_plan.md
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Database
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Flutter
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub/
+coverage/
+coverage-e2e/
+ios/Pods/
+ios/.symlinks/
+android/.gradle/
+android/local.properties
+
+# Logs
+*.log
+npm-debug.log*
+
+# Coverage
+/coverage/
+
+# Server uploads (runtime artifacts)
+Server-NestJS/uploads/
+
+# Demo video recording artifacts（官方 Demo 视频录制中间产物，不入库）
+artifacts/
+
+# Database backups
+Server-NestJS/data/backups/
+
+# SBOM（CI 生成的上传产物，不入库）
+Server-NestJS/sbom.spdx.json
+
+# 验证报告运行产物（脚本每次跑产出一对 md+json，会持续堆积刷屏 git status）
+# 已入库的代表性报告不受影响（gitignore 不取消已跟踪文件）；需发布某次证据时用 git add -f
+Server-NestJS/docs/benchmark/evidence-verify-*
+Server-NestJS/docs/benchmark/protocol-conformance-*
+docs/benchmark/generated-module-*
+# 运行产物文件名含 UTC 时刻（如 T04-04-31 → 北京 12:04）会泄露工作时间 → 默认整目录不入库，
+# 仅保留人工留档报告（date-only，无时刻）
+Server-NestJS/docs/benchmark/*
+!Server-NestJS/docs/benchmark/protocol-trust-card-crm-2026-09-08.md
+!Server-NestJS/docs/benchmark/protocol-trust-card-crm-2026-09-10.md
+# 根 docs/benchmark 生成族：新产物默认不入库（文件名含时刻会泄露工作时间）；保留已人工留档的 date-only 报告
+docs/benchmark/agent-benchmark-*
+docs/benchmark/benchmark-*
+docs/benchmark/golden-crm-*
+docs/benchmark/proxy-bridge-*
+docs/benchmark/java-starter-signals-*
+docs/benchmark/full-profile-*
+!docs/benchmark/agent-benchmark-2026-08-19.md
+!docs/benchmark/agent-benchmark-2026-08-20.md
+!docs/benchmark/agent-benchmark-2026-08-20.json
+!docs/benchmark/golden-crm-2026-08-21.md
+!docs/benchmark/golden-crm-2026-08-21.json
+!docs/benchmark/golden-crm-2026-08-29.md
+!docs/benchmark/golden-crm-2026-08-29.json
+!docs/benchmark/golden-crm-2026-09-03.md
+!docs/benchmark/golden-crm-2026-09-03.json
+!docs/benchmark/golden-crm-2026-09-03-2.md
+!docs/benchmark/golden-crm-2026-09-03-2.json
+
+# SWC 编译器缓存（Taro 构建产物，不应入库）
+.swc/

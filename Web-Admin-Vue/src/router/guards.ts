@@ -1,0 +1,72 @@
+// SPDX-License-Identifier: Apache-2.0
+
+import type { Router } from 'vue-router'
+import { useAuthStore } from '@/stores/auth'
+import { useCapabilitiesStore } from '@/stores/capabilities'
+import { storage } from '@/utils/storage'
+
+// 角色首页：admin → 控制台 dashboard，其余 → **工作台 AI 对话页**（P1：登录后默认落到聊天）。
+// 唯一合法首页保证分流不互踢
+// 同一壳两套导航（WEB-FRONT-1）：admin 构建已并入 workbench 路由（routes.ts），普通用户回落工作台（存在，不死循环）
+const SURFACE: 'user' | 'admin' = import.meta.env.MODE === 'user' ? 'user' : 'admin'
+export function homeFor(role?: string): string {
+  if (SURFACE === 'user') return '/workbench'
+  // The audit reader lands on the one page it can read, not on the admin dashboard it cannot.
+  // 审计读者落到它读得到的那一页，而不是它读不到的管理台概览。
+  if (role === 'auditor') return '/audit'
+  return role === 'admin' ? '/' : '/workbench'
+}
+
+export function setupGuards(router: Router) {
+  router.beforeEach(async (to) => {
+    const auth = useAuthStore()
+    const hasToken = !!storage.readTokens().accessToken
+
+    // 公开页（登录 / 403）不需要登录
+    if (to.meta.public) {
+      // 已登录再访问 /login 按角色回各自首页（防循环）
+      if (to.path === '/login' && hasToken && auth.status === 'authenticated') {
+        return homeFor(auth.user?.role)
+      }
+      return true
+    }
+
+    if (!hasToken) {
+      auth.status = 'unauthenticated'
+      return { path: '/login', query: { redirect: to.fullPath } }
+    }
+
+    // 有 token 但尚未加载用户 → 加载用户信息
+    if (auth.status !== 'authenticated') {
+      await auth.tryAutoLogin()
+      if (auth.status === 'unauthenticated') return { path: '/login', query: { redirect: to.fullPath } }
+    }
+
+    // 角色/壳分流：user 构建（/user/）无控制台路由，任何角色回落工作台（防守卫互踢死循环）；
+    // 仅 admin 构建按角色校验
+    const roles = to.meta.roles
+    if (SURFACE !== 'user' && roles && !roles.includes(auth.user!.role)) {
+      return homeFor(auth.user!.role)
+    }
+
+    // 能力细门（WEB-FRONT-2）：清单到手时，声明了 `meta.permission` 的路由再按能力判一次。
+    // roles 仍管壳（admin 控制台 vs user 工作台，行政分离是有意为之），能力是更细的门；
+    // 清单不可用则跳过——服务端仍逐请求裁决（隐藏 ≠ 越权）。
+    const guardPermission = to.meta.permission
+    if (guardPermission && auth.permissions && !auth.hasPermission(guardPermission)) {
+      return homeFor(auth.user!.role)
+    }
+
+    // MOD-4：目标路由属于被 capabilities 禁用的业务模块 → 弹回角色首页
+    const module = to.meta.module
+    if (module) {
+      const caps = useCapabilitiesStore()
+      await caps.load()
+      if (!caps.isModuleEnabled(module)) {
+        return homeFor(auth.user!.role)
+      }
+    }
+
+    return true
+  })
+}

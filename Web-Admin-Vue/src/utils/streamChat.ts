@@ -1,0 +1,230 @@
+// SPDX-License-Identifier: Apache-2.0
+
+/**
+ * AI 流式对话客户端（SSE）：POST /ai/chat/stream，逐事件回调；D1 CRM 闭环的确认卡数据通道。
+ * 与后端 ai.controller chatStream 事件契约对齐：text / tool_start / confirmation_request /
+ * confirmation_decision / tool_end / done / error（SSE 格式 `event: <type>\ndata: <json>\n\n`）。
+ */
+import { API_BASE_URL } from '@/utils/constants'
+import { storage } from '@/utils/storage'
+import { refreshAccessToken } from '@/api/session'
+import { api } from '@/api/client'
+import type { PresentationText } from '@/types/presentation'
+
+// ── 流式事件类型（与后端 ai.service.ts chatStream 对齐）──────────────────────
+
+export interface AiAuthCheck {
+  name: string
+  ok: boolean
+  note?: string
+}
+
+/** W5-⑦ Explainable Authz：为何允许 / 为何需确认（人类语言 + 技术检查清单） */
+export interface AiAuthorization {
+  granted?: boolean
+  role?: string
+  riskLevel?: string
+  checks?: AiAuthCheck[]
+  [key: string]: unknown
+}
+
+export interface AiToolStart {
+  name: string
+  summary?: PresentationText | null
+  arguments: Record<string, unknown>
+  isWrite: boolean
+  riskLevel?: string
+  authorization?: AiAuthorization
+}
+
+/** KB-5 run 批内单个动作（逐条 diff 摘要，run 卡"有 diff"核心） */
+export interface AiRunItem {
+  toolName: string
+  summary: PresentationText
+  riskLevel: string
+  /** §22.17 ④ 影响预览 v1.1：该动作的撤销能力档（KB-6 四档；后端缺省省略 → 不渲染撤销行） */
+  revokeClass?: string
+}
+
+export interface AiConfirmation {
+  token: string
+  /** run 模式时可空（整批用 run.items 展示）；单动作模式（confirmation/approval）必有 */
+  toolName?: string
+  summary?: PresentationText
+  arguments?: Record<string, unknown>
+  /**
+   * 'immediate' = the R3 confirmation an operator gives themselves; 'approval' = an R4 decision already
+   * handed to a human; 'run' = one authorisation for a whole batch (KB-5).
+   *
+   * `immediate` is the frozen vocabulary's word for R3. This union used to spell it `'confirmation'`,
+   * which is a value the contract, the reference server and this runtime's own read side all decline to
+   * write — this console's action centre has been asking for `'immediate'` all along.
+   *
+   * `immediate` 是冻结词表给 R3 的那个取值。这个联合类型此前写的是 `'confirmation'` —— 一个契约、参照
+   * 服务端与本运行时**自己的读侧**都不写的值，而本控制台的工作台页一直在判的正是 `'immediate'`。
+   */
+  mode?: 'immediate' | 'approval' | 'run'
+  authorization?: AiAuthorization
+  /** §22.17 ④ 影响预览：将执行几个写动作 / 涉及哪些对象类型（估计值；无可解析对象时后端省略） */
+  impact?: {
+    actions: number
+    targets: Array<{ resultType: string; count: number }>
+  }
+  /** §22.17 ④ 影响预览 v1.1：单条模式的撤销能力档（run 模式下档位在 run.items[] 上，后端缺省省略） */
+  revokeClass?: string
+  /** KB-5：mode==='run' 时必有——runId + runRisk + 逐条动作摘要 */
+  run?: {
+    runId: string
+    riskLevel: string
+    items: AiRunItem[]
+  }
+}
+
+export interface AiConfirmationDecision {
+  /** run 级整体决策（mode='run'）时为空；逐条决策带 toolName */
+  toolName?: string
+  /** 规范决策词（v2，CE-1 B3b）：approve | decline | timeout —— 客户端优先读此字段 */
+  decision?: 'approve' | 'decline' | 'timeout'
+  /** @deprecated v1 遗留；客户端优先读 decision */
+  approved: boolean
+  success?: boolean
+  resultId?: number
+  error?: string
+  /** KB-5：run 级整体决策关卡（先于逐条 decision） */
+  mode?: 'run'
+  runId?: string
+}
+
+/**
+ * Trust-grade denial guidance (`explanation`): why a tool was refused + how to make it pass.
+ *
+ * Shared shape for the SSE `tool_end.explanation`, the HTTP 403 body (`explanation`) and the
+ * confirmation 404 body. `reasonKey` / `nextStepKey` are stable i18n keys so the console can render
+ * the sentence in its own language; `reason` / `nextStep` are the server's already-localized text
+ * (used as a fallback when a key is missing); `params` carries the interpolation values.
+ *
+ * 信任化拒绝指引（`explanation`）：工具为何被拒 + 怎样才能通过。
+ *
+ * SSE `tool_end.explanation`、HTTP 403 响应体（`explanation`）与确认 404 响应体共用这一形状。
+ * `reasonKey` / `nextStepKey` 是稳定 i18n key，控制台可用自己的语言渲染；`reason` / `nextStep` 是
+ * 服务端已本地化文案（key 缺失时兜底）；`params` 携带插值取值。
+ */
+export interface AiDenialExplanation {
+  deniedBy: 'risk_policy' | 'governance' | 'confirmation' | 'casl'
+  reasonKey: string
+  nextStepKey: string
+  reason: string
+  nextStep: string
+  params?: Record<string, string | number>
+}
+
+export interface AiToolEnd {
+  name: string
+  success: boolean
+  summary?: PresentationText
+  error?: string
+  /** Trust-grade denial guidance; present only on refusals (success paths omit it). */
+  explanation?: AiDenialExplanation
+}
+
+export type StreamChatEvent =
+  | { type: 'text'; content: string }
+  | { type: 'navigate'; route: string }
+  | { type: 'tool_start'; toolStart: AiToolStart }
+  | { type: 'confirmation_request'; confirmation: AiConfirmation }
+  | { type: 'confirmation_decision'; confirmationDecision: AiConfirmationDecision }
+  | { type: 'tool_end'; toolEnd: AiToolEnd }
+  | { type: 'done'; conversationId: string }
+  | { type: 'error'; error?: string }
+
+export interface StreamChatOptions {
+  message: string
+  conversationId?: string
+  /** SSE 端点（相对 API_BASE_URL）；默认 '/ai/chat/stream'（用户）。管理端系统助手传 '/admin/ai/chat/stream' */
+  endpoint?: string
+  signal?: AbortSignal
+  onEvent: (event: StreamChatEvent) => void
+  onEnd?: () => void
+  onError?: (err: Error) => void
+}
+
+const DEFAULT_STREAM_ENDPOINT = '/ai/chat/stream'
+
+function postStream(
+  tokens: { accessToken: string },
+  endpoint: string,
+  payload: { message: string; conversationId?: string },
+  signal?: AbortSignal,
+): Promise<Response> {
+  return fetch(`${API_BASE_URL}${endpoint}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(tokens.accessToken ? { Authorization: `Bearer ${tokens.accessToken}` } : {}),
+    },
+    body: JSON.stringify(payload),
+    signal,
+  })
+}
+
+/** 解析单个 SSE 块：取 data: 行合并后 JSON.parse 为事件；忽略 event: 行（data 内自带 type） */
+function handleBlock(block: string, onEvent: (event: StreamChatEvent) => void): void {
+  const dataLines: string[] = []
+  for (const line of block.split('\n')) {
+    if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^ /, ''))
+  }
+  if (!dataLines.length) return
+  try {
+    onEvent(JSON.parse(dataLines.join('\n')) as StreamChatEvent)
+  } catch {
+    // 忽略无法解析的块（注释行 / 心跳等）
+  }
+}
+
+/** 发起流式对话：读完整 SSE，逐事件回调；AbortError 静默返回（关抽屉中止） */
+export async function streamChat(options: StreamChatOptions): Promise<void> {
+  const endpoint = options.endpoint ?? DEFAULT_STREAM_ENDPOINT
+  let tokens = storage.readTokens()
+  let res = await postStream(tokens, endpoint, { message: options.message, conversationId: options.conversationId }, options.signal)
+  if (res.status === 401 && (await refreshAccessToken())) {
+    tokens = storage.readTokens()
+    res = await postStream(tokens, endpoint, { message: options.message, conversationId: options.conversationId }, options.signal)
+  }
+  if (!res.ok) {
+    const text = await res.text().catch(() => '')
+    options.onError?.(new Error(text || `Request failed with status ${res.status}`))
+    return
+  }
+
+  try {
+    const reader = res.body?.getReader()
+    if (!reader) {
+      options.onError?.(new Error('No response body'))
+      return
+    }
+    const decoder = new TextDecoder()
+    let buffer = ''
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      // 兼容 CRLF：统一成 \n 后再按空行切块
+      buffer = buffer.replace(/\r\n/g, '\n')
+      let sep: number
+      while ((sep = buffer.indexOf('\n\n')) !== -1) {
+        const block = buffer.slice(0, sep)
+        buffer = buffer.slice(sep + 2)
+        handleBlock(block, options.onEvent)
+      }
+    }
+    options.onEnd?.()
+  } catch (err) {
+    if ((err as Error).name === 'AbortError') return
+    options.onError?.(err as Error)
+  }
+}
+
+/** 确认 AI 写操作：approve 后服务器继续执行并推流（confirmation_decision / tool_end） */
+export async function confirmTool(token: string, decision: 'approve' | 'decline', trustTool?: boolean): Promise<void> {
+  await api.post(`/ai/confirmations/${encodeURIComponent(token)}`, { decision, trustTool })
+}

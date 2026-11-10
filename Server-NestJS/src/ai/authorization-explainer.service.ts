@@ -1,0 +1,200 @@
+// SPDX-License-Identifier: Apache-2.0
+
+/**
+ * 授权解释器（§internal.16 A-5 Explainable Authorization）
+ *
+ * 从 AiService 拆出的「只读授权解释」子域（阶段 2 import 环修复：切断 audit→AiService、
+ * auth→AiService 的反向运行时依赖）。只计算「为何允许 / 为何需确认」的结构化依据，
+ * 不改变任何业务状态。依赖 ToolRegistry（风险级权威源）+ CaslAbilityFactory + 治理策略。
+ */
+
+import { Injectable, Optional } from '@nestjs/common';
+import { CaslAbilityFactory } from '../common/casl/casl-ability.factory';
+import { UsersService } from '../users/users.service';
+import { ToolRegistry } from './tools/tool-registry';
+import {
+  RISK_STRATEGY,
+  AuthorizationCheck,
+  AuthorizationReasons,
+  ToolRiskLevel,
+} from './interfaces/tool.interface';
+import { GovernancePolicyService, sanitizeBoundedFields } from '../governance-shared/services/governance-policy.service';
+
+/**
+ * §internal.16 A-5 / T5 跨入口一致：**放行授权依据快照的单一构造**（JSON 字符串）。
+ * 写三种行：**实际放行并成功执行**的行、**被扣下等人**（`outcome=pending`）的行、以及**没发生**的行
+ * （`not_executed` / `declined`——窗口到期无人裁决，或有人拒绝）。三者回答的是同一个问题：「凭什么允许它
+ * 到这一步」。**被门拒绝**的行不写（它们带的是 deny reasons 数组）→ 列里两种形状由此可分
+ * （见 docs/audit-authz-snapshot.spec.md §5.6）。SSE 流式 / 非流式 / MCP / R4 执行器共用本函数，防形状漂移。
+ * 注意对外键名为 `strategy`（源字段 riskStrategy）；`allowed/checks/riskLevel/policy` 是读取侧
+ * `parseAllowedSnapshot` 依赖的契约字段。
+ */
+export function buildAllowSnapshot(tool: string, authz: AuthorizationReasons): string {
+  return JSON.stringify({
+    allowed: true,
+    tool,
+    riskLevel: authz.riskLevel,
+    strategy: authz.riskStrategy,
+    checks: authz.checks,
+    ...(authz.policy ? { policy: authz.policy } : {}),
+  });
+}
+
+@Injectable()
+export class AuthorizationExplainerService {
+  constructor(
+    private readonly toolRegistry: ToolRegistry,
+    private readonly abilityFactory: CaslAbilityFactory,
+    @Optional() private readonly governancePolicy?: GovernancePolicyService,
+    @Optional() private readonly usersService?: UsersService,
+  ) {}
+
+  /**
+   * W5-⑦ Explainable Authorization（评审四）：生成「为何允许 / 为何需确认」的结构化依据。
+   * 由 tool_start / confirmation_request 事件携带，供前端渲染治理可解释性。
+   * 调用时机在 _assertToolAllowed 之后，故 tool_enabled / role_allowed 反映已生效的门控。
+   */
+  async getAuthorizationReasons(
+    toolName: string,
+    userId: string,
+    isWrite: boolean,
+    /**
+     * 调用方已解析的档位（可选）。**外部工具（`mcp_*`）必须传**：它们只由 `ExternalToolProvider` 解析、
+     * 不在本地注册表，而本方法内 `toolRegistry.riskLevel` 对未注册名**抛错**——不传就会把「为何允许」的
+     * 解释变成一次抛错。容错归调用方（它才知道外部工具），本服务保持纯解释。
+     * 缺省时仍按注册表取，行为与从前一致。
+     */
+    riskLevelOverride?: ToolRiskLevel,
+  ): Promise<AuthorizationReasons> {
+    const riskLevel = riskLevelOverride ?? this.toolRegistry.riskLevel(toolName);
+    const riskStrategy = RISK_STRATEGY[riskLevel];
+    const checks: AuthorizationCheck[] = [];
+    // §internal.17③ Policy Evidence：单次取策略 → 决策输入（tool_enabled/role_allowed）与决策时策略版本（内容指纹 revision）同源，
+    // 快照即冻结「当时是哪一版规则允许的」；无策略行/revision 则不附 policy（默认策略语义，向后兼容旧快照）。
+    let policyMeta: { revision: string; updatedAt?: string | null } | undefined;
+    if (this.governancePolicy) {
+      const policy = await this.governancePolicy.getPolicy();
+      // 无策略行（getPolicy 恒返回空 value 的内容指纹 revision）→ 不附 policy（audit-authz-snapshot §5：默认策略语义，
+      // 向后兼容旧快照）。updatedAt 作为「策略行存在」信号——无行显式 null，有行由 save 落时间戳。
+      if (policy?.revision && policy.updatedAt) {
+        policyMeta = {
+          revision: policy.revision,
+          updatedAt: policy.updatedAt ? new Date(policy.updatedAt).toISOString() : null,
+        };
+      }
+      const cfg = policy.tools?.[toolName] ?? {};
+      const enabled = cfg.enabled ?? true;
+      checks.push({
+        name: 'tool_enabled',
+        ok: enabled,
+        note: enabled ? '治理策略已启用' : '治理策略禁用',
+      });
+      const roles = cfg.allowedRoles ?? [];
+      if (roles.length > 0) {
+        const user = this.usersService
+          ? await this.usersService.findOne(Number(userId))
+          : null;
+        const ok = !!user && !!user.role && roles.includes(user.role);
+        checks.push({
+          name: 'role_allowed',
+          ok,
+          note: ok
+            ? `角色 ${user.role} ∈ [${roles.join(', ')}]`
+            : `需要角色 [${roles.join(', ')}]`,
+        });
+      } else {
+        checks.push({ name: 'role_allowed', ok: true, note: '无角色限制' });
+      }
+      // CONF-1「有界变动」：本工具声明了界限时把它写进快照 —— 那次放行**可被追责到界限本身**，
+      // 而不是追责到某一组具体取值（具体值在别的列：工具行 args / 字段域检查）。故这里**不需要** args。
+      const bounded = sanitizeBoundedFields(cfg.boundedFields);
+      for (const field of Object.keys(bounded).sort()) {
+        checks.push({
+          name: 'field_bound',
+          ok: true,
+          note: `${field} 声明界限 ≤ ${bounded[field].max}（本次放行覆盖该界限内的取值）`,
+        });
+      }
+    }
+    checks.push({
+      name: 'user_scoped',
+      ok: true,
+      note: '执行时注入调用者 userId，仅操作本人数据',
+    });
+    checks.push({
+      name: 'risk_policy',
+      ok: isWrite,
+      note: `风险级 ${riskLevel}（${riskStrategy}）${isWrite ? '→ 需人工确认' : '→ 自动执行'}`,
+    });
+    return {
+      tool: toolName,
+      riskLevel,
+      riskStrategy,
+      requiresConfirmation: isWrite,
+      checks,
+      ...(policyMeta ? { policy: policyMeta } : {}),
+    };
+  }
+
+  /** §internal.16 A-5 授权链：放行场景的「为什么允许」依据（tool 治理 checks + 角色 CASL 决策） */
+  async explainAuthorization(toolName: string, userId: string): Promise<{
+    tool: string;
+    riskLevel?: string;
+    riskStrategy?: string;
+    requiresConfirmation?: boolean;
+    checks: AuthorizationCheck[];
+    casl?: { action: string; subject: string; allowed: boolean; reason: string; deniedBy?: string | null };
+  }> {
+    const isWrite = RISK_STRATEGY[this.toolRegistry.riskLevel(toolName)] !== 'auto';
+    const reasons = await this.getAuthorizationReasons(toolName, userId, isWrite);
+    let casl: { action: string; subject: string; allowed: boolean; reason: string; deniedBy?: string | null } | undefined;
+    try {
+      const user = this.usersService ? await this.usersService.findOne(Number(userId)) : null;
+      casl = this.abilityFactory.explainForTarget(
+        { role: (user?.role as any) ?? 'user', sub: Number(userId) },
+        'manage',
+        toolName,
+      );
+    } catch {
+      casl = undefined;
+    }
+    return { ...reasons, casl };
+  }
+
+  /** §internal.16 A-5 授权链图：按用户聚合完整授权链（角色→CASL 资源 + 工具策略 + 生效期） */
+  async getAuthorizationChain(user: { role: 'admin' | 'user'; sub: number; username?: string | null }): Promise<{
+    user: { id: number; username: string | null; role: string };
+    grants: Array<{ policy: string; resource: string; scope: string }>;
+    toolPolicies: Array<{ toolName: string; enabled: boolean; allowedRoles: string[]; riskLevel?: string }>;
+    effectiveSince: Date | string | null;
+  }> {
+    const described = this.abilityFactory.describeForUser({ sub: user.sub, role: user.role } as never);
+    const grants = (described.resources ?? []).map((r) => ({
+      policy: described.basis ?? '角色授权',
+      resource: r.subject,
+      scope: r.scope,
+    }));
+    let toolPolicies: Array<{ toolName: string; enabled: boolean; allowedRoles: string[]; riskLevel?: string }> = [];
+    let effectiveSince: Date | string | null = null;
+    try {
+      const policy = await this.governancePolicy?.getPolicy();
+      if (policy) {
+        effectiveSince = policy.updatedAt ?? null;
+        toolPolicies = Object.entries(policy.tools ?? {}).map(([toolName, cfg]) => ({
+          toolName,
+          enabled: cfg.enabled ?? true,
+          allowedRoles: cfg.allowedRoles ?? [],
+          riskLevel: this.toolRegistry.riskLevel(toolName) || undefined,
+        }));
+      }
+    } catch {
+      // 策略不可用时工具策略空（授权链图仍显示角色级 grants）
+    }
+    return {
+      user: { id: user.sub, username: user.username ?? null, role: user.role },
+      grants,
+      toolPolicies,
+      effectiveSince,
+    };
+  }
+}

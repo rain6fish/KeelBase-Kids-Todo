@@ -1,0 +1,22 @@
+{
+  "module": "tasks",
+  "label": "任务",
+  "searchable": true,
+  "fields": [
+    { "name": "title", "type": "string", "label": "标题", "required": true },
+    { "name": "description", "type": "text", "label": "描述" },
+    { "name": "priority", "type": "enum", "label": "优先级", "enum": ["low", "medium", "high"] },
+    { "name": "status", "type": "enum", "label": "状态", "enum": ["todo", "doing", "done", "cancelled"] },
+    { "name": "taskDate", "type": "date", "label": "任务日期", "required": true },
+    { "name": "estimatedMinutes", "type": "int", "label": "预计分钟" },
+    { "name": "repeatRule", "type": "enum", "label": "重复规则", "enum": ["none", "daily", "weekly", "monthly"] },
+    { "name": "approvalStatus", "type": "enum", "label": "审批状态", "enum": ["none", "pending", "approved", "rejected"] },
+    { "name": "helpRequested", "type": "bool", "label": "请求帮助" },
+    { "name": "helpRequestNote", "type": "text", "label": "求助说明" },
+    { "name": "sortOrder", "type": "int", "label": "排序" }
+  ],
+  "aiTools": {
+    "query": true,
+    "create": { "riskLevel": "R3", "requiresConfirmation": true }
+  }
+}

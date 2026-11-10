@@ -1,0 +1,2158 @@
+// SPDX-License-Identifier: Apache-2.0
+
+/**
+ * EASY-2 CLI 单测（node:test，零依赖）。
+ * 运行：node --test scripts/keelbase-init.test.mjs
+ */
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp, mkdir, writeFile, readFile, access } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+
+import {
+  validateModuleName,
+  validateLabel,
+  parseFields,
+  validateFields,
+  validateAiTools,
+  normalizeSpecFields,
+  buildContext,
+  toSingular,
+  toPlural,
+  toPascal,
+} from './generator/validate.mjs';
+import { backendFiles } from './generator/templates-backend.mjs';
+import { frontendFiles } from './generator/templates-frontend.mjs';
+import { adminFiles } from './generator/templates-admin.mjs';
+import { taroFiles } from './generator/templates-taro.mjs';
+import { aiFiles } from './generator/templates-ai.mjs';
+import {
+  WIRED_FILES,
+  wireBackend,
+  wireFrontend,
+  wireAdmin,
+  wireTaro,
+  wireAiModule,
+} from './generator/wire.mjs';
+import { buildSpecPrompt, parseSpecResponse, extractSpec, llmConfig } from './generator/llm.mjs';
+import { parseOpenApiSpec } from './generator/import-openapi.mjs';
+import { parseOpenApiProxy, gateTierOf, summarizeRiskPreview } from './generator/import-openapi-proxy.mjs';
+import { parseSqlDdl } from './generator/import-schema.mjs';
+import { parseYaml } from './generator/yaml.mjs';
+import {
+  writeManifest,
+  readManifest,
+  mergeManifest,
+  manifestPath,
+  MANIFEST_SCHEMA,
+  MANIFEST_IDENTITY,
+  MANIFEST_PROTOCOL,
+} from './generator/manifest.mjs';
+// The runtime-capability list doctor checks, imported rather than copied — see the doctor test below.
+import { REQUIRED_RUNTIME } from './keelbase-doctor.mjs';
+
+// ── 工具 ─────────────────────────────────────────────────────────────────────
+async function tempRoot() {
+  const dir = await mkdtemp(join(tmpdir(), 'keelbase-cli-'));
+  return dir.replace(/\\/g, '/');
+}
+
+const BE = (root, p) => `${root}/Server-NestJS/src/${p}`;
+const FE = (root, p) => `${root}/Front-Flutter/lib/${p}`;
+
+async function write(p, c) {
+  await mkdir(p.substring(0, p.lastIndexOf('/')), { recursive: true });
+  await writeFile(p, c, 'utf8');
+}
+
+/** 生成一套最小接线 fixture（含各锚点）。 */
+async function makeFixtures(root) {
+  await write(BE(root, 'app.module.ts'), `import { TodosModule } from './todos/todos.module';
+import { EventsModule } from './events/events.module';
+
+@Module({
+  imports: [
+    EventsModule,
+    TodosModule,
+  ],
+})
+export class AppModule {}
+
+const MIGRATIONS = [
+  'dist/migrations/*AddAiToolSideEffects*.js',
+];
+`);
+  await write(
+    BE(root, 'common/modules/modules-manifest.ts'),
+    `export const BUSINESS_MODULES = ['events', 'todos'] as const;
+
+const businessEntries: ModuleManifestEntry[] = [
+  { id: 'events', category: 'business', deps: ['notifications'], label: '事件' },
+  { id: 'todos', category: 'business', deps: [], label: '待办', description: '待办清单与完成状态' },
+];`,
+  );
+  await write(
+    BE(root, 'feature-flags/feature-flags.constants.ts'),
+    `export const FEATURE_KEYS = {
+  TODOS: 'todos',
+} as const;`,
+  );
+  await write(
+    BE(root, 'ai/tools/navigate-page.tool.ts'),
+    `const PAGE_ROUTES: Record<string, { route: string; description: string }> = {
+  todos: { route: '/todos', description: '待办清单' },
+};`,
+  );
+  await write(
+    FE(root, 'main.dart'),
+    `import 'features/todos/data/repositories/todos_repository.dart';
+import 'features/todos/presentation/providers/todos_provider.dart';
+
+      providers: [
+        ChangeNotifierProvider<TodosProvider>(
+          create: (_) => TodosProvider(TodosRepository(apiClient), cache: AppCache(prefs)),
+        ),
+      ],`,
+  );
+  await write(
+    FE(root, 'core/router/app_router.dart'),
+    `import '../../features/todos/presentation/pages/todos_page.dart';
+    routes: [
+      // Legal pages
+    ],`,
+  );
+  await write(
+    FE(root, 'core/i18n/app_localizations.dart'),
+    `  String get deleteTodoConfirm => _t('Delete this todo?', '删除该待办？');
+}`,
+  );
+  await write(
+    BE(root, 'ai/ai.module.ts'),
+    `import { TodosModule } from '../todos/todos.module';
+import { TodosService } from '../todos/todos.service';
+import { CreateTodoTool } from './tools/create-todo.tool';
+
+@Module({
+  imports: [
+    TodosModule,
+  ],
+})
+export class AiModule {
+  useFactory(
+        todosService: TodosService,
+  ) {
+    const toolRegistry = new ToolRegistry();
+        toolRegistry.register(new CreateTodoTool(todosService));
+  }
+}
+inject: [TodosService, ContractsService, MemoriesService, ConfirmationStore],
+`,
+  );
+}
+
+function ctx(over = {}) {
+  return { ...buildContext('posts', '帖子', parseFields('title:string,content:text')), featureFlag: true, ...over };
+}
+
+// ── 校验与命名 ───────────────────────────────────────────────────────────────
+test('validateModuleName：合法/非法', () => {
+  assert.equal(validateModuleName('posts'), null);
+  assert.equal(validateModuleName('user_profile'), null);
+  assert.ok(validateModuleName('Posts'));
+  assert.ok(validateModuleName('帖子'));
+  assert.ok(validateModuleName('post-title'));
+  assert.equal(validateModuleName('bu'), null); // 短但合法
+  assert.ok(validateModuleName('bus')); // 去 s 后过短 → 拒绝
+});
+
+test('validateLabel：注入防护', () => {
+  assert.equal(validateLabel('帖子'), null);
+  assert.equal(validateLabel('AB 12'), null);
+  assert.ok(validateLabel('包含\'引号'));
+  assert.ok(validateLabel('带`反引号'));
+  assert.ok(validateLabel('带反斜杠\\'));
+  assert.ok(validateLabel('太长了太长了太长了太长了太长了'));
+});
+
+test('parseFields + validateFields：类型与保留词', () => {
+  const fields = parseFields('title:string,content:text,count:int,ok:bool,when:date');
+  assert.equal(validateFields(fields), null);
+  assert.ok(validateFields([{ name: 'id', type: 'string' }])); // 保留词
+  assert.ok(validateFields([{ name: 'bad type', type: 'string' }]));
+  assert.ok(validateFields([{ name: 'x', type: 'unknown' }]));
+});
+
+test('enum（协议反推）：类型 + 选项校验 + CLI 默认选项', () => {
+  // CLI 字符串 `status:enum` → 默认选项
+  const cliFields = parseFields('title:string,status:enum');
+  assert.equal(cliFields[1].type, 'enum');
+  assert.deepEqual(cliFields[1].enum, ['active', 'inactive']);
+  assert.equal(validateFields(cliFields), null);
+
+  // CLI 内联 enum 选项：`status:enum:active,inactive,paid`（选项不被外层逗号拆散）
+  const inline = parseFields('title:string,status:enum:active,inactive,paid');
+  assert.equal(inline[1].type, 'enum');
+  assert.deepEqual(inline[1].enum, ['active', 'inactive', 'paid']);
+  assert.equal(validateFields(inline), null);
+
+  // 协议 JSON 提供的 enum 选项
+  const specFields = [
+    { name: 'title', type: 'string' },
+    { name: 'status', type: 'enum', enum: ['pending', 'approved', 'rejected'] },
+  ];
+  assert.equal(validateFields(specFields), null);
+
+  // 非法：无选项 / 选项非法 / 选项超长
+  assert.ok(validateFields([{ name: 's', type: 'enum' }]));
+  assert.ok(validateFields([{ name: 's', type: 'enum', enum: ['大写'] }]));
+  assert.ok(validateFields([{ name: 's', type: 'enum', enum: ['a'.repeat(30)] }]));
+  assert.ok(validateFields([{ name: 's', type: 'enum', enum: ['onlyone'] }]));
+});
+
+test('parseFields：enum 选项不得吞掉紧随其后的 `name:type` 字段', () => {
+  // 旧实现把 status 后面的字段名吃进 enum，还多出一个幽灵字段（外部实测 2026-09-30 报出）
+  const fields = parseFields(
+    'plate_number:string,status:enum:available,in_use,maintenance,purchase_date:date,mileage:int',
+  );
+  assert.deepEqual(fields, [
+    { name: 'plate_number', type: 'string' },
+    { name: 'status', type: 'enum', enum: ['available', 'in_use', 'maintenance'] },
+    { name: 'purchase_date', type: 'date' },
+    { name: 'mileage', type: 'int' },
+  ]);
+  assert.equal(validateFields(fields), null);
+
+  // 枚举选项在字符串中间、后面还有字段（无类型标注的字段仍按既有约定并入选项）
+  assert.deepEqual(parseFields('a:string,b:enum:x,y,c:int'), [
+    { name: 'a', type: 'string' },
+    { name: 'b', type: 'enum', enum: ['x', 'y'] },
+    { name: 'c', type: 'int' },
+  ]);
+});
+
+test('enum 模板：后端 @IsIn + 前端下拉', () => {
+  const c = buildContext('suppliers', '供应商', [
+    { name: 'name', type: 'string' },
+    { name: 'status', type: 'enum', enum: ['active', 'inactive', 'blacklist'] },
+  ]);
+  const files = backendFiles({ ...c, featureFlag: true });
+  const entity = files.find((f) => f.path.endsWith('.entity.ts')).content;
+  assert.match(entity, /default: 'active'/);
+  const dto = files.find((f) => f.path.includes('create-')).content;
+  assert.match(dto, /@IsIn\(\['active', 'inactive', 'blacklist'\]\)/);
+  assert.match(dto, /import.*IsIn/);
+
+  const fe = frontendFiles({ ...c, featureFlag: true });
+  const model = fe.find((f) => f.path.endsWith('_model.dart')).content;
+  assert.match(model, /this\.status = 'active'/);
+  const page = fe.find((f) => f.path.endsWith('_page.dart')).content;
+  assert.match(page, /CupertinoSegmentedControl<String>/);
+  assert.match(page, /data\['status'\] = _statusVal;/);
+});
+
+test('required 透传：create DTO @IsNotEmpty + 非可选；前端 model required + 非空类型', () => {
+  const c = buildContext('contracts', '合同', [
+    { name: 'title', type: 'string', required: true },
+    { name: 'amount', type: 'int', required: true },
+    { name: 'note', type: 'text' },
+  ]);
+  const files = backendFiles({ ...c, featureFlag: true });
+  const dto = files.find((f) => f.path.includes('create-')).content;
+  assert.match(dto, /import.*IsNotEmpty/);
+  assert.match(dto, /@IsInt\(\)\n  @IsNotEmpty\(\)\n  amount!: number;/);
+  assert.doesNotMatch(dto, /amount\?: number;/);
+  assert.match(dto, /@ApiProperty\(/); // 必填字段用 @ApiProperty 非 Optional
+  assert.match(dto, /@IsOptional\(\)\n  note\?: string;/); // 非 required 保持可选
+
+  const fe = frontendFiles({ ...c, featureFlag: true });
+  const model = fe.find((f) => f.path.endsWith('_model.dart')).content;
+  assert.match(model, /final int amount;/);
+  assert.match(model, /required this\.amount/);
+  // 必填不再是「缺字段就抛」：缺一个键不该让整个列表起不来，故原值兜底。
+  // Required no longer means "throw on a missing key": one absent key must not take the whole list
+  // down, so the cast falls back to a default.
+  assert.match(model, /amount: json\['amount'\] as int\? \?\? 0,/);
+  assert.match(model, /final String\? note;/);
+  assert.doesNotMatch(model, /required this\.note/);
+});
+
+test('#3 string/enum 显式 required:false 生成可选（nullable + IsOptional）；默认/required:true 必填', () => {
+  const c = buildContext('invoices', '发票', [
+    { name: 'invoiceNo', type: 'string', required: true },
+    { name: 'customerName', type: 'string', required: false },
+    { name: 'amount', type: 'int' },
+    { name: 'status', type: 'enum', enum: ['draft', 'issued', 'paid', 'void'], required: false },
+  ]);
+  const files = backendFiles({ ...c, featureFlag: true });
+  const entity = files.find((f) => f.path.endsWith('.entity.ts')).content;
+  const dto = files.find((f) => f.path.includes('create-')).content;
+
+  // required:true string：列 NOT NULL + DTO IsNotEmpty/MinLength
+  assert.match(entity, /invoiceNo!: string;/);
+  assert.doesNotMatch(entity, /invoiceNo\?:/);
+  assert.match(dto, /@IsNotEmpty\(\)\n  @MinLength\(1\)\n  @MaxLength\(200\)\n  invoiceNo!: string;/);
+
+  // string required:false → 显式 varchar nullable 列 + IsOptional DTO（无 MinLength：允许空串）
+  assert.match(entity, /@Column\(\{ type: 'varchar', length: 200, nullable: true \}\)\n  customerName\?: string \| null;/);
+  assert.match(dto, /@ApiPropertyOptional\(\{ description: 'customerName' \}\)\n  @IsString\(\)\n  @IsOptional\(\)\n  @MaxLength\(200\)\n  customerName\?: string;/);
+
+  // int 默认可选（无 required 键）→ nullable + IsOptional
+  assert.match(entity, /@Column\(\{ nullable: true \}\)\n  amount\?: number;/);
+  assert.match(dto, /@IsOptional\(\)\n  amount\?: number;/);
+
+  // enum required:false → 显式 varchar nullable（保留首选项 default）+ DTO IsOptional
+  assert.match(entity, /@Column\(\{ type: 'varchar', length: 32, default: 'draft', nullable: true \}\)\n  status\?: string \| null;/);
+  assert.match(dto, /@IsOptional\(\)\n  @IsIn\(\[\'draft\', \'issued\', \'paid\', \'void\'\]\)\n  status\?: string;/);
+});
+
+test('#3 string 默认必填、text 默认可选（类型默认语义保留）', () => {
+  const c = buildContext('posts', '帖子', [
+    { name: 'title', type: 'string' },
+    { name: 'content', type: 'text' },
+  ]);
+  const entity = backendFiles({ ...c, featureFlag: true })
+    .find((f) => f.path.endsWith('.entity.ts')).content;
+  assert.match(entity, /title!: string;/); // string 缺省 → 必填（列 NOT NULL）
+  assert.match(entity, /content\?: string \| null;/); // text 缺省 → 可选
+});
+
+test('#3 normalizeSpecFields 透传 required（spec 不再丢弃必填标记）', () => {
+  const out = normalizeSpecFields([
+    { name: 'a', type: 'string', required: true },
+    { name: 'b', type: 'string' },
+    { name: 'c', type: 'enum', enum: ['x', 'y'], required: false },
+  ]);
+  assert.equal(out[0].required, true);
+  assert.equal(out[1].required, undefined);
+  assert.equal(out[2].required, false);
+  assert.deepEqual(out[2].enum, ['x', 'y']);
+});
+
+test('命名变换：posts/post 归一', () => {
+  const a = buildContext('posts', '帖子', []);
+  const b = buildContext('post', '帖子', []);
+  assert.equal(a.singular, 'post');
+  assert.equal(a.plural, 'posts');
+  assert.equal(a.singlePascal, 'Post');
+  assert.equal(a.pluralPascal, 'Posts');
+  assert.equal(b.singular, a.singular);
+  assert.equal(b.plural, a.plural);
+});
+
+// ── 骨架 ─────────────────────────────────────────────────────────────────────
+test('后端 8 文件骨架', () => {
+  const files = backendFiles(ctx());
+  assert.equal(files.length, 8);
+  const entity = files.find((f) => f.path.endsWith('.entity.ts')).content;
+  assert.match(entity, /@Entity\('posts'\)/);
+  assert.match(entity, /name: 'user_id'/);
+  assert.match(entity, /@DeleteDateColumn/);
+  assert.match(entity, /title!: string/);
+  assert.match(entity, /content\?: string \| null/);
+  const dto = files.find((f) => f.path.includes('create-')).content;
+  assert.match(dto, /@MaxLength\(200\)/);
+  const updateDto = files.find((f) => f.path.includes('update-')).content;
+  assert.match(updateDto, /extends PartialType/);
+  const controller = files.find((f) => f.path.endsWith('.controller.ts')).content;
+  assert.match(controller, /path: 'posts', version: '1'/);
+  assert.match(controller, /@FeatureFlag\('posts'\)/);
+  // ⑤-1 admin 端点：管理端全量列表 + 删除任意
+  assert.match(controller, /admin\/all/);
+  assert.match(controller, /@CheckPolicies\(\(ability\) => ability\.can\('manage', 'all'\)\)/);
+  const service = files.find((f) => f.path.endsWith('.service.ts')).content;
+  assert.match(service, /findAllForAdmin/);
+  assert.match(service, /removeAsAdmin/);
+  const module = files.find((f) => f.path.endsWith('.module.ts')).content;
+  assert.match(module, /forFeature\(\[Post\]\)/);
+  // controller.spec：生成模块自动带 controller 单测（覆盖管理端 admin 端点）
+  const controllerSpec = files.find((f) => f.path.endsWith('.controller.spec.ts')).content;
+  assert.match(controllerSpec, /describe\('PostsController'/);
+  assert.match(controllerSpec, /findAllForAdmin/);
+  assert.match(controllerSpec, /removeAsAdmin/);
+});
+
+test('乐观锁缺省：实体带 version 列、更新 DTO 必填 version、服务把冲突翻成 409', () => {
+  const files = backendFiles(ctx());
+  const entity = files.find((f) => f.path.endsWith('.entity.ts')).content;
+  // `default: 1` 是承重的：没有它，「NOT NULL 无默认」的列加不到已有数据的表上（见模板里的说明）
+  assert.match(entity, /@VersionColumn\(\{ default: 1 \}\)\n {2}version!: number;/);
+  assert.match(entity, /VersionColumn,/);
+
+  const updateDto = files.find((f) => f.path.includes('update-')).content;
+  // 必填是关键：可选会让调用方能不传，校验拿刚读到的那行去比 ⇒ 恒真、形同虚设
+  assert.match(updateDto, /version!: number;/);
+  assert.doesNotMatch(updateDto, /version\?: number;/);
+  assert.match(updateDto, /@IsInt\(\)/);
+  assert.match(updateDto, /@Min\(1\)/);
+
+  const service = files.find((f) => f.path.endsWith('.service.ts')).content;
+  // 只看 update 方法体：别的方法用 save() 是正常的，这里禁的是「更新也走 save()」。
+  const updateBody = service.slice(service.indexOf('async update('), service.indexOf('async remove('));
+  // 仲裁点是**条件更新**：版本进 WHERE、affected 定成败。不用 save() ——
+  // 版本列会自增但不设防（按驱动实发 SQL 核过），陈旧保存即无声覆盖。
+  assert.doesNotMatch(updateBody, /\.save\(/);
+  assert.match(updateBody, /\{ id: entity\.id, version \}/);
+  assert.match(updateBody, /version: \(\) => 'version \+ 1'/);
+  assert.match(updateBody, /if \(!result\.affected\)/);
+  assert.match(updateBody, /throw new ConflictException/);
+
+  // 生成模块自己的 spec 里钉两条：陈旧必须 409、匹配则写一次
+  const spec = files.find((f) => f.path.endsWith('.service.spec.ts')).content;
+  assert.match(spec, /rejects\.toThrow\(ConflictException\)/);
+  assert.match(spec, /affected: 0/);
+  assert.match(spec, /update: jest\.fn\(\)/);
+});
+
+test('后端 controller：--no-feature-flag 省略装饰器', () => {
+  const files = backendFiles(ctx({ featureFlag: false }));
+  const controller = files.find((f) => f.path.endsWith('.controller.ts')).content;
+  assert.doesNotMatch(controller, /@FeatureFlag/);
+  assert.doesNotMatch(controller, /feature-flag\.decorator/);
+});
+
+test('前端 4 文件骨架', () => {
+  const files = frontendFiles(ctx());
+  assert.equal(files.length, 4);
+  const model = files.find((f) => f.path.endsWith('_model.dart')).content;
+  assert.match(model, /class PostModel/);
+  assert.match(model, /fromJson/);
+  assert.match(model, /toJson/);
+  const repo = files.find((f) => f.path.endsWith('_repository.dart')).content;
+  assert.match(repo, /\/posts/);
+  assert.match(repo, /class PostsRepository/);
+  const provider = files.find((f) => f.path.endsWith('_provider.dart')).content;
+  assert.match(provider, /static const _ns = 'posts'/);
+  assert.match(provider, /乐观更新/);
+  const page = files.find((f) => f.path.endsWith('_page.dart')).content;
+  assert.match(page, /class PostsPage/);
+  assert.match(page, /l10n\.postsTitle/);
+});
+
+test('生成的 Flutter 页：用户可见文案一律走 l10n，不硬编码中文', () => {
+  const page = frontendFiles(ctx()).find((f) => f.path.endsWith('_page.dart')).content;
+  // 新增弹层的两个动作此前硬编码 '保存' / '取消'，而同一弹层其它文案早已走 l10n（2026-09-26 修）
+  assert.match(page, /Text\(l10n\.save\)/);
+  assert.match(page, /Text\(l10n\.cancel\)/);
+  // 边界守卫：`Text('…')` 的字面量里不得出现汉字（注释与 l10n getter 不在此列）。
+  // 单个断言守全页，比逐条点名更能拦住下一个漏网的串。
+  const offender = page.match(/Text\('[^']*[一-龥][^']*'/);
+  assert.equal(offender, null, `发现硬编码中文文案：${offender?.[0]}`);
+});
+
+// ── 接线 ─────────────────────────────────────────────────────────────────────
+test('接线：7 处插入 + 幂等重跑零改动', async () => {
+  const root = await tempRoot();
+  await makeFixtures(root);
+  const c = ctx();
+
+  const r1 = [...(await wireBackend(c, root)), ...(await wireFrontend(c, root))];
+  const changed = r1.filter((r) => r.changed);
+  assert.ok(changed.length >= 7, `应接线 ≥7 处，实际 ${changed.length}: ${r1.map((r) => r.file).join(',')}`);
+
+  const app = await readFile(BE(root, 'app.module.ts'), 'utf8');
+  assert.match(app, /PostsModule/);
+  const manifest = await readFile(BE(root, 'common/modules/modules-manifest.ts'), 'utf8');
+  assert.match(manifest, /'posts'/);
+  assert.match(manifest, /label: '帖子'/);
+  const main = await readFile(FE(root, 'main.dart'), 'utf8');
+  assert.match(main, /PostsProvider/);
+  const router = await readFile(FE(root, 'core/router/app_router.dart'), 'utf8');
+  assert.match(router, /path: '\/posts'/);
+  const i18n = await readFile(FE(root, 'core/i18n/app_localizations.dart'), 'utf8');
+  assert.match(i18n, /postsTitle/);
+
+  // 幂等：重跑全部应 skipped（already-wired）
+  const r2 = [...(await wireBackend(c, root)), ...(await wireFrontend(c, root))];
+  assert.equal(r2.filter((r) => r.changed).length, 0);
+});
+
+test('接线：锚点缺失 → 跳过 + 文件未破坏', async () => {
+  const root = await tempRoot();
+  // 只写 app.module（缺其他 fixture）
+  await write(BE(root, 'app.module.ts'), `import { TodosModule } from './todos/todos.module';\n@Module({ imports: [TodosModule] })\nexport class AppModule {}\n`);
+  const original = await readFile(BE(root, 'app.module.ts'), 'utf8');
+
+  const r = [...(await wireBackend(ctx(), root))];
+  const appRes = r.find((x) => x.file.endsWith('app.module.ts') && x.changed);
+  assert.ok(appRes, 'app.module 应接线成功');
+  const missing = r.filter((x) => !x.changed);
+  assert.ok(missing.length > 0, '缺 fixture 的文件应跳过');
+  // 缺 fixtures 的 manifest 文件未被创建/破坏
+  await assert.rejects(access(BE(root, 'common/modules/modules-manifest.ts')));
+  const after = await readFile(BE(root, 'app.module.ts'), 'utf8');
+  assert.match(after, /PostsModule/);
+  assert.ok(after.startsWith(original.slice(0, 40)), 'app.module 未被破坏');
+});
+
+// ── Provenance：.keelbase/manifest.json + keelbase inspect ────────────────────
+test('manifest：首次创建 + 幂等合并（多模块去重、schema/identity 固定）', async () => {
+  const root = await tempRoot();
+  await writeManifest('posts', root);
+
+  let man = JSON.parse(await readFile(`${root}/.keelbase/manifest.json`, 'utf8'));
+  assert.equal(man.schema, MANIFEST_SCHEMA);
+  assert.equal(man.identity, MANIFEST_IDENTITY);
+  assert.equal(man.protocol, MANIFEST_PROTOCOL);
+  assert.equal(man.generator, 'keelbase');
+  assert.ok(man.generatorVersion);
+  assert.deepEqual(man.modules, ['posts']);
+
+  // 幂等：同模块重跑不重复；新模块追加（排序）
+  await writeManifest('posts', root);
+  await writeManifest('notes', root);
+  await writeManifest('posts', root);
+  man = JSON.parse(await readFile(`${root}/.keelbase/manifest.json`, 'utf8'));
+  assert.deepEqual(man.modules, ['notes', 'posts']);
+  assert.deepEqual((await readManifest(root)).modules, ['notes', 'posts']);
+});
+
+test('manifest：searchableModules 记声明的可搜列，条目只增、列随重生成刷新', async () => {
+  const root = await tempRoot();
+
+  // A module that did not declare it stays out — and an older manifest without the key at all is
+  // still valid input.
+  // 未声明 searchable 的模块不进可搜清单；旧清单没有该键时也是合法输入。
+  await writeManifest('notes', root);
+  let man = JSON.parse(await readFile(`${root}/.keelbase/manifest.json`, 'utf8'));
+  assert.deepEqual(man.modules, ['notes']);
+  assert.deepEqual(man.searchableModules, []);
+
+  // 声明过的进清单，连同它的列
+  await writeManifest('books', root, { searchable: true, searchableFields: ['title', 'author'] });
+  man = JSON.parse(await readFile(`${root}/.keelbase/manifest.json`, 'utf8'));
+  assert.deepEqual(man.modules, ['books', 'notes']);
+  assert.deepEqual(man.searchableModules, [{ module: 'books', fields: ['title', 'author'] }]);
+
+  // Not declaring it on a later run is not a retraction: the manifest records what was declared,
+  // not what the last call happened to pass.
+  // 后一次不声明 searchable ≠ 撤销声明：清单记的是「声明过什么」，不是「上次调用传了什么」。
+  await writeManifest('books', root);
+  man = JSON.parse(await readFile(`${root}/.keelbase/manifest.json`, 'utf8'));
+  assert.deepEqual(man.searchableModules, [{ module: 'books', fields: ['title', 'author'] }]);
+
+  // Regenerating a module DOES refresh its columns — unlike `modules` itself, which is add-only.
+  // A column list is a product of the spec, so a stale copy is not history, it is wrong.
+  // 重生成一个模块**会**刷新它的列 —— 与 `modules` 的只增不同。列是 spec 的产物，陈旧的那份不是
+  // 历史，是错的。
+  await writeManifest('books', root, { searchable: true, searchableFields: ['title'] });
+  man = JSON.parse(await readFile(`${root}/.keelbase/manifest.json`, 'utf8'));
+  assert.deepEqual(man.searchableModules, [{ module: 'books', fields: ['title'] }]);
+
+  // 列去重且保持声明顺序；非字符串/空串被丢弃
+  await writeManifest('books', root, { searchable: true, searchableFields: ['b', 'a', 'b', '', 7] });
+  man = JSON.parse(await readFile(`${root}/.keelbase/manifest.json`, 'utf8'));
+  assert.deepEqual(man.searchableModules, [{ module: 'books', fields: ['b', 'a'] }]);
+});
+
+test('manifest：mergeManifest 缺省 root 指向 cwd（.keelbase/manifest.json）', async () => {
+  const root = await tempRoot();
+  const merged = await mergeManifest('books', root);
+  assert.equal(manifestPath(root), `${root}/.keelbase/manifest.json`);
+  assert.ok(merged.modules.includes('books'));
+  // 未写入前 readManifest 返回 null（非 KeelBase 项目也是合法输入）
+  assert.equal(await readManifest(root), null);
+});
+
+test('manifest：schema 不匹配 → 拒绝覆盖（防更新版本数据丢失）', async () => {
+  const root = await tempRoot();
+  await write(
+    `${root}/.keelbase/manifest.json`,
+    JSON.stringify({ schema: 2, identity: 'keelbase-application', generator: 'keelbase', generatorVersion: '9.9.9', protocol: '2.0', modules: ['future'] }),
+  );
+  const r = await writeManifest('posts', root);
+  assert.equal(r.changed, false);
+  assert.equal(r.reason, 'schema-mismatch');
+  assert.equal(await mergeManifest('posts', root), null);
+  // 原文件未被覆盖
+  const man = JSON.parse(await readFile(`${root}/.keelbase/manifest.json`, 'utf8'));
+  assert.equal(man.schema, 2);
+  assert.deepEqual(man.modules, ['future']);
+});
+
+test('端到端：inspect 子命令——有 manifest 退出 0 / 无 manifest 退出 1', async () => {
+  const cli = fileURLToPath(new URL('./keelbase-init.mjs', import.meta.url));
+  const spawnRun = (root) =>
+    new Promise((resolve) => {
+      const p = spawn(process.execPath, [cli, 'inspect'], { cwd: root });
+      let o = '';
+      p.stdout.on('data', (d) => (o += d));
+      p.on('close', (code) => resolve({ code, o }));
+    });
+  const stripAnsi = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
+
+  // 无 manifest → 退出 1 + 干净提示（不抛栈）
+  const empty = await spawnRun(await tempRoot());
+  assert.equal(empty.code, 1);
+  assert.match(empty.o, /非 KeelBase 应用/);
+
+  // 有 manifest → 退出 0 + 输出来源身份与能力指纹
+  const root = await tempRoot();
+  await makeFixtures(root);
+  await write(BE(root, 'common/casl/casl-ability.factory.ts'), 'export {};\n');
+  await writeManifest('posts', root);
+  const ok = await spawnRun(root);
+  const plain = stripAnsi(ok.o);
+  assert.equal(ok.code, 0);
+  assert.match(plain, /KeelBase Application/);
+  // 由常量构造，避免协议 bump 时这条断言悄悄过期（同「报错文案写死类型」一类问题）。
+  // 不把它拼进正则：那样得把**全部**元字符转义，漏一个就随值而变（CodeQL js/incomplete-sanitization）。
+  // 取出那一行、只比较值 —— 相等比「正则命中」更强，且这类问题不会再回来。
+  const protocolLine = plain.split('\n').find((l) => l.includes('Protocol:'));
+  assert.equal(protocolLine?.replace('Protocol:', '').trim(), MANIFEST_PROTOCOL);
+  assert.match(plain, /Modules:\s+posts/);
+  assert.match(plain, /✓\s+AI Tools/);
+  assert.match(plain, /✓\s+CASL Permission/);
+});
+
+test('端到端：doctor 子命令——四查 PASS / 非 KeelBase / 不支持 schema', async () => {
+  const cli = fileURLToPath(new URL('./keelbase-init.mjs', import.meta.url));
+  const spawnRun = (root) =>
+    new Promise((resolve) => {
+      const p = spawn(process.execPath, [cli, 'doctor'], { cwd: root });
+      let o = '';
+      p.stdout.on('data', (d) => (o += d));
+      p.on('close', (code) => resolve({ code, o }));
+    });
+  const stripAnsi = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
+
+  // 非 KeelBase：无 manifest → 退出 1 + 干净提示
+  const empty = await spawnRun(await tempRoot());
+  assert.equal(empty.code, 1);
+  assert.match(stripAnsi(empty.o), /非 KeelBase 应用/);
+
+  // 完整 fixture（manifest + 模块目录 + 运行时能力）→ 四查 PASS 退出 0
+  const root = await tempRoot();
+  await makeFixtures(root);
+  // The capability directories are derived from doctor's own list, not spelled out here. Spelling them
+  // out is exactly what went wrong: this fixture kept writing `ai/governance` after `01b0c8b2` renamed
+  // that directory to `ai/governance-bridge`, so the doctor check failed on a fixture whose author
+  // believed it was complete — for days, in CI. (`posts/post.entity.ts` below is a *module* directory,
+  // read by the consistency check rather than this one, so it stays explicit.)
+  //
+  // 能力目录由 doctor 自己的清单派生，而不是在这里逐条写出。逐条写出正是出问题的地方：`01b0c8b2` 把
+  // `ai/governance` 改名成 `ai/governance-bridge` 之后，本 fixture 仍写着旧路径，于是 doctor 检查在一个
+  // 作者以为完整的 fixture 上失败 —— 而且在 CI 里红了好几天。（下面的 `posts/post.entity.ts` 是**模块**
+  // 目录，由一致性检查而非本项读取，故仍显式写出。）
+  for (const { path } of REQUIRED_RUNTIME) {
+    await write(`${root}/${path}/placeholder.ts`, 'export {};\n');
+  }
+  await write(BE(root, 'posts/post.entity.ts'), 'export {};\n');
+  await writeManifest('posts', root);
+  const ok = await spawnRun(root);
+  const plain = stripAnsi(ok.o);
+  assert.equal(ok.code, 0);
+  assert.match(plain, /PASS/);
+  assert.match(plain, /完整性/);
+  assert.match(plain, /一致性/);
+  assert.match(plain, /运行时/);
+  assert.match(plain, /版本/);
+  assert.match(plain, /兼容矩阵/);
+  assert.match(plain, /protocol/); // ⑤ 协议匹配
+
+  // schema 2 → 退出 1 + 明确提示
+  await write(
+    `${root}/.keelbase/manifest.json`,
+    JSON.stringify({ schema: 2, identity: 'keelbase-application', generator: 'keelbase', generatorVersion: '9.9.9', protocol: '2.0', modules: ['future'] }),
+  );
+  const fut = await spawnRun(root);
+  assert.equal(fut.code, 1);
+  assert.match(stripAnsi(fut.o), /不支持的 manifest schema 2/);
+});
+
+// ── LLM（EASY-2.1） ──────────────────────────────────────────────────────────
+test('buildSpecPrompt：含描述与 JSON 约束', () => {
+  const p = buildSpecPrompt('图书管理');
+  assert.match(p, /图书管理/);
+  assert.match(p, /"module"/);
+  assert.match(p, /"fields"/);
+  assert.match(p, /string\|text\|int\|bool\|date/);
+});
+
+test('parseSpecResponse：纯净 JSON / 代码块围栏 / 非法', () => {
+  const spec = parseSpecResponse('{"module":"books","label":"图书","fields":[{"name":"title","type":"string"},{"name":"price","type":"int"}]}');
+  assert.equal(spec.module, 'books');
+  assert.equal(spec.fields.length, 2);
+  assert.equal(spec.fields[1].type, 'int');
+
+  const fenced = parseSpecResponse('```json\n{"module":"posts","label":"帖子","fields":[{"name":"content","type":"text"}]}\n```');
+  assert.equal(fenced.module, 'posts');
+
+  assert.throws(() => parseSpecResponse('无 JSON'));
+  assert.throws(() => parseSpecResponse('{bad json'));
+});
+
+test('llmConfig：云端/本地/未配置', () => {
+  assert.equal(llmConfig({ DEEPSEEK_API_KEY: 'k' }).apiKey, 'k');
+  const cloud = llmConfig({ DEEPSEEK_API_KEY: 'k', DEEPSEEK_BASE_URL: 'https://api.deepseek.com' });
+  assert.equal(cloud.apiKey, 'k');
+  assert.match(cloud.endpoint, /\/chat\/completions$/);
+  const local = llmConfig({ OLLAMA_BASE_URL: 'http://localhost:11434' });
+  assert.equal(local.apiKey, '');
+  assert.match(local.endpoint, /\/v1\/chat\/completions$/);
+  assert.equal(llmConfig({}), null);
+});
+
+test('extractSpec：mock fetch 成功 / API 错误 / 无配置', async () => {
+  const okFetch = async () => ({
+    ok: true,
+    json: async () => ({ choices: [{ message: { content: '{"module":"books","label":"图书","fields":[{"name":"author","type":"string"}]}' } }] }),
+  });
+  const r = await extractSpec('图书管理', { fetchImpl: okFetch, env: { DEEPSEEK_API_KEY: 'k' } });
+  assert.equal(r.ok, true);
+  assert.equal(r.spec.module, 'books');
+
+  const errFetch = async () => ({ ok: false, status: 401, text: async () => 'unauthorized' });
+  const r2 = await extractSpec('x', { fetchImpl: errFetch, env: { DEEPSEEK_API_KEY: 'k' } });
+  assert.equal(r2.ok, false);
+  assert.match(r2.error, /401/);
+
+  const r3 = await extractSpec('x', { fetchImpl: okFetch, env: {} });
+  assert.equal(r3.ok, false);
+  assert.match(r3.error, /DEEPSEEK_API_KEY|OLLAMA_BASE_URL/);
+});
+
+test('--tab：路由 shell 分支 + app_shell Tab + i18n tab 标签（非 tab 不生成顶层路由）', async () => {
+  const root = await tempRoot();
+  await write(FE(root, 'main.dart'), `import 'features/todos/data/repositories/todos_repository.dart';
+import 'features/todos/presentation/providers/todos_provider.dart';
+      providers: [
+        ChangeNotifierProvider<TodosProvider>(
+          create: (_) => TodosProvider(TodosRepository(apiClient), cache: AppCache(prefs)),
+        ),
+      ],`);
+  await write(FE(root, 'core/router/app_router.dart'), `
+    routes: [
+          StatefulShellBranch(
+            routes: [
+              GoRoute(
+                path: '/todos',
+                pageBuilder: (_, _) => const NoTransitionPage(child: TodosPage()),
+              ),
+            ],
+          ),
+      // Legal pages
+    ],`);
+  await write(FE(root, 'core/widgets/app_shell.dart'), `    _TabItem(icon: CupertinoIcons.checkmark_square, labelKey: 'tabTodos'),
+  String _label(AppLocalizations l10n, String key) {
+    switch (key) {
+      case 'tabTodos':
+        return l10n.tabTodos;
+    }
+  }`);
+  await write(FE(root, 'core/i18n/app_localizations.dart'), `  String get tabTodos => _t('Todos', '待办');`);
+
+  const c = ctx({ isTab: true });
+  await wireFrontend(c, root);
+
+  const router = await readFile(FE(root, 'core/router/app_router.dart'), 'utf8');
+  assert.match(router, /path: '\/posts'/);
+  assert.match(router, /StatefulShellBranch/);
+  assert.doesNotMatch(router, /builder: \(_, _\) => const PostsPage\(\)/); // 非顶层路由
+
+  const shell = await readFile(FE(root, 'core/widgets/app_shell.dart'), 'utf8');
+  assert.match(shell, /labelKey: 'tabPosts'/);
+  assert.match(shell, /case 'tabPosts':/);
+
+  const i18n = await readFile(FE(root, 'core/i18n/app_localizations.dart'), 'utf8');
+  assert.match(i18n, /tabPosts/);
+});
+
+test('Web-Admin-Vue 模板：api + view 骨架', () => {
+  const files = adminFiles(ctx());
+  assert.equal(files.length, 2);
+  const api = files.find((f) => f.path.endsWith('.ts')).content;
+  assert.match(api, /admin\/all/);
+  assert.match(api, /remove\(id/);
+  const view = files.find((f) => f.path.endsWith('.vue')).content;
+  assert.match(view, /AppTable/);
+  assert.match(view, /ConfirmDialog/);
+  assert.match(view, /navPosts/);
+});
+
+test('wireAdmin：routes + navGroups + i18n zh/en + 后端导航映射', async () => {
+  const root = await tempRoot();
+  await write(`${root}/Web-Admin-Vue/src/router/routes.ts`, `      { path: 'data-import', name: 'data-import', component: () => import('@/views/data-import/DataImportView.vue'), meta: { title: 'navDataImport' } },`);
+  await write(`${root}/Web-Admin-Vue/src/layouts/AdminLayout.vue`, `      { name: 'data-import', to: '/data-import', icon: 'mdi-upload-multiple', label: t('navDataImport') },`);
+  await write(`${root}/Web-Admin-Vue/src/i18n/zh.ts`, `  navDataImport: '数据导入',`);
+  await write(`${root}/Web-Admin-Vue/src/i18n/en.ts`, `  navDataImport: 'Data Import',`);
+  await write(
+    `${root}/Server-NestJS/src/ai/constants/admin-pages.ts`,
+    `export const ADMIN_PAGE_ROUTES: Record<string, { route: string; description: string }> = {\n  dashboard: { route: '/', description: '首页/概览' },\n  'data-import': { route: '/data-import', description: '数据导入' },\n  templates: { route: '/templates', description: '模板市场' },\n};\n`,
+  );
+
+  const r = await wireAdmin(ctx(), root);
+  assert.ok(r.filter((x) => x.changed).length >= 5);
+  const routes = await readFile(`${root}/Web-Admin-Vue/src/router/routes.ts`, 'utf8');
+  assert.match(routes, /PostsView\.vue/);
+  // MOD-4：生成的路由必须带 `module:`。菜单（AdminLayout）与路由守卫（guards.ts）都只读这一处 ——
+  // 少了它，能力门对生成模块从不生效：模块被禁用，页面仍留在菜单里、也仍进得去。
+  // The generated route must carry `module:` — the menu and the route guard read that key and
+  // nothing else; without it the MOD-4 gate never fires for generated modules.
+  assert.match(routes, /meta: \{ title: 'navPosts', module: 'posts' \}/);
+  const nav = await readFile(`${root}/Web-Admin-Vue/src/layouts/AdminLayout.vue`, 'utf8');
+  assert.match(nav, /navPosts/);
+  const zh = await readFile(`${root}/Web-Admin-Vue/src/i18n/zh.ts`, 'utf8');
+  assert.match(zh, /navPosts: '帖子'/);
+  const en = await readFile(`${root}/Web-Admin-Vue/src/i18n/en.ts`, 'utf8');
+  assert.match(en, /navPosts: 'Post'/);
+  // 第三处同步：只写前端两处的话，页面在管理台里活着、System AI 却到不了 —— navigation-parity 门禁
+  // 判「孤页」。故这条断言钉的是「生成器把三处都补上」，而不只是「前端两处好看」。
+  //
+  // The third place: wiring only the two frontend spots leaves a page that lives in the console but
+  // that the System AI cannot reach — the navigation-parity gate calls that an orphan. This assertion
+  // pins "the generator fills all three", not just "the two frontend ones look right".
+  const pages = await readFile(`${root}/Server-NestJS/src/ai/constants/admin-pages.ts`, 'utf8');
+  assert.match(pages, /posts: \{ route: '\/posts', description: '帖子管理' \}/);
+
+  // 幂等：重跑不重复插入
+  const again = await wireAdmin(ctx(), root);
+  assert.equal(again.filter((x) => x.changed).length, 0);
+  assert.equal(
+    (await readFile(`${root}/Server-NestJS/src/ai/constants/admin-pages.ts`, 'utf8')).match(/route: '\/posts'/g).length,
+    1,
+  );
+});
+
+test('wireAdmin：已存在（手工补的、键没加引号）的导航条目不再插第二份', async () => {
+  // 实测撞过的坑：幂等判据若写成带引号的键名，一条手工补的、不带引号的同名条目就躲过检查，
+  // 于是插出第二份 → 编译期 TS1117「object literal cannot have multiple properties with the same
+  // name」。判据因此取**路由串**（两种写法都一样）。
+  //
+  // The trap that was actually hit: with the marker written as a quoted key, a hand-added entry
+  // without quotes slips past it, a second entry is inserted, and the build dies with TS1117. The
+  // marker is therefore the route string, which reads the same in either spelling.
+  const root = await tempRoot();
+  await write(
+    `${root}/Server-NestJS/src/ai/constants/admin-pages.ts`,
+    `export const ADMIN_PAGE_ROUTES: Record<string, { route: string; description: string }> = {\n  'data-import': { route: '/data-import', description: '数据导入' },\n  posts: { route: '/posts', description: '帖子管理' },\n};\n`,
+  );
+
+  const r = await wireAdmin(ctx(), root);
+  const pages = await readFile(`${root}/Server-NestJS/src/ai/constants/admin-pages.ts`, 'utf8');
+  assert.equal(r.find((x) => x.file.endsWith('admin-pages.ts')).changed, false);
+  assert.equal(pages.match(/route: '\/posts'/g).length, 1);
+});
+
+test('Taro 模板：service/types/store/page 骨架', () => {
+  const files = taroFiles(ctx());
+  assert.equal(files.length, 5);
+  const service = files.find((f) => f.path.endsWith('-service.ts')).content;
+  assert.match(service, /\/posts/);
+  assert.match(service, /api\.get/);
+  const store = files.find((f) => f.path.endsWith('-store.ts')).content;
+  assert.match(store, /defineStore/);
+  const page = files.find((f) => f.path.endsWith('.vue')).content;
+  assert.match(page, /<script setup lang="ts">/);
+  assert.match(page, /usePostsStore/);
+  // 样式走 script 里的 `import './index.scss'`，**不是** `<style src="…">` —— 后者在本仓的
+  // weapp 构建下过不了 postcss（`Cannot read properties of undefined (reading 'source')`），
+  // 而仓里另外 22 个页面用的都是 import 写法。两条断言各钉一半：写法对，且那个坑不回来。
+  //
+  // Styles come in through `import './index.scss'` in the script, **not** `<style src="…">` — the
+  // latter does not survive this repo's weapp build (postcss dies reading `source` of undefined),
+  // while the other 22 pages here all use the import form. The two assertions split the invariant:
+  // the form is right, and the trap has not come back.
+  assert.match(page, /import '\.\/index\.scss'/);
+  assert.doesNotMatch(page, /<style src=/);
+});
+
+test('AI 工具模板：query 读 + create 写需确认', () => {
+  const c = buildContext('suppliers', '供应商', [
+    { name: 'name', type: 'string', required: true },
+    { name: 'status', type: 'enum', enum: ['active', 'inactive'] },
+  ]);
+  const files = aiFiles({ ...c, featureFlag: true });
+  assert.equal(files.length, 4);
+  const query = files.find((f) => f.path.includes('query-') && !f.path.endsWith('.spec.ts')).content;
+  assert.match(query, /name = 'query_suppliers'/);
+  // The declared filter and the call must agree: `name` is a string column, so the tool declares
+  // `keyword` and forwards it to the list endpoint's `q`.
+  // 声明的过滤与调用必须一致：`name` 是字符串列，故工具声明 `keyword` 并把它转交给列表端点的 `q`。
+  assert.match(query, /findAll\(userId: number, q\?: string\)/);
+  assert.match(query, /findAll\(Number\(userId\), keyword\)/);
+  const create = files.find((f) => f.path.includes('create-') && !f.path.endsWith('.spec.ts')).content;
+  assert.match(create, /name = 'create_supplier'/);
+  assert.match(create, /requiresConfirmation = true/);
+  assert.match(create, /requireVerifiedEmail: true/);
+  assert.match(create, /@IsIn|enum: \['active', 'inactive'\]/);
+  assert.match(create, /dto\.name = args\.name/);
+  // AI 工具 spec：query/create 各带单测（写工具断言 requiresConfirmation）
+  const querySpec = files.find((f) => f.path.endsWith('query-suppliers.tool.spec.ts')).content;
+  assert.match(querySpec, /describe\('QuerySuppliersTool'/);
+  assert.match(querySpec, /toHaveBeenCalledWith\(7, undefined\)/);
+  const createSpec = files.find((f) => f.path.endsWith('create-suppliers.tool.spec.ts')).content;
+  assert.match(createSpec, /describe\('CreateSupplierTool'/);
+  assert.match(createSpec, /requiresConfirmation/);
+});
+
+test('wireAiModule：ai.module 六处接线 + 幂等', async () => {
+  const root = await tempRoot();
+  await makeFixtures(root);
+  const c = buildContext('suppliers', '供应商', [{ name: 'name', type: 'string', required: true }]);
+
+  const r1 = await wireAiModule({ ...c, featureFlag: true }, root);
+  assert.ok(r1.filter((x) => x.changed).length >= 6, `应接线 ≥6 处，实际 ${r1.filter((x) => x.changed).length}`);
+
+  const ai = await readFile(BE(root, 'ai/ai.module.ts'), 'utf8');
+  assert.match(ai, /SuppliersModule/);
+  assert.match(ai, /QuerySuppliersTool/);
+  assert.match(ai, /new CreateSupplierTool\(suppliersService\)/);
+  assert.match(ai, /inject: \[TodosService, SuppliersService/);
+
+  // 幂等重跑零改动
+  const r2 = await wireAiModule({ ...c, featureFlag: true }, root);
+  assert.equal(r2.filter((x) => x.changed).length, 0);
+});
+
+test('wireTaro：app.config pages + explore quickCards', async () => {
+  const root = await tempRoot();
+  await write(`${root}/Front-Taro/src/app.config.ts`, `    'pages/search/index',`);
+  await write(`${root}/Front-Taro/src/pages/explore/index.vue`, `  { icon: '⚙️', label: t('explore.settings'), color: '#9333EA', path: '/pages/settings/index' },`);
+
+  const r = await wireTaro(ctx(), root);
+  assert.ok(r.filter((x) => x.changed).length >= 2);
+  const app = await readFile(`${root}/Front-Taro/src/app.config.ts`, 'utf8');
+  assert.match(app, /pages\/posts\/index/);
+  const explore = await readFile(`${root}/Front-Taro/src/pages/explore/index.vue`, 'utf8');
+  assert.match(explore, /pages\/posts\/index/);
+});
+
+// ── 端到端：跑真实 CLI ───────────────────────────────────────────────────────
+test('端到端：非交互 CLI 生成 + 接线', async () => {
+  const root = await tempRoot();
+  await makeFixtures(root);
+  const cli = fileURLToPath(new URL('./keelbase-init.mjs', import.meta.url));
+
+  const out = await new Promise((resolve, reject) => {
+    const p = spawn(process.execPath, [cli, '--module', 'posts', '--label', '帖子', '--fields', 'title:string'], {
+      cwd: root,
+    });
+    let o = '';
+    let e = '';
+    p.stdout.on('data', (d) => (o += d));
+    p.stderr.on('data', (d) => (e += d));
+    p.on('close', (code) => (code === 0 ? resolve(o + e) : reject(new Error(`exit ${code}: ${o}${e}`))));
+  });
+
+  assert.match(out, /生成业务模块：posts/);
+  // 生成文件存在
+  await access(BE(root, 'posts/post.entity.ts'));
+  await access(BE(root, 'posts/posts.module.ts'));
+  await access(FE(root, 'features/posts/data/models/post_model.dart'));
+  await access(FE(root, 'features/posts/presentation/pages/posts_page.dart'));
+  // 接线已插入
+  const app = await readFile(BE(root, 'app.module.ts'), 'utf8');
+  assert.match(app, /PostsModule/);
+  const router = await readFile(FE(root, 'core/router/app_router.dart'), 'utf8');
+  assert.match(router, /path: '\/posts'/);
+  // Provenance：CLI 自动写 .keelbase/manifest.json（来源身份）
+  const man = JSON.parse(await readFile(`${root}/.keelbase/manifest.json`, 'utf8'));
+  assert.equal(man.identity, MANIFEST_IDENTITY);
+  assert.ok(man.modules.includes('posts'));
+});
+
+test('端到端：目标文件撞名（模块目录缺失但工具文件已存在）→ 拒绝且不覆盖', async () => {
+  const root = await tempRoot();
+  await makeFixtures(root);
+  const cli = fileURLToPath(new URL('./keelbase-init.mjs', import.meta.url));
+  // 模拟 AI CRM 旗舰已占用 query-suppliers.tool.ts，而模块目录 src/suppliers 不存在（= 撞名）
+  await write(BE(root, 'ai/tools/query-suppliers.tool.ts'), '// occupied by flagship\nexport class QuerySuppliersTool {}\n');
+  const specPath = `${root}/supplier.json`;
+  await write(
+    specPath,
+    JSON.stringify({ module: 'suppliers', label: '供应商', fields: [{ name: 'name', type: 'string', label: '名称' }] }),
+  );
+
+  const { code, out } = await new Promise((resolve) => {
+    const p = spawn(process.execPath, [cli, '--spec', specPath], { cwd: root });
+    let o = '';
+    let e = '';
+    p.stdout.on('data', (d) => (o += d));
+    p.stderr.on('data', (d) => (e += d));
+    p.on('close', (c) => resolve({ code: c, out: o + e }));
+  });
+  assert.notEqual(code, 0, `撞名应被拒绝，实际 exit=${code}`);
+  assert.match(out, /已被占用|撞名/);
+  // 既有旗舰文件未被覆盖
+  const kept = await readFile(BE(root, 'ai/tools/query-suppliers.tool.ts'), 'utf8');
+  assert.match(kept, /occupied by flagship/);
+});
+
+test('端到端：--force 不覆盖非生成器产物（既有目录但不在 manifest）', async () => {
+  const root = await tempRoot();
+  await makeFixtures(root);
+  const cli = fileURLToPath(new URL('./keelbase-init.mjs', import.meta.url));
+  // 既有目录（模拟手写模块 posts）+ manifest 未登记 posts
+  await write(BE(root, 'posts/posts.service.ts'), '// hand-written\n');
+  const run = (extra = []) =>
+    new Promise((resolve) => {
+      const p = spawn(
+        process.execPath,
+        [cli, '--module', 'posts', '--label', '帖子', '--fields', 'title:string', ...extra],
+        { cwd: root },
+      );
+      let o = '';
+      p.stdout.on('data', (d) => (o += d));
+      p.stderr.on('data', (d) => (o += d));
+      p.on('close', (c) => resolve({ code: c, out: o }));
+    });
+  const refused = await run(['--force']);
+  assert.notEqual(refused.code, 0, `非生成产物 --force 应被拒绝，实际 exit=${refused.code}`);
+  assert.match(refused.out, /非本生成器产物|manifest/);
+  // 手写文件未被覆盖
+  assert.match(await readFile(BE(root, 'posts/posts.service.ts'), 'utf8'), /hand-written/);
+  // 登记为生成产物（manifest）后 → --force 允许
+  await write(
+    `${root}/.keelbase/manifest.json`,
+    JSON.stringify({ schema: 1, identity: 'keelbase-application', generatorVersion: '1.0', protocol: '1.0', modules: ['posts'] }),
+  );
+  const allowed = await run(['--force']);
+  assert.equal(allowed.code, 0, `manifest 登记的模块应允许 --force，实际 exit=${allowed.code}`);
+});
+
+test('端到端：--spec 读协议 JSON（含 enum 选项）生成', async () => {
+  const root = await tempRoot();
+  await makeFixtures(root);
+  const cli = fileURLToPath(new URL('./keelbase-init.mjs', import.meta.url));
+  const specPath = `${root}/supplier.json`;
+  await write(specPath, JSON.stringify({
+    module: 'suppliers',
+    label: '供应商',
+    fields: [
+      { name: 'name', type: 'string', label: '名称' },
+      { name: 'status', type: 'enum', label: '状态', enum: ['active', 'inactive', 'blacklist'] },
+    ],
+  }));
+
+  const out = await new Promise((resolve, reject) => {
+    const p = spawn(process.execPath, [cli, '--spec', specPath], { cwd: root });
+    let o = '';
+    let e = '';
+    p.stdout.on('data', (d) => (o += d));
+    p.stderr.on('data', (d) => (e += d));
+    p.on('close', (code) => (code === 0 ? resolve(o + e) : reject(new Error(`exit ${code}: ${o}${e}`))));
+  });
+
+  assert.match(out, /生成业务模块：suppliers/);
+  // enum 选项透传：后端 @IsIn + entity 默认值；前端 model 默认 + 下拉
+  const dto = await readFile(BE(root, 'suppliers/dto/create-supplier.dto.ts'), 'utf8');
+  assert.match(dto, /@IsIn\(\['active', 'inactive', 'blacklist'\]\)/);
+  const entity = await readFile(BE(root, 'suppliers/supplier.entity.ts'), 'utf8');
+  assert.match(entity, /default: 'active'/);
+  const page = await readFile(FE(root, 'features/suppliers/presentation/pages/suppliers_page.dart'), 'utf8');
+  assert.match(page, /CupertinoSegmentedControl<String>/);
+  // AI 工具自动生成：读 + 写需确认
+  await access(BE(root, 'ai/tools/query-suppliers.tool.ts'));
+  await access(BE(root, 'ai/tools/create-suppliers.tool.ts'));
+  const createTool = await readFile(BE(root, 'ai/tools/create-suppliers.tool.ts'), 'utf8');
+  assert.match(createTool, /requiresConfirmation = true/);
+  const aiModule = await readFile(BE(root, 'ai/ai.module.ts'), 'utf8');
+  assert.match(aiModule, /new CreateSupplierTool\(suppliersService\)/);
+});
+
+// ── P0-9a：searchable 声明 → manifest 的可搜索清单 ──────────────────────────────
+/** Run the CLI once and hand back its exit code with stdout+stderr merged. */
+/* 跑一次 CLI，回传退出码与合并后的输出。 */
+async function runInit(root, args) {
+  const cli = fileURLToPath(new URL('./keelbase-init.mjs', import.meta.url));
+  return new Promise((resolve) => {
+    const p = spawn(process.execPath, [cli, ...args], { cwd: root });
+    let o = '';
+    let e = '';
+    p.stdout.on('data', (d) => (o += d));
+    p.stderr.on('data', (d) => (e += d));
+    p.on('close', (code) => resolve({ code, out: o + e }));
+  });
+}
+
+test('端到端：spec 声明 searchable: true → manifest 记进 searchableModules（运行时据此索引）', async () => {
+  const root = await tempRoot();
+  await makeFixtures(root);
+  const specPath = `${root}/books.json`;
+  await write(specPath, JSON.stringify({
+    module: 'books',
+    label: '图书',
+    searchable: true,
+    // 一个 string、一个 text、一个 enum、一个 int：清单只该收前两个，且保持声明顺序。
+    fields: [
+      { name: 'title', type: 'string', label: '书名' },
+      { name: 'summary', type: 'text', label: '简介' },
+      { name: 'status', type: 'enum', label: '状态', enum: ['unread', 'read'] },
+      { name: 'rating', type: 'int', label: '评分' },
+    ],
+  }));
+
+  const { code, out } = await runInit(root, ['--spec', specPath]);
+  assert.equal(code, 0, out);
+
+  // Both keys are written: `modules` says what was generated, `searchableModules` says what the
+  // runtime may match, and on which columns. Only the latter is read at runtime.
+  // 两个键都写：modules 是「生成了什么」，searchableModules 是「哪些可搜、搜哪些列」——运行时只读后者。
+  const man = JSON.parse(await readFile(`${root}/.keelbase/manifest.json`, 'utf8'));
+  assert.deepEqual(man.modules, ['books']);
+  assert.deepEqual(man.searchableModules, [{ module: 'books', fields: ['title', 'summary'] }]);
+
+  // A module that did not declare it stays out, while both kinds coexist in one manifest.
+  // 未声明 searchable 的模块不进清单（同一份 manifest 里两类模块并存）。
+  const plainSpec = `${root}/notes.json`;
+  await write(plainSpec, JSON.stringify({
+    module: 'notes',
+    label: '笔记',
+    fields: [{ name: 'title', type: 'string', label: '标题' }],
+  }));
+  assert.equal((await runInit(root, ['--spec', plainSpec])).code, 0);
+  const man2 = JSON.parse(await readFile(`${root}/.keelbase/manifest.json`, 'utf8'));
+  assert.deepEqual(man2.modules, ['books', 'notes']);
+  assert.deepEqual(man2.searchableModules, [{ module: 'books', fields: ['title', 'summary'] }]);
+});
+
+test('端到端：searchable 但无 string/text 字段 → 生成前拒绝（不做兑现不了的承诺）', async () => {
+  const root = await tempRoot();
+  await makeFixtures(root);
+  const specPath = `${root}/readings.json`;
+  await write(specPath, JSON.stringify({
+    module: 'readings',
+    label: '读数',
+    searchable: true,
+    // Only non-declarable columns. `status` is deliberately here: it IS a text column at the database
+    // level, and an implementation that matched "whatever looks textual" would consider this spec
+    // searchable. Under declared columns it is not — a status is an enumeration, not free text.
+    // 只有不可声明的列。`status` 是刻意放进来的：它在数据库层**确实**是文本列，一个「看着像文本就
+    // 匹配」的实现会认为这份 spec 可搜。在「列由声明来」的语义下它不可搜 —— 状态是枚举，不是自由文本。
+    fields: [
+      { name: 'value', type: 'int', label: '数值' },
+      { name: 'status', type: 'enum', label: '状态', enum: ['ok', 'bad'] },
+      { name: 'recordedAt', type: 'date', label: '记录时间' },
+    ],
+  }));
+
+  const { code, out } = await runInit(root, ['--spec', specPath]);
+  assert.notEqual(code, 0, `应拒绝，实际 exit=${code}`);
+  assert.match(out, /string \/ text/);
+  // The refusal lands before anything is written: no module directory, no manifest.
+  // 拒绝发生在写文件之前：模块目录与 manifest 都不该出现。
+  await assert.rejects(access(BE(root, 'readings')));
+  await assert.rejects(access(`${root}/.keelbase/manifest.json`));
+
+  // Control: the same fields generate fine without `searchable` — what is refused is the claim,
+  // not the fields.
+  // 对照组：同样的字段去掉 searchable 就能生成 —— 被拒的是那条声明，不是这些字段。
+  await write(specPath, JSON.stringify({
+    module: 'readings',
+    label: '读数',
+    fields: [
+      { name: 'value', type: 'int', label: '数值' },
+      { name: 'recordedAt', type: 'date', label: '记录时间' },
+    ],
+  }));
+  assert.equal((await runInit(root, ['--spec', specPath])).code, 0);
+  const man = JSON.parse(await readFile(`${root}/.keelbase/manifest.json`, 'utf8'));
+  assert.deepEqual(man.searchableModules, []);
+});
+
+test('本仓清单里的 searchableModules 就是生成器对 specs/books.json 会写出的那一份', async () => {
+  // The repo's own manifest is checked in by hand, and the runtime reads *it* — so the claim "books
+  // is searchable" has to be true of two files at once. This regenerates from the repo's actual spec
+  // and compares, which is the difference between "the hand-written entry looks right" and "the
+  // generator, given that spec, produces exactly this".
+  // 本仓的清单是手工检入的，而运行时读的正是**它** —— 故「books 可搜」这件事必须同时对两个文件成立。
+  // 这里用仓库真实的 spec 重生成一遍再比对：这正是「手工那条看着对」与「生成器拿到这份 spec 就产出
+  // 这一条」之间的差别。
+  const repoRoot = fileURLToPath(new URL('..', import.meta.url));
+  const spec = JSON.parse(await readFile(join(repoRoot, 'specs/books.json'), 'utf8'));
+  const repoManifest = JSON.parse(await readFile(join(repoRoot, '.keelbase/manifest.json'), 'utf8'));
+
+  const root = await tempRoot();
+  await makeFixtures(root);
+  const specPath = `${root}/books.json`;
+  await write(specPath, JSON.stringify(spec));
+  assert.equal((await runInit(root, ['--spec', specPath])).code, 0);
+
+  const generated = JSON.parse(await readFile(`${root}/.keelbase/manifest.json`, 'utf8'));
+  // Compare the books entry rather than the whole array: the repository now holds more than one
+  // searchable module, and whole-array equality would fold "how many are there" into a claim that is
+  // only about how books is described. Same reasoning as the feature-flag list: pin the entry, not
+  // the inventory.
+  // 逐条比对 books 那一条，而不是整个数组：本仓现在不止一个可搜模块，整数组相等会把「一共有几个」
+  // 混进一条只关于「books 这条怎么描述」的断言里。理由与 feature flag 那张清单相同：钉条目，不钉总数。
+  const booksEntry = (m) => m.searchableModules.filter((x) => x.module === 'books');
+  assert.deepEqual(booksEntry(generated), booksEntry(repoManifest));
+  // 且它确实是一条有列可搜的声明（不是两个文件一起空着）
+  assert.equal(booksEntry(generated).length, 1);
+  assert.ok(booksEntry(generated)[0].fields.length > 0);
+});
+
+// ── P0-9b：scope 声明 → 生成物真的参与行级数据范围 ──────────────────────────────
+test('端到端：spec 声明 scope → 实体多出范围列、服务走范围构造、模块自登记', async () => {
+  const root = await tempRoot();
+  await makeFixtures(root);
+  const specPath = `${root}/reports.json`;
+  await write(specPath, JSON.stringify({
+    module: 'reports',
+    label: '报告',
+    scope: ['dept', 'org'], // 顺序刻意倒着写：归一后应为 org, dept
+    fields: [{ name: 'title', type: 'string', label: '标题' }],
+  }));
+  assert.equal((await runInit(root, ['--spec', specPath])).code, 0);
+
+  const entity = await readFile(BE(root, 'reports/report.entity.ts'), 'utf8');
+  assert.match(entity, /@Index\(\['orgId'\]\)/);
+  assert.match(entity, /name: 'org_id'/);
+  assert.match(entity, /name: 'dept_id'/);
+
+  const service = await readFile(BE(root, 'reports/reports.service.ts'), 'utf8');
+  // 范围来自平台既有构件，不是每模块一份私有实现
+  assert.match(service, /resolveScopeDescriptor\(userId, 'Report'/);
+  assert.match(service, /buildScopeWhere<Record<string, unknown>>\(descriptor, 'Report'\)/);
+  assert.match(service, /rowInScope\(/);
+  // 创建盖章：成员的行归属组织，缺组织则保持仅本人
+  assert.match(service, /orgContextOf\(this\.orgService, userId\)/);
+  assert.match(service, /orgId: orgContext\?\.orgId \?\? undefined/);
+  assert.match(service, /deptId: orgContext\?\.deptId \?\? undefined/);
+
+  const module_ = await readFile(BE(root, 'reports/reports.module.ts'), 'utf8');
+  // 自登记（与 pii 的 registerSensitiveKeys 同一手法）——登记的是归一后的级别
+  assert.match(service, /registerScopeColumns\('Report', \{ owner: 'userId', org: 'orgId', dept: 'deptId' \}\)/);
+  assert.match(service, /registerOrgLevelSubject\('Report'\)/);
+  assert.match(module_, /OrgModule/);
+});
+
+test('端到端：未声明 scope 的模块不带任何范围接线（缺省仍是仅本人，绝不静默放宽）', async () => {
+  const root = await tempRoot();
+  await makeFixtures(root);
+  const specPath = `${root}/notes.json`;
+  await write(specPath, JSON.stringify({
+    module: 'notes',
+    label: '笔记',
+    fields: [{ name: 'title', type: 'string', label: '标题' }],
+  }));
+  assert.equal((await runInit(root, ['--spec', specPath])).code, 0);
+
+  const entity = await readFile(BE(root, 'notes/note.entity.ts'), 'utf8');
+  assert.doesNotMatch(entity, /org_id|dept_id/);
+  const service = await readFile(BE(root, 'notes/notes.service.ts'), 'utf8');
+  assert.doesNotMatch(service, /buildScopeWhere|rowInScope|OrgService|registerScopeColumns/);
+  // The default branch is still own-only. A declared text column only adds the `q` filter *on top of*
+  // it (`: { userId };`), never instead of it — so that fallback has to stay visible right here.
+  // 缺省分支仍只回本人。声明文本列只是把 `q` 过滤叠加在它**之上**（`: { userId };`），不是替换它 ——
+  // 故这条回退必须仍在这里看得见。
+  assert.match(service, /: \{ userId \};/);
+  const module_ = await readFile(BE(root, 'notes/notes.module.ts'), 'utf8');
+  assert.doesNotMatch(module_, /OrgModule/);
+});
+
+test('端到端：scope 声明非法 → 生成前拒绝（不产出一个参与不了范围体系的模块）', async () => {
+  const cases = [
+    { scope: ['dept'], hint: /dept 就必须同时声明 org/ },
+    { scope: ['org', 'org'], hint: /重复级别/ },
+    { scope: ['team'], hint: /未知级别/ },
+    { scope: [], hint: /非空数组/ },
+    { scope: 'org', hint: /非空数组/ },
+  ];
+  for (const [i, c] of cases.entries()) {
+    const root = await tempRoot();
+    await makeFixtures(root);
+    const specPath = `${root}/reports.json`;
+    await write(specPath, JSON.stringify({
+      module: 'reports',
+      label: '报告',
+      scope: c.scope,
+      fields: [{ name: 'title', type: 'string', label: '标题' }],
+    }));
+
+    const { code, out } = await runInit(root, ['--spec', specPath]);
+    assert.notEqual(code, 0, `case #${i} 应被拒绝，实际 exit=${code}`);
+    assert.match(out, c.hint);
+    // 拒绝发生在写文件之前
+    await assert.rejects(access(BE(root, 'reports')));
+  }
+});
+
+// ── P0-12 输入通道：OpenAPI → Protocol ─────────────────────────────────────────
+test('parseOpenApiSpec：OpenAPI 3 类型映射（string/int/bool/date/enum + 保留字段/对象跳过）', () => {
+  const spec = {
+    openapi: '3.0.0',
+    components: { schemas: { Customer: { type: 'object', properties: {
+      id: { type: 'integer' },
+      name: { type: 'string' },
+      status: { type: 'string', enum: ['active', 'inactive', 'archived'] },
+      birthday: { type: 'string', format: 'date' },
+      vip: { type: 'boolean' },
+      score: { type: 'number' },
+      orders: { type: 'array', items: { type: 'object' } },
+      meta: { type: 'object' },
+    } } } },
+  };
+  const r = parseOpenApiSpec(spec);
+  assert.equal(r.module, 'customers');
+  assert.deepEqual(
+    r.fields.map((f) => `${f.name}:${f.type}`),
+    ['name:string', 'status:enum', 'birthday:date', 'vip:bool', 'score:int'],
+  );
+  assert.deepEqual(r.fields.find((f) => f.name === 'status').enum, ['active', 'inactive', 'archived']);
+});
+
+test('parseOpenApiSpec：Swagger 2 definitions + 指定 schema', () => {
+  const spec = { swagger: '2.0', definitions: { Order: { type: 'object', properties: {
+    id: { type: 'integer' },
+    amount: { type: 'number' },
+    createdAt: { type: 'string', format: 'date-time' },
+  } }, Customer: { type: 'object', properties: { name: { type: 'string' } } } } };
+  const r = parseOpenApiSpec(spec, { schema: 'Customer', module: 'clients', label: '客户' });
+  assert.equal(r.module, 'clients');
+  assert.equal(r.label, '客户');
+  assert.deepEqual(r.fields, [{ name: 'name', type: 'string' }]);
+});
+
+test('parseOpenApiSpec：无 schemas / enum 选项不合法时降级 string', () => {
+  assert.match(parseOpenApiSpec({ openapi: '3.0.0' }).error, /未找到可用的 schemas/);
+  const spec = { components: { schemas: { Foo: { properties: { status: { type: 'string', enum: ['Active', 'in progress', 'x'] } } } } } };
+  const r = parseOpenApiSpec(spec);
+  assert.equal(r.fields[0].type, 'string'); // 选项非法 → 降级 string
+});
+
+test('parseOpenApiSpec：required/label 透传 + skipped 诊断（保留/关系/非法名/enum 降级）', () => {
+  const spec = {
+    openapi: '3.0.0',
+    components: { schemas: { Customer: {
+      type: 'object',
+      required: ['name', 'status', 'owner', 'tier'],
+      properties: {
+        id: { type: 'integer' },
+        name: { type: 'string', title: '客户名称' },
+        status: { type: 'string', enum: ['Active', 'in progress'] },
+        owner: { type: 'string', description: '负责人' },
+        tier: { type: 'string', enum: ['basic', 'pro'], title: '等级' },
+        orders: { type: 'array', items: { $ref: '#/components/schemas/Order' } },
+        ref: { $ref: '#/components/schemas/Contact' },
+        '9first': { type: 'string' },
+        extra: { type: 'string', title: '额外' },
+      },
+    } } },
+  };
+  const r = parseOpenApiSpec(spec);
+  // required 透传（合法字段 + required 才标；保留/关系不在 fields 中）
+  assert.equal(r.fields.find((f) => f.name === 'name').required, true);
+  assert.equal(r.fields.find((f) => f.name === 'owner').required, true);
+  assert.equal(r.fields.find((f) => f.name === 'tier').required, true);
+  assert.equal(r.fields.find((f) => f.name === 'extra').required, undefined); // 未列 required 不误标
+  // label 透传：title 优先，description 兜底
+  assert.equal(r.fields.find((f) => f.name === 'name').label, '客户名称');
+  assert.equal(r.fields.find((f) => f.name === 'owner').label, '负责人');
+  assert.equal(r.fields.find((f) => f.name === 'extra').label, '额外');
+  // label 安全化：去掉引号/换行/反斜杠
+  const badTitle = parseOpenApiSpec({ components: { schemas: { Foo: { properties: { a: { type: 'string', title: "引'号\n反\\斜杠" } } } } } });
+  assert.equal(badTitle.fields[0].label, '引号反斜杠');
+  // 合法 enum 保留 + required；非法 enum 降级 string + 诊断
+  assert.deepEqual(r.fields.find((f) => f.name === 'tier').enum, ['basic', 'pro']);
+  assert.equal(r.fields.find((f) => f.name === 'status').type, 'string');
+  assert.ok(r.skipped.some((s) => s.name === 'status' && /降级/.test(s.reason)));
+  // 保留字段 / 关系 / 非法名 诊断
+  assert.ok(r.skipped.some((s) => s.name === 'id' && /保留/.test(s.reason)));
+  assert.ok(r.skipped.some((s) => s.name === 'orders' && /关系/.test(s.reason)));
+  assert.ok(r.skipped.some((s) => s.name === 'ref' && /关系/.test(s.reason)));
+  assert.ok(r.skipped.some((s) => s.name === '9first' && /非法/.test(s.reason)));
+  // 全部保留/关系字段被记入，fields 只含标量
+  assert.deepEqual(r.fields.map((f) => f.name), ['name', 'status', 'owner', 'tier', 'extra']);
+});
+
+// ── AI Bridge 加固（§3）：YAML / $ref / allOf / number 精度 / 多 schema 提示 ──
+test('parseYaml：嵌套 map/list/引号/内联 enum/多行注释（OpenAPI YAML 子集）', () => {
+  const yaml = `
+openapi: 3.0.1
+info:
+  title: Contract API
+  version: 1.0
+components:
+  schemas:
+    Contract:
+      type: object
+      required:
+        - title
+      properties:
+        title:
+          type: string
+          description: 合同名称
+        status:
+          type: string
+          enum: [draft, active]
+        tags:
+          - 内部
+          - 外部
+`;
+  const r = parseYaml(yaml);
+  assert.equal(r.openapi, '3.0.1');
+  assert.equal(r.info.title, 'Contract API');
+  assert.deepEqual(r.components.schemas.Contract.required, ['title']);
+  assert.equal(r.components.schemas.Contract.properties.title.description, '合同名称');
+  assert.deepEqual(r.components.schemas.Contract.properties.status.enum, ['draft', 'active']);
+  assert.deepEqual(r.components.schemas.Contract.properties.tags, ['内部', '外部']);
+});
+
+test('parseOpenApiSpec：$ref 关系标注 + 顶层 allOf 合并 + number 精度 notes', () => {
+  // $ref 关系标注落入手写清单
+  const ref = parseOpenApiSpec({
+    components: { schemas: { Order: { type: 'object', properties: {
+      owner: { $ref: '#/components/schemas/User' },
+      title: { type: 'string' },
+    } } } },
+  });
+  assert.ok(ref.skipped.some((s) => s.name === 'owner' && /关系 \$ref/.test(s.reason)));
+  assert.ok(ref.fields.some((f) => f.name === 'title'));
+
+  // 顶层 allOf 组合：合并标量 properties + required
+  const allOf = parseOpenApiSpec({
+    components: { schemas: { Order: { allOf: [
+      { type: 'object', properties: { base: { type: 'string' } } },
+      { type: 'object', properties: { amount: { type: 'number' } }, required: ['amount'] },
+    ] } } },
+  });
+  assert.ok(allOf.fields.some((f) => f.name === 'base'));
+  const amount = allOf.fields.find((f) => f.name === 'amount');
+  assert.equal(amount.required, true);
+
+  // number 精度 notes（format double / type number → int 提示）
+  assert.ok(allOf.notes.some((n) => /amount/.test(n) && /丢精度/.test(n)));
+
+  // 字段级 allOf 含 $ref → 关系跳过（需至少一个标量字段避免返回 error）
+  const allOfRef = parseOpenApiSpec({
+    components: { schemas: { X: { type: 'object', properties: {
+      title: { type: 'string' },
+      detail: { allOf: [{ $ref: '#/components/schemas/User' }] },
+    } } } },
+  });
+  assert.ok(allOfRef.skipped.some((s) => s.name === 'detail' && /关系/.test(s.reason)));
+});
+
+test('parseSqlDdl：DECIMAL/REAL → int 丢精度 notes', () => {
+  const r = parseSqlDdl(`CREATE TABLE orders (
+    id INTEGER PRIMARY KEY,
+    title VARCHAR(120) NOT NULL,
+    amount DECIMAL(10,2),
+    price REAL
+  );`);
+  assert.ok(r.notes.some((n) => /amount/.test(n) && /DECIMAL/.test(n)));
+  assert.ok(r.notes.some((n) => /price/.test(n) && /REAL/.test(n)));
+});
+
+// ── AI Bridge B 路径（§4 完整 B）：OpenAPI operations → ProxyTool 配置 ────────
+test('parseOpenApiProxy：operations → 工具（读 R1 / 写 R3 + 参数映射）', () => {
+  const r = parseOpenApiProxy({
+    paths: {
+      '/customers': {
+        get: { operationId: 'listCustomers', summary: '客户列表', parameters: [{ name: 'keyword', in: 'query', schema: { type: 'string' }, description: '关键字' }] },
+        post: { operationId: 'createCustomer', summary: '新建', tags: ['crm'], requestBody: { content: { 'application/json': { schema: { type: 'object', required: ['name'], properties: { name: { type: 'string' }, annualSpend: { type: 'number' } } } } } } },
+      },
+      '/customers/{id}': {
+        get: { operationId: 'getCustomer', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }] },
+      },
+    },
+  }, { baseUrl: 'http://erp', audience: 'legacy-erp' });
+  assert.equal(r.error, undefined);
+  assert.equal(r.baseUrl, 'http://erp');
+  assert.equal(r.audience, 'legacy-erp');
+  assert.equal(r.tools.length, 3);
+
+  const list = r.tools.find((t) => t.name === 'list_customers');
+  assert.equal(list.method, 'GET');
+  assert.equal(list.riskLevel, 'R1');
+  assert.equal(list.parameters[0].name, 'keyword');
+  assert.equal(list.parameters[0].type, 'string');
+  assert.equal(list.parameters[0].required, false);
+
+  const create = r.tools.find((t) => t.name === 'create_customer');
+  assert.equal(create.method, 'POST');
+  assert.equal(create.riskLevel, 'R3'); // 写默认
+  assert.match(create.description, /\[crm\]/); // tag 前缀
+  const name = create.parameters.find((p) => p.name === 'name');
+  assert.equal(name.required, true); // requestBody.required 透传
+  const spend = create.parameters.find((p) => p.name === 'annualSpend');
+  assert.equal(spend.type, 'number');
+  assert.equal(spend.required, false);
+
+  const get = r.tools.find((t) => t.name === 'get_customer');
+  assert.equal(get.path, '/customers/{id}'); // OpenAPI 路径模板直接透传
+  const id = get.parameters.find((p) => p.name === 'id');
+  assert.equal(id.type, 'integer');
+  assert.equal(id.required, true); // path 参数必填
+});
+
+test('parseOpenApiProxy：riskLevel 覆盖 + YAML flow-map 字符串 schema + 名称冲突去重', () => {
+  // YAML 子集解析器把嵌套 flow-map 存为字符串（键值无引号非严格 JSON）——模拟真实 parseYaml 产物
+  const r = parseOpenApiProxy({
+    paths: {
+      '/customers/{id}': {
+        delete: {
+          operationId: 'removeCustomer',
+          'x-keelbase-risk-level': 'R4',
+          parameters: [{ name: 'id', in: 'path', required: true, schema: '{ type: integer }' }],
+        },
+        get: {
+          parameters: [{ name: 'id', in: 'path', required: true, schema: '{ type: integer }' }],
+        },
+      },
+    },
+  }, {});
+  assert.equal(r.tools.length, 2);
+  const del = r.tools.find((t) => t.method === 'DELETE');
+  assert.equal(del.riskLevel, 'R4'); // x-keelbase-risk-level 覆盖默认 R3
+  assert.equal(del.parameters[0].type, 'integer'); // flow-map 字符串 schema 解析出类型
+  assert.equal(del.name, 'remove_customer'); // operationId 优先
+  // 无 operationId 的 GET → 派生名 method_path
+  assert.ok(r.tools.some((t) => t.name === 'get_customers_id'));
+});
+
+test('parseOpenApiProxy：连字符 path 参数（{customer-id}）→ 占位符重写为清洗名 {customer_id} + 参数对齐', () => {
+  const r = parseOpenApiProxy({
+    paths: {
+      '/orders/{customer-id}': {
+        get: { operationId: 'getOrdersByCustomer', parameters: [{ name: 'customer-id', in: 'path', required: true, schema: { type: 'integer' } }] },
+      },
+    },
+  }, {});
+  const t = r.tools[0];
+  assert.equal(t.path, '/orders/{customer_id}'); // 占位符与参数名对齐（ProxyTool 按名取 args）
+  const p = t.parameters.find((x) => x.name === 'customer_id');
+  assert.equal(p.type, 'integer');
+  assert.equal(p.required, true);
+});
+
+test('parseOpenApiProxy：x-keelbase-revoke-path → revokePath（Java 端补偿端点约定）', () => {
+  const r = parseOpenApiProxy({
+    paths: {
+      '/contracts/{id}': {
+        delete: { operationId: 'removeContract', 'x-keelbase-revoke-path': 'DELETE /contracts/{id}', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }] },
+      },
+    },
+  }, {});
+  const t = r.tools[0];
+  assert.equal(t.revokePath, 'DELETE /contracts/{id}');
+  assert.match(t.description, /撤销/);
+});
+
+test('parseOpenApiProxy：Swagger 2（in: body 参数）→ body 字段解析', () => {
+  const r = parseOpenApiProxy({
+    swagger: '2.0',
+    paths: {
+      '/contracts': {
+        post: {
+          operationId: 'createContract',
+          summary: '新建合同',
+          parameters: [
+            { name: 'body', in: 'body', required: true, schema: { type: 'object', required: ['name'], properties: { name: { type: 'string', description: '合同名称' }, amount: { type: 'number' } } } },
+          ],
+        },
+      },
+    },
+  }, {});
+  const t = r.tools[0];
+  assert.equal(t.method, 'POST');
+  const name = t.parameters.find((p) => p.name === 'name');
+  const amount = t.parameters.find((p) => p.name === 'amount');
+  assert.ok(name, 'Swagger 2 body 参数 schema 属性应解析');
+  assert.equal(name.required, true);
+  assert.equal(name.type, 'string');
+  assert.equal(amount.type, 'number');
+});
+
+test('parseOpenApiProxy：无 paths / 空工具 → error', () => {
+  assert.match(parseOpenApiProxy({ openapi: '3.0.0' }, {}).error, /未找到可用 operations/);
+  assert.match(parseOpenApiProxy({ paths: { '/x': { parameters: [] } } }, {}).error, /没有可转换的 operations/);
+  assert.match(parseOpenApiProxy(null, {}).error, /无效的 OpenAPI/);
+});
+
+test('gateTierOf：风险级 → 门控档位（R0–R2 自动 / R3 确认 / R4 人工审批 / R5 阻断）', () => {
+  assert.deepEqual(
+    ['R0', 'R1', 'R2', 'R3', 'R4', 'R5'].map(gateTierOf),
+    ['auto', 'auto', 'auto', 'confirm', 'approval', 'blocked'],
+  );
+});
+
+test('summarizeRiskPreview：逐工具档位/依据 + 汇总（读=自动，写=确认，覆盖 R5=阻断，覆盖 R4=审批）', () => {
+  const r = parseOpenApiProxy({
+    paths: {
+      '/customers': {
+        get: { operationId: 'listCustomers' },
+        post: { operationId: 'createCustomer' },
+      },
+      '/customers/{id}': {
+        delete: {
+          operationId: 'deleteCustomer',
+          'x-keelbase-risk-level': 'R5',
+          parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+        },
+      },
+      '/exports': {
+        post: { operationId: 'runExport', 'x-keelbase-risk-level': 'R4' },
+      },
+    },
+  }, {});
+  assert.equal(r.error, undefined);
+  const p = summarizeRiskPreview(r);
+  assert.deepEqual(
+    p.rows.map((x) => `${x.name}:${x.access}:${x.riskLevel}:${x.gateTier}:${x.basis}`),
+    [
+      'list_customers:read:R1:auto:default-read',
+      'create_customer:write:R3:confirm:default-write',
+      'delete_customer:write:R5:blocked:override',
+      'run_export:write:R4:approval:override',
+    ],
+  );
+  assert.deepEqual(p.byGateTier, { auto: 1, confirm: 1, approval: 1, blocked: 1 });
+  assert.equal(p.total, 4);
+  assert.equal(p.read, 1);
+  assert.equal(p.write, 3);
+  assert.deepEqual(p.writeTools, ['create_customer', 'delete_customer', 'run_export']);
+  // Evidence lives beside the config; the generated proxy tool shape must not grow a `riskBasis` field.
+  // 依据放在配置旁边；生成的 proxy 工具形状不得多出 `riskBasis` 字段。
+  assert.deepEqual(r.riskBases, {
+    list_customers: 'default-read',
+    create_customer: 'default-write',
+    delete_customer: 'override',
+    run_export: 'override',
+  });
+  assert.ok(!('riskBasis' in r.tools[0]));
+});
+
+// ── P0-12 输入通道：SQL DDL → Protocol ────────────────────────────────────────
+test('parseSqlDdl：类型映射（text/int/bool/date/enum）+ 保留列/约束行跳过', () => {
+  const sql = `CREATE TABLE IF NOT EXISTS customers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name VARCHAR(100) NOT NULL,
+    bio TEXT,
+    vip BOOLEAN DEFAULT 0,
+    status VARCHAR(20) DEFAULT 'active' CHECK (status IN ('active','inactive','archived')),
+    birthday DATE,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME,
+    deleted_at DATETIME,
+    score DECIMAL(10,2),
+    long_note VARCHAR(1000),
+    UNIQUE (email)
+  );`;
+  const r = parseSqlDdl(sql);
+  assert.equal(r.module, 'customers');
+  assert.deepEqual(
+    r.fields.map((f) => `${f.name}:${f.type}`),
+    ['name:string', 'bio:text', 'vip:bool', 'status:enum', 'birthday:date', 'score:int', 'long_note:text'],
+  );
+  assert.deepEqual(r.fields.find((f) => f.name === 'status').enum, ['active', 'inactive', 'archived']);
+});
+
+test('parseSqlDdl：NOT NULL → required + skipped 诊断（保留列/约束行/未知类型）', () => {
+  const sql = `CREATE TABLE assets (
+    id INTEGER PRIMARY KEY,
+    code VARCHAR(32) NOT NULL,
+    name VARCHAR(100),
+    category_id INTEGER,
+    meta JSON,
+    created_at DATETIME,
+    UNIQUE (code)
+  );`;
+  const r = parseSqlDdl(sql);
+  // NOT NULL → required；可空不标
+  assert.equal(r.fields.find((f) => f.name === 'code').required, true);
+  assert.equal(r.fields.find((f) => f.name === 'name').required, undefined);
+  assert.equal(r.fields.find((f) => f.name === 'category_id').required, undefined); // 关系列保留为 int，非 NOT NULL 不标
+  // 保留列 / 约束行 / 未知类型 诊断
+  assert.ok(r.skipped.some((s) => s.name === 'id' && /保留/.test(s.reason)));
+  assert.ok(r.skipped.some((s) => s.name === 'created_at' && /保留/.test(s.reason)));
+  assert.ok(r.skipped.some((s) => s.name === 'unique' && /约束/.test(s.reason)));
+  assert.ok(r.skipped.some((s) => s.name === 'meta' && /未知类型/.test(s.reason)));
+});
+
+test('parseSqlDdl：多表选指定表 + 无 CREATE TABLE 报错', () => {
+  const sql = `CREATE TABLE orders (
+    id SERIAL PRIMARY KEY,
+    customer_id INTEGER REFERENCES customers(id),
+    amount NUMERIC(12,2),
+    status TEXT CHECK (status IN ('pending','paid','cancelled')),
+    created_at TIMESTAMP
+  );
+  CREATE TABLE customers (id INTEGER PRIMARY KEY, name VARCHAR(50));`;
+  const r = parseSqlDdl(sql, { table: 'orders' });
+  assert.equal(r.module, 'orders');
+  assert.deepEqual(r.fields.map((f) => f.name), ['customer_id', 'amount', 'status']);
+  assert.match(parseSqlDdl('SELECT 1;').error, /未找到 CREATE TABLE/);
+  assert.match(parseSqlDdl('').error, /空的 SQL/);
+});
+
+// ── P0-12 CLI：--import-* --out 写协议 JSON ───────────────────────────────────
+test('端到端：--import-openapi --out 写出可被 --spec 消费的协议 JSON', async () => {
+  const root = await tempRoot();
+  const cli = fileURLToPath(new URL('./keelbase-init.mjs', import.meta.url));
+  const swaggerPath = `${root}/swagger.json`;
+  await write(swaggerPath, JSON.stringify({ components: { schemas: {
+    Customer: { properties: { name: { type: 'string' }, status: { type: 'string', enum: ['active', 'inactive'] } } },
+  } } }));
+
+  const out = await new Promise((resolve, reject) => {
+    const p = spawn(process.execPath, [cli, '--import-openapi', swaggerPath, '--module', 'customers', '--out', `${root}/spec.json`], { cwd: root });
+    let o = '';
+    let e = '';
+    p.stdout.on('data', (d) => (o += d));
+    p.stderr.on('data', (d) => (e += d));
+    p.on('close', (code) => (code === 0 ? resolve(o + e) : reject(new Error(`exit ${code}: ${o}${e}`))));
+  });
+
+  assert.match(out, /写出协议/);
+  const spec = JSON.parse(await readFile(`${root}/spec.json`, 'utf8'));
+  assert.equal(spec.module, 'customers');
+  assert.ok(spec.fields.some((f) => f.name === 'name'));
+  // 产物可被 --spec 消费（字段合法）
+  assert.equal(validateFields(spec.fields), null);
+});
+
+test('端到端：--import-openapi-proxy 写出 B 路径 Proxy 配置（读 R1 / 写 R3 + 委托身份）', async () => {
+  const root = await tempRoot();
+  const cli = fileURLToPath(new URL('./keelbase-init.mjs', import.meta.url));
+  const specPath = `${root}/erp.yaml`;
+  await write(specPath, `openapi: 3.0.0
+paths:
+  /customers:
+    get:
+      operationId: listCustomers
+      summary: 客户列表
+      parameters:
+        - { name: keyword, in: query, schema: { type: string }, description: 关键字 }
+    post:
+      operationId: createCustomer
+      summary: 新建客户
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+  /customers/{id}:
+    delete:
+      operationId: removeCustomer
+      x-keelbase-risk-level: R4
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+`);
+
+  const out = await new Promise((resolve, reject) => {
+    const p = spawn(process.execPath, [cli, '--import-openapi-proxy', specPath, '--base-url', 'http://erp:8080/api', '--audience', 'legacy-erp', '--out', `${root}/proxy.json`], { cwd: root });
+    let o = '';
+    let e = '';
+    p.stdout.on('data', (d) => (o += d));
+    p.stderr.on('data', (d) => (e += d));
+    p.on('close', (code) => (code === 0 ? resolve(o + e) : reject(new Error(`exit ${code}: ${o}${e}`))));
+  });
+
+  assert.match(out, /写出 B 路径 Proxy 配置/);
+  const cfg = JSON.parse(await readFile(`${root}/proxy.json`, 'utf8'));
+  assert.equal(cfg.baseUrl, 'http://erp:8080/api');
+  assert.equal(cfg.audience, 'legacy-erp');
+  assert.equal(cfg.tools.length, 3);
+  assert.equal(cfg.tools.find((t) => t.name === 'list_customers').riskLevel, 'R1');
+  assert.equal(cfg.tools.find((t) => t.name === 'create_customer').riskLevel, 'R3');
+  assert.equal(cfg.tools.find((t) => t.name === 'remove_customer').riskLevel, 'R4');
+  assert.equal(cfg.tools.find((t) => t.name === 'get_customers_id'), undefined); // 无 GET /customers/{id}
+  // 产物可被 ProxyToolRegistryService 消费（name/method/path/parameters 齐全）
+  for (const t of cfg.tools) {
+    assert.ok(t.name && t.method && t.path && Array.isArray(t.parameters));
+  }
+});
+
+test('端到端：多文件 OpenAPI（外部 $ref schema）→ proxy 配置 body 参数解析', async () => {
+  const root = await tempRoot();
+  const cli = fileURLToPath(new URL('./keelbase-init.mjs', import.meta.url));
+  // 主 spec：paths 的 requestBody 引用外部文件 schema（真实企业 spec 常见拆分）
+  await write(`${root}/erp.yaml`, `openapi: 3.0.0
+paths:
+  /contracts:
+    post:
+      operationId: createContract
+      summary: 新建合同
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "./schemas.yaml#/components/schemas/Contract"
+`);
+  // 外部 schema 文件
+  await write(`${root}/schemas.yaml`, `components:
+  schemas:
+    Contract:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, description: 合同名称 }
+        tier: { type: string, enum: [basic, pro] }
+`);
+
+  const out = await new Promise((resolve, reject) => {
+    const p = spawn(process.execPath, [cli, '--import-openapi-proxy', `${root}/erp.yaml`, '--base-url', 'http://erp:8080/api', '--audience', 'legacy-erp', '--out', `${root}/proxy.json`], { cwd: root });
+    let o = '';
+    let e = '';
+    p.stdout.on('data', (d) => (o += d));
+    p.stderr.on('data', (d) => (e += d));
+    p.on('close', (code) => (code === 0 ? resolve(o + e) : reject(new Error(`exit ${code}: ${o}${e}`))));
+  });
+
+  assert.match(out, /写出 B 路径 Proxy 配置/);
+  const cfg = JSON.parse(await readFile(`${root}/proxy.json`, 'utf8'));
+  const create = cfg.tools.find((t) => t.name === 'create_contract');
+  assert.ok(create, '应生成 create_contract');
+  // 外部 $ref body schema 已被 deref：name（required）与 tier 进参数
+  const name = create.parameters.find((p) => p.name === 'name');
+  const tier = create.parameters.find((p) => p.name === 'tier');
+  assert.ok(name, '外部 schema 的 name 应解析为 body 参数');
+  assert.equal(name.required, true);
+  assert.equal(name.type, 'string');
+  assert.ok(tier, '外部 schema 的 tier 应解析');
+  assert.equal(tier.type, 'string');
+});
+
+test('端到端：--import-openapi-proxy --list-tools 预览工具清单（不生成）', async () => {
+  const root = await tempRoot();
+  const cli = fileURLToPath(new URL('./keelbase-init.mjs', import.meta.url));
+  const specPath = `${root}/erp.yaml`;
+  await write(specPath, `openapi: 3.0.0
+paths:
+  /contracts:
+    get: { operationId: listContracts }
+    post: { operationId: createContract }
+`);
+
+  const out = await new Promise((resolve, reject) => {
+    const p = spawn(process.execPath, [cli, '--import-openapi-proxy', specPath, '--list-tools'], { cwd: root });
+    let o = '';
+    let e = '';
+    p.stdout.on('data', (d) => (o += d));
+    p.stderr.on('data', (d) => (e += d));
+    p.on('close', (code) => (code === 0 ? resolve(o + e) : reject(new Error(`exit ${code}: ${o}${e}`))));
+  });
+
+  assert.match(out, /接入风险预览（2 个工具：读 1 \/ 写 1）/);
+  assert.match(out, /list_contracts\s+GET \/contracts\s+读 · R1 · 自动 · 默认读/);
+  assert.match(out, /create_contract\s+POST \/contracts\s+写 · R3 · 确认 · 默认写/);
+  assert.match(out, /汇总：自动 1 · 确认 1 · 人工审批 0 · 阻断 0/);
+  assert.match(out, /写工具（1）：create_contract/);
+  // 不写任何文件（纯预览）
+  await assert.rejects(access(`${root}/proxy.json`));
+});
+
+test('specs/external-crm.openapi.json 可被 import-openapi-proxy 消费（EB-1 示例 spec 健康，读 R1 / 写 R3）', async () => {
+  const root = fileURLToPath(new URL('..', import.meta.url));
+  const spec = JSON.parse(await readFile(join(root, 'specs/external-crm.openapi.json'), 'utf8'));
+  const out = parseOpenApiProxy(spec, { baseUrl: 'http://legacy-crm:8080/api', audience: 'legacy-crm' });
+  assert.ok(out.tools, '应解析出工具（而非 error）');
+  const names = out.tools.map((t) => t.name).sort();
+  assert.deepEqual(names, [
+    'create_followup_task',
+    'get_customer',
+    'list_customer_orders',
+    'list_customers',
+    'update_order_amount',
+  ]);
+  assert.equal(out.tools.find((t) => t.name === 'list_customers').riskLevel, 'R1');
+  assert.equal(out.tools.find((t) => t.name === 'create_followup_task').riskLevel, 'R3');
+});
+
+test('端到端：--import-openapi --out 协议含 required/label 透传 + skipped 诊断', async () => {
+  const root = await tempRoot();
+  const cli = fileURLToPath(new URL('./keelbase-init.mjs', import.meta.url));
+  const swaggerPath = `${root}/swagger.json`;
+  await write(swaggerPath, JSON.stringify({ components: { schemas: {
+    Customer: {
+      required: ['name'],
+      properties: {
+        id: { type: 'integer' },
+        name: { type: 'string', title: '客户名称' },
+        orders: { type: 'array', items: { type: 'object' } },
+      },
+    },
+  } } }));
+
+  await new Promise((resolve, reject) => {
+    const p = spawn(process.execPath, [cli, '--import-openapi', swaggerPath, '--module', 'customers', '--out', `${root}/spec.json`], { cwd: root });
+    let o = '';
+    let e = '';
+    p.stdout.on('data', (d) => (o += d));
+    p.stderr.on('data', (d) => (e += d));
+    p.on('close', (code) => (code === 0 ? resolve(o + e) : reject(new Error(`exit ${code}: ${o}${e}`))));
+  });
+
+  const spec = JSON.parse(await readFile(`${root}/spec.json`, 'utf8'));
+  assert.equal(spec.fields.find((f) => f.name === 'name').required, true);
+  assert.equal(spec.fields.find((f) => f.name === 'name').label, '客户名称');
+  assert.ok(spec.skipped.some((s) => s.name === 'id' && /保留/.test(s.reason)));
+  assert.ok(spec.skipped.some((s) => s.name === 'orders' && /关系/.test(s.reason)));
+  // 产物仍可被 --spec 消费（skipped 为诊断信息，不影响字段合法性）
+  assert.equal(validateFields(spec.fields), null);
+});
+
+test('端到端：--import-schema --out 写出协议 JSON（enum 透传）', async () => {
+  const root = await tempRoot();
+  const cli = fileURLToPath(new URL('./keelbase-init.mjs', import.meta.url));
+  const sqlPath = `${root}/schema.sql`;
+  await write(sqlPath, `CREATE TABLE suppliers (
+    id INTEGER PRIMARY KEY,
+    name VARCHAR(100),
+    tier VARCHAR(20) CHECK (tier IN ('basic','pro','enterprise'))
+  );`);
+
+  await new Promise((resolve, reject) => {
+    const p = spawn(process.execPath, [cli, '--import-schema', sqlPath, '--table', 'suppliers', '--out', `${root}/supplier.json`], { cwd: root });
+    let o = '';
+    let e = '';
+    p.stdout.on('data', (d) => (o += d));
+    p.stderr.on('data', (d) => (e += d));
+    p.on('close', (code) => (code === 0 ? resolve(o + e) : reject(new Error(`exit ${code}: ${o}${e}`))));
+  });
+
+  const spec = JSON.parse(await readFile(`${root}/supplier.json`, 'utf8'));
+  assert.equal(spec.module, 'suppliers');
+  const tier = spec.fields.find((f) => f.name === 'tier');
+  assert.deepEqual(tier.enum, ['basic', 'pro', 'enterprise']);
+  assert.equal(validateFields(spec.fields), null);
+});
+
+test('端到端：--import-schema --out 协议含 required 透传 + skipped 诊断', async () => {
+  const root = await tempRoot();
+  const cli = fileURLToPath(new URL('./keelbase-init.mjs', import.meta.url));
+  const sqlPath = `${root}/schema.sql`;
+  await write(sqlPath, `CREATE TABLE contracts (
+    id INTEGER PRIMARY KEY,
+    title VARCHAR(200) NOT NULL,
+    amount NUMERIC(12,2) NOT NULL,
+    meta JSON,
+    created_at DATETIME
+  );`);
+
+  await new Promise((resolve, reject) => {
+    const p = spawn(process.execPath, [cli, '--import-schema', sqlPath, '--table', 'contracts', '--out', `${root}/contract.json`], { cwd: root });
+    let o = '';
+    let e = '';
+    p.stdout.on('data', (d) => (o += d));
+    p.stderr.on('data', (d) => (e += d));
+    p.on('close', (code) => (code === 0 ? resolve(o + e) : reject(new Error(`exit ${code}: ${o}${e}`))));
+  });
+
+  const spec = JSON.parse(await readFile(`${root}/contract.json`, 'utf8'));
+  assert.equal(spec.fields.find((f) => f.name === 'title').required, true);
+  assert.equal(spec.fields.find((f) => f.name === 'amount').required, true);
+  assert.ok(spec.skipped.some((s) => s.name === 'id' && /保留/.test(s.reason)));
+  assert.ok(spec.skipped.some((s) => s.name === 'meta' && /未知类型/.test(s.reason)));
+  // 产物仍可被 --spec 消费
+  assert.equal(validateFields(spec.fields), null);
+});
+
+test('端到端：--import-schema 直接生成（无 --out，enum 透传 + AI 工具）', async () => {
+  const root = await tempRoot();
+  await makeFixtures(root);
+  const cli = fileURLToPath(new URL('./keelbase-init.mjs', import.meta.url));
+  const sqlPath = `${root}/schema.sql`;
+  await write(sqlPath, `CREATE TABLE suppliers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name VARCHAR(100) NOT NULL,
+    tier VARCHAR(20) DEFAULT 'basic' CHECK (tier IN ('basic','pro','enterprise')),
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );`);
+
+  const out = await new Promise((resolve, reject) => {
+    const p = spawn(process.execPath, [cli, '--import-schema', sqlPath, '--table', 'suppliers', '--module', 'suppliers', '--label', '供应商'], { cwd: root });
+    let o = '';
+    let e = '';
+    p.stdout.on('data', (d) => (o += d));
+    p.stderr.on('data', (d) => (e += d));
+    p.on('close', (code) => (code === 0 ? resolve(o + e) : reject(new Error(`exit ${code}: ${o}${e}`))));
+  });
+
+  assert.match(out, /生成业务模块：suppliers/);
+  // enum 从 CHECK IN 透传：entity 默认值 + DTO @IsIn
+  const entity = await readFile(BE(root, 'suppliers/supplier.entity.ts'), 'utf8');
+  assert.match(entity, /default: 'basic'/);
+  const dto = await readFile(BE(root, 'suppliers/dto/create-supplier.dto.ts'), 'utf8');
+  assert.match(dto, /@IsIn\(\['basic', 'pro', 'enterprise'\]\)/);
+  // 自动附 AI 工具（读 + 写需确认）
+  await access(BE(root, 'ai/tools/query-suppliers.tool.ts'));
+  const createTool = await readFile(BE(root, 'ai/tools/create-suppliers.tool.ts'), 'utf8');
+  assert.match(createTool, /requiresConfirmation = true/);
+});
+
+test('specs/ 协议文件全部可被生成器消费（协议生态基础检查）', async () => {
+  const fsp = await import('node:fs/promises');
+  const root = fileURLToPath(new URL('..', import.meta.url));
+  const dir = join(root, 'specs');
+  // OpenAPI 文件（external-crm.openapi.json 等）是 --import-openapi 输入，非协议 JSON，跳过
+  const files = (await fsp.readdir(dir)).filter((f) => f.endsWith('.json') && !f.endsWith('.openapi.json'));
+  assert.ok(files.length >= 8, `应有 ≥8 份协议，实际 ${files.length}`);
+  for (const f of files) {
+    const spec = JSON.parse(await fsp.readFile(join(dir, f), 'utf8'));
+    assert.ok(spec.module, `${f}: 缺 module`);
+    assert.equal(validateFields(spec.fields || []), null, `${f}: 字段非法`);
+    assert.doesNotThrow(
+      () => buildContext(spec.module, spec.label || spec.module, spec.fields || []),
+      `${f}: buildContext 失败`,
+    );
+  }
+});
+
+test('生成模块一致性：协议字段 ⊆ 实体字段（books/notes/contracts/suppliers 已验证产物）', async () => {
+  const fsp = await import('node:fs/promises');
+  const root = fileURLToPath(new URL('..', import.meta.url));
+  // 端到端验证过的生成模块：specs 即其生成来源（books/notes 已按 specs 回填实体字段，2026-08-20）
+  const verified = [
+    { spec: 'books.json', module: 'books' },
+    { spec: 'notes.json', module: 'notes' },
+    { spec: 'contract.json', module: 'contracts' },
+    { spec: 'supplier.json', module: 'suppliers' },
+  ];
+  for (const { spec, module } of verified) {
+    const specData = JSON.parse(await fsp.readFile(join(root, 'specs', spec), 'utf8'));
+    const ctx = buildContext(module, specData.label, specData.fields);
+    const entityPath = join(root, 'Server-NestJS', 'src', module, `${ctx.singular}.entity.ts`);
+    const entity = await fsp.readFile(entityPath, 'utf8');
+    for (const f of specData.fields) {
+      assert.ok(entity.includes(f.name), `${module}: 实体缺协议字段 ${f.name}`);
+    }
+  }
+});
+
+test('validateAiTools（Protocol 2.0）：合法/非法形态', () => {
+  assert.equal(validateAiTools(null), null);
+  assert.equal(validateAiTools(undefined), null);
+  assert.equal(validateAiTools({ enabled: true, query: { riskLevel: 'R1' }, create: { riskLevel: 'R4' } }), null);
+  assert.equal(validateAiTools({ create: false, query: false }), null);
+  assert.equal(validateAiTools({ create: { riskLevel: 'R2' } }), null);
+  assert.equal(validateAiTools({ create: 'yes' }), 'aiTools.create 必须是 false 或 { riskLevel, requiresConfirmation }');
+  assert.equal(validateAiTools({ create: { riskLevel: 'R9' } }), 'aiTools.create.riskLevel 必须是 R0-R5');
+  assert.equal(validateAiTools({ query: { riskLevel: 'r1' } }), 'aiTools.query.riskLevel 必须是 R0-R5');
+  assert.equal(validateAiTools({ enabled: 'true' }), 'aiTools.enabled 必须是布尔');
+  // requiresConfirmation=false 需显式 R1/R2（写工具不确认 = 低风险写）
+  assert.equal(
+    validateAiTools({ create: { requiresConfirmation: false } }),
+    'aiTools.create: requiresConfirmation=false 需显式配 R1/R2 风险级',
+  );
+  assert.equal(
+    validateAiTools({ create: { requiresConfirmation: false, riskLevel: 'R4' } }),
+    'aiTools.create: requiresConfirmation=false 需显式配 R1/R2 风险级',
+  );
+});
+
+test('aiFiles（Protocol 2.0）：aiTools 开关过滤 + create/query riskLevel 透出', () => {
+  const ctx = buildContext('posts', '帖子', [{ name: 'title', type: 'string', label: '标题', required: true }]);
+
+  // 缺省：query + create 都生成（create R3 + 确认，与旧协议一致；create 文件名复数、工具名单数）
+  let files = aiFiles(ctx);
+  assert.ok(files.some((f) => f.path === 'ai/tools/query-posts.tool.ts'));
+  let create = files.find((f) => f.path === 'ai/tools/create-posts.tool.ts').content;
+  assert.match(create, /readonly riskLevel = 'R3';/);
+  assert.match(create, /readonly requiresConfirmation = true;/);
+
+  // enabled:false → 全部不生成（只读敏感模块）
+  assert.equal(aiFiles({ ...ctx, aiTools: { enabled: false } }).length, 0);
+
+  // create:false → 只生成 query
+  files = aiFiles({ ...ctx, aiTools: { create: false } });
+  assert.equal(files.filter((f) => f.path.includes('create-posts.tool')).length, 0);
+  assert.ok(files.some((f) => f.path === 'ai/tools/query-posts.tool.ts'));
+
+  // query:false → 只生成 create
+  files = aiFiles({ ...ctx, aiTools: { query: false } });
+  assert.ok(files.some((f) => f.path === 'ai/tools/create-posts.tool.ts'));
+  assert.equal(files.filter((f) => f.path.includes('query-posts.tool')).length, 0);
+
+  // create R4（双人审批）+ query R2（策略决定）→ 风险级透出
+  files = aiFiles({ ...ctx, aiTools: { create: { riskLevel: 'R4' }, query: { riskLevel: 'R2' } } });
+  create = files.find((f) => f.path === 'ai/tools/create-posts.tool.ts').content;
+  assert.match(create, /readonly riskLevel = 'R4';/);
+  assert.match(create, /readonly requiresConfirmation = true;/);
+  const query = files.find((f) => f.path === 'ai/tools/query-posts.tool.ts').content;
+  assert.match(query, /readonly riskLevel = 'R2';/);
+
+  // create R2 + requiresConfirmation:false → 不设确认行（自动/策略决定）
+  files = aiFiles({ ...ctx, aiTools: { create: { riskLevel: 'R2', requiresConfirmation: false } } });
+  create = files.find((f) => f.path === 'ai/tools/create-posts.tool.ts').content;
+  assert.match(create, /readonly riskLevel = 'R2';/);
+  assert.doesNotMatch(create, /readonly requiresConfirmation = true;/);
+});
+
+/**
+ * 模块名的单复数：不规则走表，表外仍朴素（**不猜**）。2026-10-12 修 —— `points_entries` 此前被单数化成
+ * `points_entrie`（只剥尾字母 `s`），反向也会把表名 `addresses` 变成 `addressess`。
+ *
+ * The module name's singular and plural forms. `toSingular` used to strip a trailing `s` and nothing
+ * else, so an irregular plural produced a nonsense name — `points_entries` became `points_entrie`, and a
+ * table called `addresses` would have come back out as `addressess`. Only the words that show up as
+ * table and resource names are in the table; everything else keeps the plain `-s` behaviour, because
+ * `movies` and `entries` end alike and resolve oppositely, and a general rule is wrong on one of them.
+ */
+test('模块名单复数：不规则走表，表外仍朴素（不猜）', () => {
+  assert.equal(toSingular('posts'), 'post');
+  assert.equal(toPlural('post'), 'posts');
+  assert.equal(toPlural('posts'), 'posts');
+
+  // 复合名：只有**最后一段**是中心词（拿整名查表会错过 `entries`）
+  assert.equal(toSingular('points_entries'), 'points_entry');
+  assert.equal(toPlural('points_entries'), 'points_entries');
+  assert.equal(toPlural('point_entry'), 'point_entries');
+  assert.equal(toPlural('user_profiles'), 'user_profiles');
+
+  assert.equal(toSingular('addresses'), 'address');
+  assert.equal(toPlural('address'), 'addresses');
+  assert.equal(toSingular('categories'), 'category');
+  assert.equal(toPlural('category'), 'categories');
+  assert.equal(toSingular('companies'), 'company');
+
+  // 表外的词保持原样：`movies` 与 `entries` 同形不同解 ⇒ 宁可朴素，也别猜错。
+  assert.equal(toSingular('movies'), 'movie');
+  assert.equal(toPlural('movies'), 'movies');
+
+  // Issue #76：这六个是像样的表名/资源名，而朴素规则把它们的单数剥错（模块名会一路传到实体文件名与类名）。
+  // 逐个钉住「单数对」**且**「往返仍对」—— 表里补词不能把 `toPlural` 弄坏。
+  const issue76 = [
+    ['buses', 'bus'],
+    ['heroes', 'hero'],
+    ['gases', 'gas'],
+    ['quizzes', 'quiz'],
+    ['shelves', 'shelf'],
+    ['vertices', 'vertex'],
+  ];
+  for (const [plural, singular] of issue76) {
+    assert.equal(toSingular(plural), singular, `toSingular(${plural})`);
+    assert.equal(toPlural(plural), plural, `toPlural(${plural}) 应原样往返`);
+    assert.equal(toPlural(singular), plural, `toPlural(${singular})`);
+  }
+  // 邻域的**反例**：`cases` 与 `gases` 同尾异解 —— 补表不许把它们搅在一起（这是「表而非规则」的理由）。
+  assert.equal(toSingular('cases'), 'case');
+  assert.equal(toPlural('case'), 'cases');
+});
+
+test('WIRED_FILES：还原清单覆盖接线会改的每一个文件（含 CLAUDE.md）', () => {
+  // wireAdmin 会改 CLAUDE.md，而共用检出的调用方正是按 WIRED_FILES 还原；漏掉它就会把改动留在树上。
+  // wireAdmin edits CLAUDE.md, and a shared-checkout caller restores exactly WIRED_FILES.
+  assert.ok(WIRED_FILES.includes('CLAUDE.md'), 'CLAUDE.md 必须列在 WIRED_FILES 里');
+});
+
+test('wireAdmin：把新模块补进 CLAUDE.md §13 的模块清单，且幂等', async () => {
+  // 为什么值得一条用例：`check:admin-pages` 拿 views/ 下的目录与那一行对账，而生成器此前不碰 CLAUDE.md
+  // ⇒ 每生成一个模块，那道门就红一次，直到有人手工补上（实测：复制模块那一轮）。而且
+  // `create_module_apply` 只跑 CLI —— 补不了，于是助手造出来的模块会留下一道红门。
+  const root = await mkdtemp(join(tmpdir(), 'kb-wire-admin-'));
+  await writeFile(
+    join(root, 'CLAUDE.md'),
+    '前略\n**模块**（括号内 = `Web-Admin-Vue/src/views/` 下的目录名）：登录(`login`) / **生成与示例模块**(`books` · `point_records`)\n后略\n',
+  );
+
+  const ctx = buildContext('points_ledgers', '积分台账', [{ name: 'points', type: 'int' }]);
+
+  const first = await wireAdmin(ctx, root);
+  assert.equal(first.find((r) => r.file.endsWith('CLAUDE.md'))?.changed, true);
+  const after = await readFile(join(root, 'CLAUDE.md'), 'utf8');
+  assert.ok(after.includes('`point_records` · `points_ledgers`)'), '应追加进那一行的括号内');
+
+  // 幂等：再跑一次不动它（否则每次生成都改一行文档）
+  const second = await wireAdmin(ctx, root);
+  assert.equal(second.find((r) => r.file.endsWith('CLAUDE.md'))?.changed, false);
+  assert.equal(await readFile(join(root, 'CLAUDE.md'), 'utf8'), after);
+});

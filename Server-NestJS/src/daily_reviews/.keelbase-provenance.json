@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "module": "daily_reviews",
+  "generator": "keelbase",
+  "generatorVersion": "1.3.0",
+  "protocol": "1.1",
+  "source": "spec:specs/daily_reviews.json",
+  "generatedAt": "2026-11-03T10:32:08.507Z"
+}

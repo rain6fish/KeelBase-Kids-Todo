@@ -1,0 +1,276 @@
+// SPDX-License-Identifier: Apache-2.0
+
+/**
+ * P0-14 Agent Decision Trace：用户可见的 AI 执行轨迹。
+ *
+ * 把分散在 ai_messages（输入/回复）、ai_audit_logs（工具调用/确认/完成/错误）、
+ * ai_tool_side_effects（写操作实际创建记录）三张表的数据，合并为按时间排序的
+ * TraceStep 时间线——用户本人可在对话历史里查看「AI 为什么做这一步」。
+ *
+ * 所有权闸门复用 ConversationService.getConversation（CASL），非本人 404/403。
+ * 只读聚合，不写库、不新增表。
+ */
+
+import { Injectable } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
+import { AiAuditLog } from '../../governance-shared/entities/ai-audit-log.entity';
+import { ConversationService, ConversationData } from '../conversation/conversation.service';
+import { AiToolEffectsService } from '../../governance-shared/services/ai-tool-effects.service';
+import { parseToolCall as parseToolCallShared } from '../../governance-shared/services/tool-name';
+import {
+  parseConfirmation as parseConfirmationShared,
+  type ConfirmationOutcome,
+} from '../../governance-shared/services/confirmation-detail';
+import type { AppAbility } from '../../common/casl/casl-ability.factory';
+
+export type TraceStepType =
+  | 'input' // 用户提问
+  | 'assistant' // AI 文本回复（非空）
+  | 'tool_call' // AI 调用工具（含成功/失败）
+  | 'confirmation' // 写操作确认决策
+  | 'effect' // 写工具实际创建的记录
+  | 'notice'; // chat/knowledge/plan/analyze/error/navigate 等摘要
+
+export interface TraceEffect {
+  effectId: number;
+  resultType: string;
+  resultId: number;
+  targetTitle?: string | null;
+  revocable: boolean;
+  /**
+   * The server-normalized lifecycle status (`executed` / `revoked` / `revoking_external` /
+   * `revoke_failed`), passed through from `EffectProjection.normalizeStatus` unchanged — the trace
+   * does not derive a second one. There is no "absent" value here: `listForConversation` always
+   * supplies it.
+   *
+   * 服务端归一的生命周期状态（`executed` / `revoked` / `revoking_external` / `revoke_failed`），
+   * 由 `EffectProjection.normalizeStatus` 原样透传 —— 轨迹不自算第二套。这里没有「缺席」这个取值：
+   * `listForConversation` 恒下发。
+   */
+  status: string;
+  /** E-1 字段级变更快照（JSON 字符串；create 类 before 为 null） */
+  before?: string | null;
+  after?: string | null;
+}
+
+export interface TraceStep {
+  id: string;
+  type: TraceStepType;
+  time: string;
+  toolName?: string;
+  args?: string;
+  success?: boolean;
+  errorMessage?: string | null;
+  /** W5-⑦ Explainable Authz：工具被拒时 AuthorizationDeniedError 的检查清单（为何阻止） */
+  checks?: Array<{ name: string; ok: boolean; note?: string }>;
+  outcome?: ConfirmationOutcome;
+  trusted?: boolean;
+  content?: string;
+  detail?: string | null;
+  model?: string;
+  provider?: string;
+  tokens?: number;
+  effect?: TraceEffect;
+  /** D4 多 Agent 归责：执行该步骤的子 agent 标识 / 调用方 agent */
+  agentId?: string;
+  callerAgentId?: string;
+  /** §internal.16 A-1 业务事件名（CustomerRiskAssessed 等） */
+  businessEvent?: string | null;
+  /** §internal.16 A-1 Decision Evidence（JSON 字符串：{decision, evidence[], policy, confidence}） */
+  evidence?: string | null;
+}
+
+export interface DecisionTrace {
+  conversation: {
+    id: string;
+    provider: string;
+    model: string;
+    summary?: string | null;
+    createdAt: string;
+    lastActivityAt: string;
+  };
+  steps: TraceStep[];
+}
+
+@Injectable()
+export class DecisionTraceService {
+  constructor(
+    @InjectRepository(AiAuditLog)
+    private readonly auditRepo: Repository<AiAuditLog>,
+    private readonly conversationService: ConversationService,
+    private readonly toolEffectsService: AiToolEffectsService,
+  ) {}
+
+  async getConversationTrace(
+    id: string,
+    userId: string,
+    ability: AppAbility,
+  ): Promise<DecisionTrace> {
+    // 所有权闸门：非本人/不存在在此抛出 404/403
+    const conv = await this.conversationService.getConversation(id, userId, ability);
+    return this._buildTrace(conv, id);
+  }
+
+  /** §internal.16 A-2 业务实体账本：跳所有权闸门（授权由实体级兜底），跨用户会话读取步骤 */
+  async getConversationTracePeek(id: string): Promise<DecisionTrace> {
+    const conv = await this.conversationService.peekConversation(id);
+    return this._buildTrace(conv, id);
+  }
+
+  private async _buildTrace(conv: ConversationData, id: string): Promise<DecisionTrace> {
+    const [logs, effects] = await Promise.all([
+      this.auditRepo.find({
+        where: { conversationId: id },
+        order: { createdAt: 'ASC' },
+      }),
+      this.toolEffectsService.listForConversation(id),
+    ]);
+
+    const steps: TraceStep[] = [];
+
+    // 消息 → input / assistant（tool 原始结果与 system 提示不进轨迹）
+    conv.messages.forEach((m, i) => {
+      if (m.role === 'user') {
+        steps.push({ id: `msg-${i}`, type: 'input', time: m.timestamp, content: m.content });
+      } else if (m.role === 'assistant' && m.content && m.content.trim().length > 0) {
+        steps.push({ id: `msg-${i}`, type: 'assistant', time: m.timestamp, content: m.content });
+      }
+    });
+
+    // 审计日志 → tool_call / confirmation / notice
+    for (const log of logs) {
+      if (log.action === 'tool_call') {
+        const parsed = parseToolCallFromDetail(log.detail);
+        // The tool name comes from the row's own `tool` column (C-3; contract `ai-audit-log-row` v5)
+        // and only falls back to parsing `detail` for rows that predate that column. A refused call is
+        // exactly where the two disagree across implementations — the column was added so a reader
+        // stops re-deriving the tool from text whose grammar is the producer's own.
+        //
+        // 工具名取该行自己的 `tool` 列（C-3；契约 `ai-audit-log-row` v5），只有该列之前写下的旧行
+        // 才回落解析 `detail`。**被拒的那一次调用**正是两种写法跨实现分歧的地方 —— 这一列之所以存在，
+        // 就是要让读取侧不再从「文法归产出方所有」的那句文本里重新推出工具名。
+        const toolName = log.tool ?? parsed.toolName;
+        const { args } = parsed;
+        steps.push({
+          id: `tool-${log.id}`,
+          type: 'tool_call',
+          time: log.createdAt.toISOString(),
+          toolName,
+          args,
+          success: !log.isError,
+          errorMessage: log.errorMessage,
+          checks: parseChecks(log.authorization),
+          agentId: log.agentId,
+          callerAgentId: log.callerAgentId,
+          // §internal.16 A-1 业务行为取证：业务事件名 + Decision Evidence（链外透出）
+          businessEvent: log.businessEvent ?? null,
+          evidence: log.evidence ?? null,
+        });
+      } else if (log.action === 'tool_confirmation') {
+        const parsed = parseConfirmation(log.detail);
+        steps.push({
+          id: `conf-${log.id}`,
+          type: 'confirmation',
+          time: log.createdAt.toISOString(),
+          toolName: parsed.toolName,
+          args: parsed.args,
+          outcome: parsed.outcome,
+          trusted: parsed.trusted,
+          agentId: log.agentId,
+          callerAgentId: log.callerAgentId,
+        });
+      } else {
+        const tokens = (log.promptTokens ?? 0) + (log.completionTokens ?? 0);
+        steps.push({
+          id: `log-${log.id}`,
+          type: 'notice',
+          time: log.createdAt.toISOString(),
+          detail: log.detail,
+          model: log.model,
+          provider: log.provider,
+          tokens: tokens > 0 ? tokens : undefined,
+          success: !log.isError,
+          errorMessage: log.errorMessage,
+          agentId: log.agentId,
+          callerAgentId: log.callerAgentId,
+        });
+      }
+    }
+
+    // 写操作副作用 → effect（AI 实际创建/修改的记录）
+    for (const eff of effects) {
+      steps.push({
+        id: `effect-${eff.id}`,
+        type: 'effect',
+        time: eff.createdAt,
+        toolName: eff.toolName,
+        effect: {
+          effectId: eff.id,
+          resultType: eff.resultType,
+          resultId: eff.resultId,
+          targetTitle: eff.targetTitle ?? null,
+          // KB-6：可撤以服务端单一权威判定（listForConversation 已按 _isRevocable 下发 revocable）——
+          // 此处不再自算（原 `status==='executed' && revokeClass!=='none'` 是第二套规则，新增档位即漂移）
+          revocable: eff.revocable,
+          // The status is the projection's own reading, passed through untouched. Do not re-derive it
+          // here from `revocable`/`targetSoftDeleted`: that would be a second rule that drifts.
+          // 状态是投影自己的读数，原样透传。不要在这里用 `revocable`/`targetSoftDeleted` 重算：
+          // 那是第二套规则，会漂。
+          status: eff.status,
+          before: eff.beforeSnapshot ?? null,
+          after: eff.afterSnapshot ?? null,
+        },
+      });
+    }
+
+    steps.sort((a, b) => (a.time < b.time ? -1 : a.time > b.time ? 1 : 0));
+
+    return {
+      conversation: {
+        id: conv.id,
+        provider: conv.provider,
+        model: conv.model,
+        summary: conv.summary ?? null,
+        createdAt: conv.createdAt,
+        lastActivityAt: conv.lastActivityAt,
+      },
+      steps,
+    };
+  }
+}
+
+/** W5-⑦：authorization 列是 AuthorizationDeniedError.reasons（checks[]）的 JSON；非法/缺失返回 undefined */
+function parseChecks(raw?: string | null): Array<{ name: string; ok: boolean; note?: string }> | undefined {
+  if (!raw) return undefined;
+  try {
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** detail 形如 `create_event({"title":"..."})` → 拆出工具名与参数 JSON 字符串（走共享解析器）。
+ *  不像工具调用的 detail 仍按原样充当工具名 —— 轨迹宁可显示原文，也不显示空。
+ *  调用点只在行的 `tool` 列缺席（该列之前的旧行）时才用这里的 `toolName`（见上面 tool_call 分支）。 */
+function parseToolCallFromDetail(detail?: string | null): { toolName: string; args?: string } {
+  const parsed = parseToolCallShared(detail);
+  if (!parsed) return { toolName: detail ?? '' };
+  return { toolName: parsed.toolName, args: parsed.args ?? undefined };
+}
+
+/**
+ * 轨迹步的确认形状。单条形状走共享解析器；**run 级**（`run(<token>) N items → outcome`）与认不出的行
+ * 仍以**原文**充当工具名 —— 轨迹宁可显示原文，也不显示空（本文件既有取舍）。但 `outcome` **一律取共享
+ * 解析器的真读数**，故一次已批准的 run 级审批不再被显示成超时。
+ */
+function parseConfirmation(
+  detail?: string | null,
+): { toolName: string; args?: string; outcome: ConfirmationOutcome; trusted: boolean } {
+  const parsed = parseConfirmationShared(detail);
+  if (parsed?.kind === 'tool') {
+    return { toolName: parsed.toolName, args: parsed.args, outcome: parsed.outcome, trusted: parsed.trusted };
+  }
+  return { toolName: detail || '', outcome: parsed?.outcome ?? 'timeout', trusted: false };
+}

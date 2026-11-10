@@ -1,0 +1,196 @@
+// SPDX-License-Identifier: Apache-2.0
+
+import { Injectable, Optional } from '@nestjs/common';
+import { AbilityBuilder, createMongoAbility, MongoAbility } from '@casl/ability';
+import { UserRole } from '../entities/user.entity';
+import { JwtPayload } from '../../auth/interfaces/jwt-payload.interface';
+import { BUILTIN_ROLE_RULES, RoleRuleSource, type RoleRuleSeed } from './builtin-role-rules';
+
+export type Action =
+  | 'manage'
+  | 'create'
+  | 'read'
+  | 'update'
+  | 'delete';
+
+/** W5-⑦ Explainable Authz：决策 + 依据（资源级） */
+export interface ExplainResult {
+  action: string;
+  subject: string;
+  allowed: boolean;
+  reason: string;
+  deniedBy: 'casl' | null;
+}
+
+/**
+ * 宽松的 subject 类型：字符串名（'all'/'User'/'Event'）+ 任意对象。
+ * CASL v7 对严格联合类型（含实体类）的 AbilityBuilder 条件推断存在缺陷
+ * （MongoQuery<never> / ActionOf never），故采用宽泛类型保证 DSL 可用。
+ * 实例校验通过 `subject('User', obj)` 提供 subject 名。
+ */
+export type AppAbility = MongoAbility<[Action, string | Record<string, any>]>;
+
+/** capability 条目 actions 的规范顺序；`manage` 展开为这四个显式动作（契约见 permission-capability-list.schema.json） */
+const EXPANDED_ACTIONS: Action[] = ['create', 'read', 'update', 'delete'];
+
+function normalizeActions(ruleAction: string | string[]): string[] {
+  const list = Array.isArray(ruleAction) ? ruleAction : [ruleAction];
+  const set = new Set<string>();
+  for (const a of list) {
+    if (a === 'manage') EXPANDED_ACTIONS.forEach((x) => set.add(x));
+    else set.add(a);
+  }
+  return [...set].sort(
+    (a, b) => EXPANDED_ACTIONS.indexOf(a as Action) - EXPANDED_ACTIONS.indexOf(b as Action),
+  );
+}
+
+@Injectable()
+export class CaslAbilityFactory {
+  /** 可选注入：数据驱动的规则来源（权限-2 Step 2）。缺席 = 用内置常量（单元测试 / 加载失败）。 */
+  constructor(@Optional() private readonly registry?: RoleRuleSource) {}
+  /**
+   * 该角色的规则来源：**注册表优先（数据驱动），该角色没有规则则回退内置常量**。
+   * 回退保证两件事：① 单元测试的无参构造 `new CaslAbilityFactory()` 行为不变；
+   * ② 注册表加载失败时不至于无人可用（fail-safe 到内置规则，绝不 fail-open 到无规则）。
+   *
+   * **契约**：非空即视为该角色的**完整**规则集 —— 故「治理数据缺失时以内置为底」由**注册表实现**负责
+   * （`RoleRuleRegistry.reload()` 按角色回退，见其注释），工厂不替它兜。新写一个 `RoleRuleSource`
+   * 实现时别只回一条局部规则：2026-09-27 的事故正是一条生成规则让这里从「空」变「非空」，
+   * 内置的所有权规则整批消失（普通用户在自己资源上 403，11 个 e2e 套件命中）。
+   */
+  private _rulesFor(role: string): RoleRuleSeed[] {
+    const fromRegistry = this.registry?.rulesFor(role);
+    if (fromRegistry && fromRegistry.length > 0) return fromRegistry;
+    return BUILTIN_ROLE_RULES.filter((r) => r.roleCode === role);
+  }
+
+  createForUser(user: JwtPayload): AppAbility {
+    const { can, build } = new AbilityBuilder<AppAbility>(createMongoAbility);
+
+    for (const rule of this._rulesFor(user.role)) {
+      // `manage` is what a seed meant before `actions` existed; keep that meaning when it is absent.
+      // `manage` 是 `actions` 出现之前一条种子的含义 —— 不写时保持它。
+      const actions = (rule.actions ?? ['manage']) as Action[];
+      if (rule.ownerField == null) {
+        can(actions, rule.subject);
+        continue;
+      }
+      const raw = rule.valueFrom === 'familyId' ? user.familyId : user.sub;
+      // 家庭 ID 缺席（如管理员/未加入家庭的用户）时不要下发「familyId = undefined」的条件——
+      // 那会匹配到所有 familyId 为空的行，等于放宽而不是收紧。
+      if (raw === undefined || raw === null) continue;
+      const value = rule.stringifyOwner ? String(raw) : raw;
+      can(actions, rule.subject, { [rule.ownerField]: value } as never);
+    }
+
+    return build();
+  }
+
+  /**
+   * W5-⑦ Explainable Authz：把当前用户的能力规则解析为用户可读的「权限清单 + 依据」。
+   * 遍历 ability.rules → 提取 subject/scope（all=管理员全量，own=行级所有权条件）。
+   */
+  describeForUser(user: JwtPayload): {
+    role: string;
+    basis: string;
+    resources: { subject: string; scope: 'all' | 'own'; actions: string[]; reason: string }[];
+  } {
+    const ability = this.createForUser(user);
+    const isAdmin = user.role === UserRole.ADMIN;
+    const seen = new Map<
+      string,
+      { subject: string; scope: 'all' | 'own'; actions: string[]; reason: string }
+    >();
+
+    for (const rule of ability.rules) {
+      const subjects = (Array.isArray(rule.subject) ? rule.subject : [rule.subject]).filter(
+        (s): s is string => typeof s === 'string',
+      );
+      const actions = normalizeActions(rule.action as unknown as string | string[]);
+      for (const s of subjects) {
+        if (s === 'all') {
+          seen.set('all', {
+            subject: 'all',
+            scope: 'all',
+            actions: normalizeActions('manage'),
+            reason: '管理员：可管理全部资源',
+          });
+          continue;
+        }
+        const existing = seen.get(s);
+        if (existing) {
+          // 同一 subject 多条规则 → 能力取并集（capability = 授予的并集）
+          existing.actions = normalizeActions([...existing.actions, ...actions]);
+          continue;
+        }
+        const cond = (rule.conditions ?? {}) as Record<string, unknown>;
+        const hasOwn =
+          cond.userId !== undefined || cond.id !== undefined || cond.requesterId !== undefined;
+        seen.set(s, {
+          subject: s,
+          scope: hasOwn ? 'own' : 'all',
+          actions,
+          reason: hasOwn ? '只能操作自己的数据（行级所有权条件）' : '可访问（无行级限制）',
+        });
+      }
+    }
+
+    // The basis names the role that actually granted the capabilities. An audit reader is not an
+    // "ordinary user with row ownership": it holds reads on the audit surfaces only, and saying
+    // otherwise would state a false basis to the very person reviewing decisions.
+    //
+    // 依据说的是**真正授予这些能力的角色**。审计读者不是「带行级所有权的普通用户」——它只在审计面上
+    // 持有只读权；说成前者，等于向正在复核决策的人陈述一个错误的依据。
+    const auditor = user.role === UserRole.AUDITOR;
+    return {
+      role: user.role,
+      basis: isAdmin
+        ? '管理员角色：可管理全部资源'
+        : auditor
+          ? '审计读者：只读审计与治理面'
+          : '普通用户：可管理本人拥有的资源（行级所有权条件）',
+      resources: [...seen.values()].sort((a, b) => a.subject.localeCompare(b.subject)),
+    };
+  }
+
+  /**
+   * W5-⑦ Explainable Authz：对「某 action × 资源」返回决策 + 依据（资源级；对象级由行级校验承担）。
+   * 供 POST /auth/permissions/explain 与管理台 Security Review 排查「为何某用户被拒」。
+   */
+  /** W5-⑦ 决策解释（本人） */
+  explain(user: JwtPayload, action: Action, subjectName: string): ExplainResult {
+    return this._explain(user, action, subjectName);
+  }
+
+  /**
+   * B1：管理员为目标用户反查决策依据（资源级；对象级由行级校验承担）。
+   * 只需 role + sub，不要求完整 JwtPayload。
+   */
+  explainForTarget(user: { role: UserRole; sub: number }, action: Action, subjectName: string): ExplainResult {
+    return this._explain(user, action, subjectName);
+  }
+
+  private _explain(
+    user: { role: UserRole; sub: number },
+    action: Action,
+    subjectName: string,
+  ): ExplainResult {
+    const ability = this.createForUser(user as JwtPayload);
+    const allowed = ability.can(action, subjectName);
+    const isAdmin = user.role === UserRole.ADMIN;
+    return {
+      action,
+      subject: subjectName,
+      allowed,
+      reason: allowed
+        ? subjectName === 'all'
+          ? '管理员：可管理全部资源'
+          : '可操作（本人所有权范围，行级条件）'
+        : isAdmin
+          ? '当前策略不允许此操作'
+          : '需要管理员权限，或该资源不在你的可管理范围',
+      deniedBy: allowed ? null : 'casl',
+    };
+  }
+}

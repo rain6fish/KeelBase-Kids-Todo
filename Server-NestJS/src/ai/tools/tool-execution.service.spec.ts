@@ -1,0 +1,581 @@
+// SPDX-License-Identifier: Apache-2.0
+
+import { ToolExecutionService } from './tool-execution.service';
+import { ToolRegistry } from './tool-registry';
+import { ToolGateService } from './tool-gate.service';
+import { ExternalToolRegistry } from './external-tool-registry';
+import { AuthorizationDeniedError } from '../interfaces/tool.interface';
+import { ConfirmationStore } from '../confirmation/confirmation.store';
+import { AiToolEffectsService } from '../../governance-shared/services/ai-tool-effects.service';
+import { outboundIdempotencyKey } from '../proxy/outbound-idempotency';
+
+/**
+ * 执行域单测（阶段 3 第六刀从 `ai.service.spec.ts` 整段搬来，**断言一字未改**）。
+ * 门控用真实 `ToolGateService`（与 ai.service.spec 同口径）：mock 掉就丢了被测对象。
+ */
+describe('ToolExecutionService（执行域）', () => {
+  let toolExecution: ToolExecutionService;
+  let mockToolRegistry: jest.Mocked<ToolRegistry>;
+  let mockToolGate: ToolGateService;
+  let externalTools: ExternalToolRegistry;
+
+  beforeEach(() => {
+    mockToolRegistry = {
+      getToolDefinitions: jest.fn().mockReturnValue([]),
+      execute: jest.fn(),
+      register: jest.fn(),
+      getTool: jest.fn(),
+      getAllTools: jest.fn(),
+      requiresConfirmation: jest.fn().mockReturnValue(false),
+      riskLevel: jest.fn().mockReturnValue('R1'),
+    } as any;
+    externalTools = new ExternalToolRegistry();
+    mockToolGate = new ToolGateService(mockToolRegistry as any, externalTools);
+    toolExecution = new ToolExecutionService(mockToolRegistry as any, mockToolGate, externalTools);
+  });
+
+  describe('executeWrite（HS-3 幂等 + 副作用登记）', () => {
+    it('HS-3: executeWrite 无已有副作用时执行并记录', async () => {
+      const record = jest.fn().mockResolvedValue({ id: 1 });
+      (toolExecution as any).toolEffectsService = {
+        claimWrite: jest.fn().mockResolvedValue({ won: true }),
+        settleClaim: jest.fn().mockResolvedValue(undefined),
+        releaseClaim: jest.fn().mockResolvedValue(undefined),
+        buildKey: jest.fn().mockReturnValue('new-key'),
+        findExisting: jest.fn().mockResolvedValue({ existing: false }),
+        record,
+      };
+      mockToolRegistry.execute.mockResolvedValue({ success: true, data: { id: 100 } });
+
+      const result = await toolExecution.executeWrite('create_event', { title: 'X' }, '1', 'c1');
+
+      expect(result).toEqual({ success: true, data: { id: 100 } });
+      expect(record).toHaveBeenCalledWith(
+        expect.objectContaining({ userId: '1', toolName: 'create_event', conversationId: 'c1' }),
+        'event',
+        100,
+        { before: null, after: null }, // E-1 快照（测试未注入 captor → null）
+      );
+      (toolExecution as any).toolEffectsService = undefined;
+    });
+
+    // ── P1：外部 MCP 写工具的幂等（回归）────────────────────────────────────────
+    const registerExternal = (callTool: jest.Mock) =>
+      externalTools.register({
+        isExternal: (n: string) => n.startsWith('mcp_'),
+        requiresConfirmation: async () => true,
+        callTool,
+      } as never);
+
+    it('P1: 外部写同键重放 → 幂等命中，且**不再调用** callTool（防真实二次外部写）', async () => {
+      const callTool = jest.fn().mockResolvedValue({ executed: true, content: { id: 7 } });
+      registerExternal(callTool);
+      const record = jest.fn().mockResolvedValue({ id: 1 });
+      (toolExecution as any).toolEffectsService = {
+        claimWrite: jest.fn().mockResolvedValue({ won: true }),
+        settleClaim: jest.fn().mockResolvedValue(undefined),
+        releaseClaim: jest.fn().mockResolvedValue(undefined),
+        findExisting: jest.fn().mockResolvedValue({ existing: false }),
+        record,
+        listGroup: jest.fn().mockResolvedValue([]),
+      };
+
+      const first = await toolExecution.executeWrite('mcp_send_email', { to: 'a@b.c' }, '1', 'c1');
+      expect(first).toEqual({ success: true, data: { id: 7 } });
+      expect(callTool).toHaveBeenCalledTimes(1);
+      // 锚行：resultType=external_call，resultId 取外部返回的 id，revokeClass 钉 none（MCP 无补偿通道 ⇒ 不可撤）
+      expect(record).toHaveBeenCalledWith(
+        expect.objectContaining({ toolName: 'mcp_send_email', conversationId: 'c1', revokeClass: 'none' }),
+        'external_call',
+        7,
+      );
+
+      // 同键重放（LLM 重试 / 二次裁决 / 重启）→ 命中幂等，**不再**触发外部调用
+      (toolExecution as any).toolEffectsService.findExisting = jest
+        .fn()
+        .mockResolvedValue({ existing: true, effect: { resultId: 7, resultType: 'external_call' } });
+      const second = await toolExecution.executeWrite('mcp_send_email', { to: 'a@b.c' }, '1', 'c1');
+      expect(second).toEqual({ success: true, data: { id: 7, idempotent: true } });
+      expect(callTool).toHaveBeenCalledTimes(1);
+    });
+
+    it('P1: 外部写**失败不登记**锚行（否则键被占，之后每次重试都回放失败结果）', async () => {
+      registerExternal(jest.fn().mockResolvedValue({ executed: false, error: 'boom' }));
+      const record = jest.fn().mockResolvedValue({ id: 1 });
+      (toolExecution as any).toolEffectsService = {
+        claimWrite: jest.fn().mockResolvedValue({ won: true }),
+        settleClaim: jest.fn().mockResolvedValue(undefined),
+        releaseClaim: jest.fn().mockResolvedValue(undefined),
+        findExisting: jest.fn().mockResolvedValue({ existing: false }),
+        record,
+        listGroup: jest.fn().mockResolvedValue([]),
+      };
+
+      const res = await toolExecution.executeWrite('mcp_send_email', { to: 'a@b.c' }, '1', 'c1');
+
+      expect(res.success).toBe(false);
+      expect(record).not.toHaveBeenCalled();
+    });
+
+    it('P1: 外部写无返回 id 时用稳定 hash 作 resultId（同参数两次调用取同一个值）', async () => {
+      registerExternal(jest.fn().mockResolvedValue({ executed: true, content: {} }));
+      const record = jest.fn().mockResolvedValue({ id: 1 });
+      (toolExecution as any).toolEffectsService = {
+        claimWrite: jest.fn().mockResolvedValue({ won: true }),
+        settleClaim: jest.fn().mockResolvedValue(undefined),
+        releaseClaim: jest.fn().mockResolvedValue(undefined),
+        findExisting: jest.fn().mockResolvedValue({ existing: false }),
+        record,
+        listGroup: jest.fn().mockResolvedValue([]),
+      };
+
+      await toolExecution.executeWrite('mcp_send_email', { to: 'a@b.c' }, '1', 'c1');
+      await toolExecution.executeWrite('mcp_send_email', { to: 'a@b.c' }, '1', 'c2');
+
+      const [firstId, secondId] = record.mock.calls.map((c) => c[2] as number);
+      expect(Number.isInteger(firstId)).toBe(true);
+      expect(firstId).toBeGreaterThan(0);
+      expect(firstId).toBe(secondId); // 稳定（可回溯同参数调用），不随会话漂移
+    });
+
+    // A8: the proxy id names this user's external write. It used to hash only the tool name and the
+    // argument text, so two users calling the same tool with the same arguments shared one
+    // resultType+resultId and a lookup on that pair mixed their rows; and because `JSON.stringify`
+    // preserves key order, two spellings of one logical call produced two ids, splitting one effect
+    // across two identities while the idempotency key counted them as one. Both cases fail against
+    // the previous implementation: same id across users, different ids across key orders.
+    //
+    // A8：代理 id 命名的是「这个用户的这次外部写」。它此前只哈希工具名与参数文本，于是两个用户
+    // 同工具同参数共享同一个 resultType+resultId，按该二元组取行会混；而 `JSON.stringify` 保键序，
+    // 同一逻辑调用的两种写法产出两个 id，把一次 effect 拆成两个身份，幂等键却当作同一件事。
+    // 两个用例对旧实现均为红：跨用户同 id、跨键序异 id。
+    it('A8: 代理身份含用户维度 —— 同工具同参数的两个用户拿不到同一个 resultId', async () => {
+      registerExternal(jest.fn().mockResolvedValue({ executed: true, content: {} }));
+      const record = jest.fn().mockResolvedValue({ id: 1 });
+      (toolExecution as any).toolEffectsService = {
+        claimWrite: jest.fn().mockResolvedValue({ won: true }),
+        settleClaim: jest.fn().mockResolvedValue(undefined),
+        releaseClaim: jest.fn().mockResolvedValue(undefined),
+        findExisting: jest.fn().mockResolvedValue({ existing: false }),
+        record,
+        listGroup: jest.fn().mockResolvedValue([]),
+      };
+
+      await toolExecution.executeWrite('mcp_send_email', { to: 'a@b.c' }, '1', 'c1');
+      await toolExecution.executeWrite('mcp_send_email', { to: 'a@b.c' }, '2', 'c1');
+
+      const [idForUser1, idForUser2] = record.mock.calls.map((c) => c[2] as number);
+      expect(idForUser1).toBeGreaterThan(0);
+      expect(idForUser1).not.toBe(idForUser2);
+    });
+
+    it('A8: 参数序规范 —— 同一逻辑调用的两种键序得到同一个 resultId', async () => {
+      registerExternal(jest.fn().mockResolvedValue({ executed: true, content: {} }));
+      const record = jest.fn().mockResolvedValue({ id: 1 });
+      (toolExecution as any).toolEffectsService = {
+        claimWrite: jest.fn().mockResolvedValue({ won: true }),
+        settleClaim: jest.fn().mockResolvedValue(undefined),
+        releaseClaim: jest.fn().mockResolvedValue(undefined),
+        findExisting: jest.fn().mockResolvedValue({ existing: false }),
+        record,
+        listGroup: jest.fn().mockResolvedValue([]),
+      };
+
+      await toolExecution.executeWrite('mcp_send_email', { to: 'a@b.c', subject: 'hi' }, '1', 'c1');
+      await toolExecution.executeWrite('mcp_send_email', { subject: 'hi', to: 'a@b.c' }, '1', 'c1');
+
+      const [first, second] = record.mock.calls.map((c) => c[2] as number);
+      expect(first).toBe(second);
+    });
+
+    it('HS-3: create_contract 副作用 resultType 记 contract（非兜底 todo）', async () => {
+      const record = jest.fn().mockResolvedValue({ id: 1 });
+      (toolExecution as any).toolEffectsService = {
+        claimWrite: jest.fn().mockResolvedValue({ won: true }),
+        settleClaim: jest.fn().mockResolvedValue(undefined),
+        releaseClaim: jest.fn().mockResolvedValue(undefined),
+        buildKey: jest.fn().mockReturnValue('new-key-contract'),
+        findExisting: jest.fn().mockResolvedValue({ existing: false }),
+        record,
+      };
+      mockToolRegistry.execute.mockResolvedValue({ success: true, data: { id: 200 } });
+
+      const result = await toolExecution.executeWrite('create_contract', { name: 'X' }, '1', 'c1');
+
+      expect(result).toEqual({ success: true, data: { id: 200 } });
+      expect(record).toHaveBeenCalledWith(
+        expect.objectContaining({ userId: '1', toolName: 'create_contract', conversationId: 'c1' }),
+        'contract',
+        200,
+        { before: null, after: null },
+      );
+      (toolExecution as any).toolEffectsService = undefined;
+    });
+
+    it('FP-8: B 路径写空体成功 → 仍记 proxy_call 副作用锚（proxyResultId），不假装有 data', async () => {
+      const record = jest.fn().mockResolvedValue({ id: 1 });
+      (toolExecution as any).toolEffectsService = {
+        claimWrite: jest.fn().mockResolvedValue({ won: true }),
+        settleClaim: jest.fn().mockResolvedValue(undefined),
+        releaseClaim: jest.fn().mockResolvedValue(undefined),
+        buildKey: jest.fn().mockReturnValue('fp8-key'),
+        findExisting: jest.fn().mockResolvedValue({ existing: false }),
+        record,
+      };
+      mockToolRegistry.execute.mockResolvedValue({ success: true, data: null });
+      const origIsProxy = (toolExecution as any).isProxyTool;
+      (toolExecution as any).isProxyTool = () => true;
+      try {
+        const result = await toolExecution.executeWrite('proxy_write_empty', { id: '7' }, '1', 'c1');
+        expect(result).toEqual({ success: true, data: null });
+        expect(record).toHaveBeenCalledTimes(1);
+        const [ctx, resultType, resultId, snap] = record.mock.calls[0];
+        expect(ctx).toMatchObject({ userId: '1', toolName: 'proxy_write_empty', conversationId: 'c1' });
+        expect(resultType).toBe('proxy_call');
+        expect(typeof resultId).toBe('number');
+        expect(resultId).toBeGreaterThan(0); // 稳定 proxyResultId 锚，非空不伪造
+        expect(snap).toEqual({ before: null, after: null });
+      } finally {
+        (toolExecution as any).isProxyTool = origIsProxy;
+        (toolExecution as any).toolEffectsService = undefined;
+      }
+    });
+
+    it('FP-8: 非 proxy 写返回空体（无 data）→ 不记录（缺锚不伪造）', async () => {
+      const record = jest.fn();
+      (toolExecution as any).toolEffectsService = {
+        claimWrite: jest.fn().mockResolvedValue({ won: true }),
+        settleClaim: jest.fn().mockResolvedValue(undefined),
+        releaseClaim: jest.fn().mockResolvedValue(undefined),
+        buildKey: jest.fn().mockReturnValue('local-empty'),
+        findExisting: jest.fn().mockResolvedValue({ existing: false }),
+        record,
+      };
+      mockToolRegistry.execute.mockResolvedValue({ success: true, data: null });
+      await toolExecution.executeWrite('create_event', { title: 'X' }, '1', 'c1');
+      expect(record).not.toHaveBeenCalled();
+      (toolExecution as any).toolEffectsService = undefined;
+    });
+
+    it('HS-3: executeWrite 无 toolEffectsService 时直接执行不记录', async () => {
+      mockToolRegistry.execute.mockResolvedValue({ success: true, data: { id: 1 } });
+      (toolExecution as any).toolEffectsService = undefined;
+      const result = await toolExecution.executeWrite('create_event', {}, '1');
+      expect(result).toEqual({ success: true, data: { id: 1 } });
+    });
+
+    it('HS-3: executeWrite 外部 MCP 工具经 provider 调用', async () => {
+      (toolExecution as any).externalTools.provider = {
+        isExternal: jest.fn().mockReturnValue(true),
+        callTool: jest.fn().mockResolvedValue({ executed: true, content: 'sent' }),
+      };
+      const result = await toolExecution.executeWrite('mcp_wx_send_email', { to: 'a' }, '1');
+      expect(result).toEqual({ success: true, data: 'sent' });
+      (toolExecution as any).externalTools.provider = undefined;
+    });
+  });
+
+  describe('NC-3 plan/子代理只读门控（executeAgentRead）', () => {
+    it('写/需确认工具 → 拒绝（agent_read_only reasons），不经 toolRegistry.execute', async () => {
+      mockToolRegistry.requiresConfirmation.mockReturnValue(true);
+      const err = await toolExecution
+        .executeAgentRead('create_event', { title: 'x' }, '1')
+        .catch((e: any) => e);
+      expect(err.message).toContain('write/confirmation-gated');
+      expect(err.reasons.some((c: any) => c.name === 'agent_read_only' && c.ok === false)).toBe(true);
+      expect(err.denial).toEqual({ kind: 'agent_read_only', params: { tool: 'create_event' } });
+      expect(mockToolRegistry.execute).not.toHaveBeenCalled();
+    });
+
+    it('治理策略禁用的只读工具 → 拒绝（tool_enabled），不执行', async () => {
+      mockToolRegistry.requiresConfirmation.mockReturnValue(false);
+      (mockToolGate as any).governancePolicy = {
+        isToolEnabled: jest.fn().mockResolvedValue(false),
+        getAllowedRoles: jest.fn().mockResolvedValue([]),
+      };
+      const err = await toolExecution
+        .executeAgentRead('web_search', { q: 'x' }, '1')
+        .catch((e: any) => e);
+      expect(err.message).toContain('disabled by governance policy');
+      expect(mockToolRegistry.execute).not.toHaveBeenCalled();
+    });
+
+    it('放行的只读工具 → 经 executeRead 同源执行', async () => {
+      mockToolRegistry.requiresConfirmation.mockReturnValue(false);
+      mockToolRegistry.execute.mockResolvedValue({ success: true, data: { total: 3 } });
+      const res = await toolExecution.executeAgentRead('query_events', { start: 'x' }, '1');
+      expect(res.success).toBe(true);
+      expect(mockToolRegistry.execute).toHaveBeenCalledWith('query_events', { start: 'x' }, '1');
+    });
+  });
+
+  /**
+   * AUTHZ-1 / AUTHZ-2 都在**执行点**成立，故断言也钉在这里。
+   *
+   * 观测面（旧实现不可能产出）：旧实现里「artifact 绑的目的地与工具此刻的目的地不一致」这件事
+   * **根本不存在**——artifact 没有目的地，执行点也没有比对，于是同一个 artifact 指向另一个目标时
+   * 照常写下去；同理「越域字段」在旧实现里只是普通参数。两者修复后的表现都是**拒绝执行**，
+   * 而「工具一次都没被调用」是旧实现无论如何都产不出的观测面。
+   */
+  describe('AUTHZ-1 确认 artifact 的目的地绑定（执行点）', () => {
+    const proxyTool = (audience: string) => ({ name: 'create_invoice', audience } as any);
+
+    it('artifact 绑 legacy-erp、工具此刻指向 legacy-crm → 拒，且不执行', async () => {
+      mockToolRegistry.getTool.mockReturnValue(proxyTool('legacy-crm'));
+      mockToolRegistry.execute.mockResolvedValue({ success: true, data: { id: 1 } });
+
+      const err = await toolExecution
+        .executeWrite('create_invoice', { amount: 1 }, '1', 'c1', undefined, {
+          audience: 'legacy-erp',
+        })
+        .catch((e: any) => e);
+
+      expect(err).toBeInstanceOf(AuthorizationDeniedError);
+      expect(err.message).toContain('destination changed since the confirmation was issued');
+      expect(err.reasons).toEqual([
+        expect.objectContaining({ name: 'destination_binding', ok: false }),
+      ]);
+      expect(err.denial).toEqual({
+        kind: 'destination_changed',
+        params: {
+          tool: 'create_invoice',
+          confirmedFor: 'legacy-erp',
+          current: 'legacy-crm',
+        },
+      });
+      expect(mockToolRegistry.execute).not.toHaveBeenCalled();
+    });
+
+    it('artifact 绑定的目的地与此刻一致 → 照常执行', async () => {
+      mockToolRegistry.getTool.mockReturnValue(proxyTool('legacy-erp'));
+      mockToolRegistry.execute.mockResolvedValue({ success: true, data: { id: 1 } });
+
+      const res = await toolExecution.executeWrite(
+        'create_invoice',
+        { amount: 1 },
+        '1',
+        'c1',
+        undefined,
+        { audience: 'legacy-erp' },
+      );
+
+      expect(res).toEqual({ success: true, data: { id: 1 } });
+      expect(mockToolRegistry.execute).toHaveBeenCalledTimes(1);
+    });
+
+    it('外部 MCP 工具的目的地是它的 server 名——换 server 即换目标', async () => {
+      mockToolRegistry.execute.mockResolvedValue({ success: true, data: { id: 1 } });
+
+      const err = await toolExecution
+        .executeWrite('mcp_billing_charge', { amount: 1 }, '1', 'c1', undefined, {
+          audience: 'mcp:inventory',
+        })
+        .catch((e: any) => e);
+
+      expect(err.message).toContain('confirmed for "mcp:inventory", now "mcp:billing"');
+    });
+
+    it('没有 artifact 的写（免确认 / 本轮信任）不传 audience → 不受此约束', async () => {
+      mockToolRegistry.getTool.mockReturnValue(proxyTool('legacy-crm'));
+      mockToolRegistry.execute.mockResolvedValue({ success: true, data: { id: 2 } });
+
+      const res = await toolExecution.executeWrite('create_invoice', { amount: 1 }, '1', 'c1');
+
+      expect(res).toEqual({ success: true, data: { id: 2 } });
+    });
+  });
+
+  describe('AUTHZ-2 授权层声明的可写字段域 / destination 白名单（执行点）', () => {
+    const withPolicy = (override: Record<string, unknown>) => {
+      const gate = new ToolGateService(mockToolRegistry as any, externalTools, {
+        getToolPolicy: jest.fn().mockResolvedValue({
+          enabled: true,
+          requiresConfirmation: true,
+          requiresApproval: false,
+          allowedRoles: [],
+          mode: 'confirm',
+          writableFields: [],
+          allowedDestinations: [],
+          ...override,
+        }),
+        isToolEnabled: jest.fn().mockResolvedValue(true),
+        getAllowedRoles: jest.fn().mockResolvedValue([]),
+        // ACT-7：执行点现在也会重算审批要求（它唯一读政策的那一处）。本组用例打的是字段域 / 目的地，
+        // 不涉及升档，故这里如实答「不要求审批」；升档那一支由专属用例自己装配政策。
+        requiresApproval: jest.fn().mockResolvedValue(false),
+      } as any);
+      return new ToolExecutionService(mockToolRegistry as any, gate, externalTools);
+    };
+
+    it('声明了字段域的工具，请求带域外字段 → 拒（旧实现无域概念，照常写）', async () => {
+      const svc = withPolicy({ writableFields: ['status'] });
+      mockToolRegistry.execute.mockResolvedValue({ success: true, data: { id: 1 } });
+
+      const err = await svc
+        .executeWrite('update_ticket', { status: 'done', owner: 9 }, '1', 'c1')
+        .catch((e: any) => e);
+
+      expect(err).toBeInstanceOf(AuthorizationDeniedError);
+      expect(err.message).toContain('outside its writable field domain: owner');
+      expect(err.reasons).toEqual([expect.objectContaining({ name: 'field_domain', ok: false })]);
+      expect(mockToolRegistry.execute).not.toHaveBeenCalled();
+    });
+
+    it('域内字段 → 照常执行（字段域是上限，不是要求逐字全等）', async () => {
+      const svc = withPolicy({ writableFields: ['status', 'priority'] });
+      mockToolRegistry.execute.mockResolvedValue({ success: true, data: { id: 3 } });
+
+      const res = await svc.executeWrite('update_ticket', { status: 'done' }, '1', 'c1');
+
+      expect(res).toEqual({ success: true, data: { id: 3 } });
+    });
+
+    it('destination 不在白名单 → 拒', async () => {
+      const svc = withPolicy({ allowedDestinations: ['legacy-erp'] });
+      mockToolRegistry.getTool.mockReturnValue({ name: 'create_invoice', audience: 'legacy-crm' } as any);
+      mockToolRegistry.execute.mockResolvedValue({ success: true, data: { id: 1 } });
+
+      const err = await svc
+        .executeWrite('create_invoice', { amount: 1 }, '1', 'c1')
+        .catch((e: any) => e);
+
+      expect(err.message).toContain('not allowed to write to destination "legacy-crm"');
+      expect(err.reasons).toEqual([
+        expect.objectContaining({ name: 'destination_allowed', ok: false }),
+      ]);
+      expect(mockToolRegistry.execute).not.toHaveBeenCalled();
+    });
+
+    it('未声明（两域皆空）→ 不约束，照常执行', async () => {
+      const svc = withPolicy({});
+      mockToolRegistry.execute.mockResolvedValue({ success: true, data: { id: 4 } });
+
+      const res = await svc.executeWrite('update_ticket', { anything: 1 }, '1', 'c1');
+
+      expect(res).toEqual({ success: true, data: { id: 4 } });
+    });
+  });
+
+  describe('ACT-7 执行点重算审批要求（等待窗口内策略升档）', () => {
+    /**
+     * 装配一个「政策可翻转」的闸门：`requiresApproval` 由闭包变量决定，故同一序列里可以先按 T1 的
+     * 政策批准、再按 T2 的政策执行 —— 这正是等待窗口。确认行按 token 返回给定形态。
+     */
+    const withFlippablePolicy = (confirmationRow: unknown) => {
+      const state = { requiresApproval: false };
+      const gate = new ToolGateService(
+        mockToolRegistry as any,
+        externalTools,
+        {
+          // 真闸门在执行点要读的两处政策：字段域/目的地复查读 `getToolPolicy`，审批要求读 `requiresApproval`。
+          // 两者都随 `state` 翻，故「T1 批准 → T2 升档」是同一次装配里的两个时刻。
+          getToolPolicy: jest.fn(async () => ({
+            enabled: true,
+            requiresConfirmation: true,
+            requiresApproval: state.requiresApproval,
+            allowedRoles: [],
+            mode: state.requiresApproval ? 'approval' : 'confirm',
+            writableFields: [],
+            allowedDestinations: [],
+          })),
+          isToolEnabled: jest.fn().mockResolvedValue(true),
+          getAllowedRoles: jest.fn().mockResolvedValue([]),
+          requiresApproval: jest.fn(async () => state.requiresApproval),
+        } as any,
+        undefined,
+        undefined,
+        undefined,
+        new ConfirmationStore({ findOne: jest.fn().mockResolvedValue(confirmationRow) } as any),
+      );
+      return { svc: new ToolExecutionService(mockToolRegistry as any, gate, externalTools), state };
+    };
+
+    /** 操作者本人点的那张确认：已批准，但**没有审批人** —— 它不是双人审批。 */
+    const OPERATOR_CONFIRMED = { status: 'approved', approverId: undefined };
+
+    it('**判据原文**：确认时政策是 R3、执行前升成 R4 ⇒ 执行点**不放行**（旧实现照样执行）', async () => {
+      const { svc, state } = withFlippablePolicy(OPERATOR_CONFIRMED);
+      // T1：决策时政策不要求审批，故这张 token 是「本人确认」；T2：等待窗口内策略升档
+      state.requiresApproval = true;
+      mockToolRegistry.execute.mockResolvedValue({ success: true, data: { id: 1 } });
+
+      const err = await svc
+        .executeWrite('update_ticket', { status: 'done' }, '1', 'c1', undefined, {
+          authorizationRef: 'tok-1',
+        })
+        .catch((e: any) => e);
+
+      expect(err).toBeInstanceOf(AuthorizationDeniedError);
+      expect(err.reasons).toEqual([expect.objectContaining({ name: 'approval_missing', ok: false })]);
+      // 最强的观测面：工具**一次都没被执行**（旧实现此处会写下去）
+      expect(mockToolRegistry.execute).not.toHaveBeenCalled();
+    });
+
+    it('**反向对照**：政策没升档 ⇒ 同一序列照常执行（不得误拒）', async () => {
+      const { svc } = withFlippablePolicy(OPERATOR_CONFIRMED);
+      mockToolRegistry.execute.mockResolvedValue({ success: true, data: { id: 2 } });
+
+      const res = await svc.executeWrite('update_ticket', { status: 'done' }, '1', 'c1', undefined, {
+        authorizationRef: 'tok-1',
+      });
+
+      expect(res).toEqual({ success: true, data: { id: 2 } });
+      expect(mockToolRegistry.execute).toHaveBeenCalledTimes(1);
+    });
+
+    it('**反向对照**：凭据是审批人的批准 ⇒ 即便政策要求审批也照常执行（R4 路径不被误拒）', async () => {
+      const { svc, state } = withFlippablePolicy({ status: 'approved', approverId: '9' });
+      state.requiresApproval = true;
+      mockToolRegistry.execute.mockResolvedValue({ success: true, data: { id: 3 } });
+
+      const res = await svc.executeWrite('update_ticket', { status: 'done' }, '1', 'c1', undefined, {
+        authorizationRef: 'tok-2',
+      });
+
+      expect(res).toEqual({ success: true, data: { id: 3 } });
+    });
+  });
+
+  /**
+   * ACT-9b：执行点送给出站写出方的 action key **就是账本那个键**。
+   *
+   * `ProxyTool` 从 `outboundIdempotencyKey` 读它（它拿不到 conversationId，见 §6.6 的状态说明），
+   * 故这里用一个「在执行期间读作用域」的注册表替身来观测同一个事实 —— 这是声明里最关键的一句：
+   * **一次逻辑调用在两侧是同一个键**，而不是两个需要事后对账的身份。
+   */
+  describe('ACT-9b 执行点送下去的 action key', () => {
+    it('就是账本键（`buildKey`）—— 与本地副作用行、执行占位行同源', async () => {
+      let seen: string | undefined;
+      mockToolRegistry.execute.mockImplementation(async () => {
+        // 工具执行期间读作用域 —— `ProxyTool` 就是这么读的
+        seen = outboundIdempotencyKey.getStore();
+        return { success: true, data: { id: 1 } };
+      });
+      const effectsStub = {
+        findExisting: jest.fn().mockResolvedValue({ existing: false }),
+        claimWrite: jest.fn().mockResolvedValue({ won: true }),
+        settleClaim: jest.fn().mockResolvedValue(undefined),
+        releaseClaim: jest.fn().mockResolvedValue(undefined),
+        record: jest.fn().mockResolvedValue({ id: 1 }),
+      };
+      const svc = new ToolExecutionService(
+        mockToolRegistry as any,
+        mockToolGate,
+        externalTools,
+        effectsStub as any,
+        undefined,
+      );
+
+      await svc.executeWrite('update_ticket', { status: 'done' }, 'u9', 'conv-9');
+
+      expect(seen).toBe(
+        AiToolEffectsService.buildKey({
+          userId: 'u9',
+          conversationId: 'conv-9',
+          toolName: 'update_ticket',
+          args: { status: 'done' },
+        }),
+      );
+    });
+  });
+});

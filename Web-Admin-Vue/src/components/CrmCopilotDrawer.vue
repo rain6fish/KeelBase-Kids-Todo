@@ -1,0 +1,355 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<template>
+  <el-drawer v-model="open" :title="t('copilotTitle')" size="min(600px, 92vw)" @closed="onClosed">
+    <!-- 对话区 -->
+    <div ref="scrollRef" class="copilot-chat flex-grow-1 mb-3">
+      <div v-if="!items.length" class="text-medium-emphasis pa-2">
+        {{ t('copilotHint', { name: customerName }) }}
+      </div>
+      <div v-for="(m, i) in items" :key="i" class="mb-2">
+        <!-- 用户消息 -->
+        <div v-if="m.kind === 'user'" class="d-flex justify-end">
+          <div class="pa-2 copilot-bubble copilot-user">{{ m.content }}</div>
+        </div>
+
+        <!-- AI 文本（流式累加） -->
+        <div v-else-if="m.kind === 'ai'" class="d-flex justify-start">
+          <div class="pa-2 copilot-bubble copilot-ai">{{ m.content }}</div>
+        </div>
+
+        <!-- 工具卡：读/写徽标 + 摘要 + 结果 -->
+        <div v-else-if="m.kind === 'tool'" class="pa-2" style="border-left: 3px solid var(--el-color-primary); border-radius: 4px; background: var(--el-fill-color-light)">
+          <div class="d-flex align-center ga-1">
+            <AppIcon :icon="m.toolStart.isWrite ? 'mdi-pencil' : 'mdi-magnify'" :color="m.toolStart.isWrite ? 'var(--el-color-primary)' : 'var(--el-text-color-secondary)'" size="16" />
+            <el-tag :type="m.toolStart.isWrite ? 'primary' : 'info'" size="small" effect="plain">{{ m.toolStart.isWrite ? t('writeOp') : t('readOp') }}</el-tag>
+            <span class="text-caption font-weight-medium">{{ toolLabelText(m.toolStart.name) }}</span>
+          </div>
+          <div v-if="m.toolStart.isWrite && presentText(m.toolStart.summary)" class="text-caption text-medium-emphasis mt-1">{{ presentText(m.toolStart.summary) }}</div>
+          <!-- §internal.6 四问（写操作）：发生了什么(summary 上方) / 现在什么状态 / 能保证什么 / 不能保证什么 -->
+          <div v-if="m.toolEnd" class="text-caption mt-1" :class="m.toolEnd.success ? 'text-success' : 'text-error'">
+            <template v-if="m.toolStart.isWrite">
+              {{ m.toolEnd.success ? t('copilotWriteDone') : t('copilotWriteFailed') }}
+              <span v-if="!m.toolEnd.success && m.toolEnd.error"> — {{ m.toolEnd.error }}</span>
+            </template>
+            <template v-else>{{ m.toolEnd.success ? t('toolDone') : (m.toolEnd.error || t('toolFailed')) }}</template>
+          </div>
+          <AiDenialCard v-if="m.toolEnd?.explanation" :tool-end="m.toolEnd" />
+        </div>
+
+        <!-- 拒绝卡（门控段拒绝：没有 tool_start，只有 tool_end.explanation） -->
+        <div v-else-if="m.kind === 'denied'">
+          <AiDenialCard :tool-end="m.toolEnd" />
+        </div>
+
+        <!-- 确认卡：批准/拒绝后显示结果 -->
+        <div v-else-if="m.kind === 'confirmation'" class="d-flex justify-start">
+          <AiConfirmationCard
+            v-if="m.status === 'pending'"
+            :confirmation="m.confirmation"
+            @approved="(trust) => onApprove(m, trust)"
+            @rejected="() => onReject(m)"
+          />
+          <div v-else class="pa-2 copilot-bubble copilot-ai" :class="m.result?.approved ? 'text-success' : 'text-error'">
+            {{ m.result?.outcome === 'timeout' ? t('stepTimedOut') : m.result?.approved ? t('approved') : t('rejected') }}
+          </div>
+        </div>
+
+        <!-- 错误/提示 -->
+        <div v-else-if="m.kind === 'notice'" class="text-error text-body-2 pa-1">{{ m.content }}</div>
+      </div>
+      <div v-if="loading" class="text-caption text-medium-emphasis pa-2">{{ t('thinking') }}</div>
+    </div>
+
+    <!-- 预置问题（AI Copilot：让业务用户一键问） -->
+    <div class="d-flex flex-wrap ga-1 mb-2">
+      <el-button v-for="q in quickQuestions" :key="q.key" size="small" plain :disabled="loading" @click="sendQuick(q)">
+        {{ q.label }}
+      </el-button>
+    </div>
+
+    <!-- 输入区 -->
+    <div class="d-flex ga-2">
+      <el-input
+        v-model="input"
+        :placeholder="t('copilotPlaceholder')"
+        :disabled="loading"
+        @keyup.enter="send(input)"
+      />
+      <el-button type="primary" :loading="loading" @click="send(input)">
+        <template #icon><AppIcon icon="mdi-send" /></template>
+      </el-button>
+    </div>
+  </el-drawer>
+</template>
+
+<script setup lang="ts">
+import { computed, nextTick, ref, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
+import { useSnackbarStore } from '@/stores/snackbar'
+import AppIcon from '@/components/AppIcon.vue'
+import AiConfirmationCard from '@/components/AiConfirmationCard.vue'
+import AiDenialCard from '@/components/AiDenialCard.vue'
+import { streamChat, confirmTool, type AiConfirmation, type AiToolEnd, type AiToolStart } from '@/utils/streamChat'
+import { toolLabel } from '@/utils/toolLabel'
+import { usePresentText } from '@/utils/presentation'
+
+const presentText = usePresentText()
+
+const props = defineProps<{
+  modelValue: boolean
+  customerName: string
+  customerId: number
+}>()
+const emit = defineEmits<{
+  (e: 'update:modelValue', v: boolean): void
+  /** D1 闭环：AI 写操作执行成功 → 父组件刷新业务数据 + 钻取治理轨迹 */
+  (e: 'executed', payload: { resultType: string; resultId: number }): void
+}>()
+
+const { t, tm } = useI18n()
+/** 工具名人类标签（D2 feature 命名空间），未命中回退原始名 */
+const toolLabelText = (name: string) => toolLabel(tm('feature') as Record<string, string> | undefined, name)
+const snackbar = useSnackbarStore()
+const scrollRef = ref<HTMLElement>()
+const items = ref<CopilotItem[]>([])
+const input = ref('')
+const loading = ref(false)
+const conversationId = ref<string | undefined>()
+const abortCtrl = ref<AbortController | null>(null)
+
+type CopilotItem =
+  | { kind: 'user'; content: string }
+  | { kind: 'ai'; content: string }
+  | { kind: 'tool'; toolStart: AiToolStart; toolEnd?: AiToolEnd }
+  | { kind: 'denied'; toolEnd: AiToolEnd }
+  | {
+      kind: 'confirmation'
+      confirmation: AiConfirmation
+      status: 'pending' | 'decided'
+      // outcome 保留规范决策词（approve|decline|timeout）——timeout 不得塌缩成「已拒绝」（v2 schema 要求）
+      result?: { approved: boolean; outcome?: 'approve' | 'decline' | 'timeout' }
+    }
+  | { kind: 'notice'; content: string }
+
+const open = computed({
+  get: () => props.modelValue,
+  set: (v) => emit('update:modelValue', v),
+})
+
+/** AI Copilot 预置问题：围绕当前客户（本人数据作用域） */
+const quickQuestions = computed(() => [
+  { key: 'risk', label: t('copilotQRisk') },
+  { key: 'orders', label: t('copilotQOrders') },
+  { key: 'followup', label: t('copilotQFollowup') },
+])
+
+watch(open, (v) => {
+  if (v) {
+    items.value = []
+    conversationId.value = undefined
+    input.value = ''
+    abortCtrl.value = null
+    loading.value = false
+  }
+})
+
+function onClosed() {
+  abortCtrl.value?.abort()
+  abortCtrl.value = null
+  loading.value = false
+}
+
+function customerContext(): string {
+  return `当前客户「${props.customerName}」（ID ${props.customerId}）`
+}
+
+function sendQuick(q: { key: string; label: string }) {
+  // 上下文由 send 首条统一注入，避免与手动输入重复前缀
+  send(q.label)
+}
+
+function scrollBottom() {
+  void nextTick(() => {
+    const el = scrollRef.value
+    // jsdom 无 scrollTo：防御（测试环境不抛 unhandled rejection）
+    if (el && typeof el.scrollTo === 'function') el.scrollTo({ top: el.scrollHeight })
+  })
+}
+
+/** 工具名 → 副作用 resultType（对齐后端 ai.service.ts 的映射） */
+function resultTypeFor(toolName: string): string {
+  if (toolName === 'create_followup_task') return 'crm_task'
+  if (toolName === 'create_project_task') return 'pm_task'
+  if (toolName === 'create_event') return 'event'
+  if (toolName === 'submit_approval_request') return 'app_request'
+  return 'todo'
+}
+
+async function send(raw: string) {
+  const message = raw.trim()
+  if (!message || loading.value) return
+  // P0-1 差距#2：首条消息自动注入当前客户上下文——问「分析这家客户的风险」AI 直接定位当前客户，不再反问
+  // 后续轮次（有对话历史 / conversationId）已有上下文，不重复注入
+  const isFirst = items.value.length === 0
+  const toBackend = isFirst ? `${customerContext()}。${message}` : message
+  items.value.push({ kind: 'user', content: message })
+  input.value = ''
+  loading.value = true
+
+  // 上一轮未完成流中止（正常情况下 onClosed 已 abort）
+  abortCtrl.value?.abort()
+  const ctrl = new AbortController()
+  abortCtrl.value = ctrl
+
+  let aiIndex = -1
+  let executed: { resultType: string; resultId: number } | null = null
+  let pendingConfirmation: CopilotItem & { kind: 'confirmation' } | null = null
+
+  const pushAi = () => {
+    if (aiIndex === -1) {
+      items.value.push({ kind: 'ai', content: '' })
+      aiIndex = items.value.length - 1
+    }
+  }
+
+  try {
+    await streamChat({
+      message: toBackend,
+      conversationId: conversationId.value,
+      signal: ctrl.signal,
+      onEvent: (ev) => {
+        switch (ev.type) {
+          case 'text': {
+            pushAi()
+            const item = items.value[aiIndex]
+            if (item && item.kind === 'ai') item.content += ev.content
+            scrollBottom()
+            break
+          }
+          case 'tool_start': {
+            items.value.push({ kind: 'tool', toolStart: ev.toolStart })
+            scrollBottom()
+            break
+          }
+          case 'confirmation_request': {
+            items.value.push({ kind: 'confirmation', confirmation: ev.confirmation, status: 'pending' })
+            // 持有数组返回的**响应式代理**（而非 push 进去的原始对象）：否则 confirmation_decision
+            // 直接改原始对象不会触发重渲染——服务端驱动的决策（如 timeout，无本地点击）时卡片停在「待确认」。
+            pendingConfirmation = items.value[items.value.length - 1] as CopilotItem & { kind: 'confirmation' }
+            scrollBottom()
+            break
+          }
+          case 'confirmation_decision': {
+            const d = ev.confirmationDecision
+            // 规范决策词优先（v2：decision），回落 v1 approved（deprecated）。
+            // timeout 与 decline 不同（v2 schema 明确不得塌缩）——保留 outcome 供卡片分别呈现。
+            const outcome: 'approve' | 'decline' | 'timeout' =
+              d.decision ?? (d.approved ? 'approve' : 'decline')
+            const approved = outcome === 'approve'
+            // KB-5：run 级整体决策关卡（mode:'run'，无 toolName/resultId）只清 pending 槽；
+            // run 逐条 decision 带 toolName+resultId，仅更新 executed（供 tool_end→emit executed）。
+            if (pendingConfirmation) {
+              pendingConfirmation.status = 'decided'
+              pendingConfirmation.result = { approved, outcome }
+              pendingConfirmation = null
+            }
+            // 批准且带 resultId + toolName → 记住执行结果，待 tool_end 确认后通知父组件
+            if (approved && d.resultId !== undefined && d.toolName) {
+              executed = { resultType: resultTypeFor(d.toolName), resultId: d.resultId }
+            }
+            scrollBottom()
+            break
+          }
+          case 'tool_end': {
+            // 确认卡在工具卡之后入列 → 按工具名反查匹配的工具卡，附加结束态
+            const match = [...items.value].reverse().find(
+              (it) => it.kind === 'tool' && it.toolStart.name === ev.toolEnd.name,
+            )
+            if (match && match.kind === 'tool') {
+              match.toolEnd = ev.toolEnd
+            } else if (ev.toolEnd.explanation) {
+              // 门控段拒绝没有 tool_start；仍要为这次拒绝建一个步骤。
+              // Gate refusals have no `tool_start`; still create a step for the refusal.
+              items.value.push({ kind: 'denied', toolEnd: ev.toolEnd })
+            }
+            // 写操作成功 → D1 闭环：通知父组件刷新 + 钻取治理轨迹。
+            // 无论成败都清除 executed（防工具失败后 stale 残留，被后续无关 tool_end 误触发）
+            if (executed) {
+              if (ev.toolEnd.success) emit('executed', executed)
+              executed = null
+            }
+            scrollBottom()
+            break
+          }
+          case 'done': {
+            conversationId.value = ev.conversationId
+            break
+          }
+          case 'error': {
+            if (ev.error) items.value.push({ kind: 'notice', content: ev.error })
+            break
+          }
+        }
+      },
+      onEnd: () => {
+        loading.value = false
+        scrollBottom()
+      },
+      onError: (err) => {
+        items.value.push({ kind: 'notice', content: err.message || t('loadFailed') })
+        loading.value = false
+        scrollBottom()
+      },
+    })
+  } catch {
+    // streamChat 内部已回调 onError；此处兜底
+    loading.value = false
+  } finally {
+    abortCtrl.value = null
+    loading.value = false // 中止/onEnd 缺失时兜底，防 loading 卡死
+  }
+}
+
+async function onApprove(item: CopilotItem & { kind: 'confirmation' }, trustTool: boolean) {
+  item.status = 'decided'
+  item.result = { approved: true } // 乐观显示，等服务器 confirmation_decision 收敛
+  try {
+    await confirmTool(item.confirmation.token, 'approve', trustTool)
+  } catch {
+    snackbar.error(t('confirmFailed'))
+    item.status = 'pending'
+    item.result = undefined
+  }
+}
+
+async function onReject(item: CopilotItem & { kind: 'confirmation' }) {
+  item.status = 'decided'
+  item.result = { approved: false }
+  try {
+    await confirmTool(item.confirmation.token, 'decline')
+  } catch {
+    snackbar.error(t('confirmFailed'))
+    item.status = 'pending'
+    item.result = undefined
+  }
+}
+</script>
+
+<style scoped>
+.copilot-chat {
+  overflow-y: auto;
+  min-height: 240px;
+  max-height: 46vh;
+}
+.copilot-bubble {
+  border-radius: 8px;
+  max-width: 78%;
+  white-space: pre-wrap;
+}
+.copilot-user {
+  background: var(--el-color-primary-light-9);
+}
+.copilot-ai {
+  background: var(--el-fill-color-light);
+}
+</style>

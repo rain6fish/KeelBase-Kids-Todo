@@ -1,0 +1,197 @@
+// SPDX-License-Identifier: Apache-2.0
+
+// 必须第一个 import：OpenTelemetry 需要在 http/express 模块加载前 patch
+import './tracing-init';
+import { NestFactory } from '@nestjs/core';
+import { VersioningType, Logger as NestLogger } from '@nestjs/common';
+import { Logger } from 'nestjs-pino';
+import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
+import helmet from 'helmet';
+import { json, Request, Response, NextFunction } from 'express';
+import { AppModule } from './app.module';
+import { NestExpressApplication } from '@nestjs/platform-express';
+import { WsAdapter } from '@nestjs/platform-ws';
+import { join, resolve } from 'path';
+import { LOCAL_UPLOAD_DIR } from './storage/local-storage.service';
+import { STORAGE_SERVICE } from './storage/storage.service';
+import type { StorageService } from './storage/storage.service';
+import { UploadSignService } from './upload/upload-sign.service';
+import { isBlindTrustValue, parseTrustProxy } from './config/trust-proxy';
+import { applyRequestContext } from './common/request-context';
+
+async function bootstrap() {
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, {
+    bufferLogs: true,
+  });
+  app.useLogger(app.get(Logger));
+  const logger = new NestLogger('Bootstrap');
+
+  // AU-1（§22.19）：信任反代跳数/子网 → req.ip 得真实客户端 IP（操作审计 ip 归因）。
+  // 默认只信「回环 + 链路本地 + 私有网段」（自带 nginx / 同机反代）→ 公网直连者伪造的 XFF 不被采信。
+  // 显式配跳数则**不校验来源**，仅在应用不可被绕过直连时安全。见 parseTrustProxy。
+  const rawTrustProxy = process.env.TRUST_PROXY;
+  const trustProxy = parseTrustProxy(rawTrustProxy);
+  app.set('trust proxy', trustProxy);
+  // 三个分支都给出实际去向——尤其 `true` 被拒时**必须可见**，否则运维以为「配了信任」而实际是
+  // 「不信任」（静默降级：原实现的日志条件 `!== false` 恰好在此时不打印，配置与生效相反却零提示）。
+  if (isBlindTrustValue(rawTrustProxy)) {
+    logger.warn(
+      'TRUST_PROXY=true 已拒绝并降级为「不信任反代」——true 等于盲信任意上游可伪造的 X-Forwarded-For' +
+        '（审计 IP 可被伪造成任意值）。请改为 CIDR/子网（推荐，如自带 nginx 的容器网段）或跳数。',
+    );
+  } else if (trustProxy === false) {
+    logger.log('trust proxy = false（不信任任何反代；req.ip 取 socket 地址）');
+  } else {
+    logger.log(`trust proxy = ${JSON.stringify(trustProxy)}（真实客户端 IP 解析已启用）`);
+  }
+
+  // AU-2 / AU-3（§22.19）：请求级归因元数据（客户端 IP + 访客标识）→ requestContext，
+  // 供 AuditService.log 与操作审计拦截器落 ai_audit_logs / operation_audit_logs 的 ip 与 guest_id。
+  // 中间件本体在 common/request-context 单一真源（e2e 的 test helper 共用同一函数，否则测试里会缺失）。
+  // 置于 trust proxy 之后 → req.ip 已是真实客户端 IP。
+  applyRequestContext(app);
+
+  const nodeEnv = process.env.NODE_ENV || 'development';
+  const isDev = nodeEnv === 'development';
+  const isProd = nodeEnv === 'production';
+
+  // CORS — allow specific origins in production
+  const corsOrigins = process.env.CORS_ORIGINS || '*';
+  const isWildcard = corsOrigins === '*';
+  // DEP-7：生产环境拒绝「通配 + credentials」组合——通配时禁用 credentials，防任意源携带凭据
+  const allowCredentials = !(isProd && isWildcard);
+  if (isProd && isWildcard) {
+    logger.warn('CORS_ORIGINS 为 *（通配）：已禁用 credentials（生产禁止通配+凭据组合）');
+  }
+   app.enableCors({
+     origin: corsOrigins === '*' ? true : corsOrigins.split(',').map((s) => s.trim()),
+     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
+     credentials: allowCredentials,
+   });
+
+  // Security headers
+  // 例外：script-src 放行 'wasm-unsafe-eval' —— Flutter web 的 CanvasKit 是 WebAssembly，
+  // 而 CSP 下编译 wasm 需要该关键字（只授权 wasm 编译，**不**放行 JS eval，比 'unsafe-eval' 窄得多）。
+  // 缺它时连 8 字节的最小 wasm 都编译不了（2026-09-23 实测），单容器的 /mobile 预览必然白屏。
+  app.use(
+    helmet({
+      contentSecurityPolicy: {
+        directives: {
+          ...helmet.contentSecurityPolicy.getDefaultDirectives(),
+          'script-src': ["'self'", "'wasm-unsafe-eval'"],
+        },
+      },
+    }),
+  );
+
+  // Body size limit — prevent large payload attacks
+  app.use(json({ limit: '1mb' }));
+
+  // API versioning
+  app.enableVersioning({
+    type: VersioningType.URI,
+    defaultVersion: '1',
+  });
+
+  // Global route prefix
+  app.setGlobalPrefix('api');
+
+  // CR-21: /uploads file access control — only released after the signed URL
+  // verifies (progressive mode lets bare URLs through by default; UPLOAD_REQUIRE_SIGN=1 enforces 403).
+  // After verifying, hand off to the storage driver: local objects stream from disk, private S3
+  // objects 302 to a time-limited presigned URL.
+  //
+  // CR-21：/uploads 文件访问控制——签名 URL 校验后才放行（渐进模式默认放行裸 URL，UPLOAD_REQUIRE_SIGN=1 强制 403）。
+  // 校验通过后交给存储驱动：本地对象直接送盘，私有 S3 对象 302 到有时效的 presigned URL。
+  const uploadSign = app.get(UploadSignService);
+  const storage = app.get<StorageService>(STORAGE_SERVICE);
+  const requireSign = process.env.UPLOAD_REQUIRE_SIGN === '1';
+  app.use('/uploads', async (req: Request, res: Response, next: NextFunction) => {
+    const filename = (req.path || '').replace(/^\/+/, '');
+    // 防路径穿越：拒绝空 / `..` / 反斜杠；允许 S3 键的嵌套目录段（`日期/文件`）
+    if (!filename || filename.includes('..') || filename.includes('\\')) {
+      return res.status(403).json({ code: 403, message: 'Forbidden' });
+    }
+    const pathname = `/uploads/${filename}`;
+    const e = (req.query.e as string) || '';
+    const s = (req.query.s as string) || '';
+    if (!uploadSign.verify(pathname, e, s)) {
+      if (requireSign) {
+        return res.status(403).json({ code: 403, message: 'Forbidden' });
+      }
+      // 渐进模式：放行但记日志，观察裸 URL 访问面
+      logger.warn(`[uploads] unsigned access (progressive mode): ${pathname}`);
+    }
+    try {
+      // 私有对象（S3）→ 302 到有时效的 presigned URL；本地 → 从磁盘流式送出
+      const redirect = await storage.accessRedirectUrl(pathname);
+      if (redirect) return res.redirect(302, redirect);
+      const full = resolve(LOCAL_UPLOAD_DIR, filename);
+      if (!full.startsWith(resolve(LOCAL_UPLOAD_DIR))) {
+        return res.status(403).json({ code: 403, message: 'Forbidden' });
+      }
+      res.sendFile(full, (err: Error | undefined) => {
+        if (err) next(err);
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // EASY-1 单容器交付：当 public/ 目录存在（Dockerfile.single 内嵌前端）时，
+  // 用 Nest 托管 Web 工作台（根路径 → /admin/#/workbench）+ 移动主 App 预览（/mobile）+ 管理台（/admin），
+  // 使 `docker run` 单容器即可提供全栈，无需 nginx。SERVE_STATIC 显式开启。
+  // 端定位（2026-08-17）：Web 业务 UI 唯一宿主 = 工作台；Flutter web 仅作移动预览。
+  if (process.env.SERVE_STATIC === '1') {
+    const publicDir = join(__dirname, '..', 'public');
+    const adminDir = join(publicDir, 'admin');
+    const mobileDir = join(publicDir, 'mobile');
+    // 根路径 → 工作台（Vue hash 路由，/admin/#/workbench 为工作台首页）
+    app.getHttpAdapter().get('/', (req: any, res: any) => res.redirect('/admin/#/workbench'));
+    // 移动主 App 预览（Flutter web，hash 路由无需 SPA fallback）→ /mobile/
+    app.useStaticAssets(mobileDir, { prefix: '/mobile' });
+    // 管理台 + 工作台（Web-Admin-Vue Vue3 独立构建，/admin 子路径）
+    app.useStaticAssets(adminDir, { prefix: '/admin' });
+    logger.log('Serving workbench (root → /admin/#/workbench) + mobile preview (/mobile) + admin console');
+  }
+
+  // Swagger docs — only in development
+  if (isDev) {
+    const config = new DocumentBuilder()
+      .setTitle('KeelBase API')
+      .setDescription('KeelBase backend API documentation (dev only)')
+      .setVersion('1.0')
+      .addBearerAuth()
+      .build();
+    const document = SwaggerModule.createDocument(app, config);
+    SwaggerModule.setup('api/docs', app, document);
+    logger.log('Swagger docs enabled at /api/docs (dev only)');
+  }
+
+  // RG-6 WebSocket 双向通道（原生 ws，/ws）
+  app.useWebSocketAdapter(new WsAdapter(app));
+
+  // Graceful shutdown
+  app.enableShutdownHooks();
+
+  const port = process.env.PORT || 3000;
+  await app.listen(port);
+  logger.log(`Server running on http://localhost:${port} [${nodeEnv}]`);
+
+  // 新手提示（dev 环境打印演示账号与访问地址，傻瓜化）
+  if (isDev) {
+    console.log('');
+    console.log('  ═══════════════════════════════════════════════════');
+    console.log(`   后端 API    http://localhost:${port}`);
+    console.log(`   Swagger 文档 http://localhost:${port}/api/docs`);
+    console.log('');
+    console.log('   演示账号：');
+    console.log('     普通用户  alex / Alex@2026$Demo');
+    console.log('     管理员    admin / Admin@2026$KeelBase');
+    console.log('');
+    console.log('   下一步：跑前端 `flutter run -d chrome`，或见 docs/manual/quickstart.md');
+    console.log('  ═══════════════════════════════════════════════════');
+    console.log('');
+  }
+}
+bootstrap();

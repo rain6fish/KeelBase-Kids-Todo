@@ -1,0 +1,78 @@
+// SPDX-License-Identifier: Apache-2.0
+
+import {
+  Entity,
+  PrimaryGeneratedColumn,
+  Column,
+  Index,
+  CreateDateColumn,
+  UpdateDateColumn,
+  DeleteDateColumn,
+} from 'typeorm';
+
+/** 客户状态 */
+export const CUSTOMER_STATUSES = ['lead', 'active', 'churn_risk', 'inactive'] as const;
+export type CustomerStatus = (typeof CUSTOMER_STATUSES)[number];
+
+/** 风险等级 */
+export const RISK_LEVELS = ['low', 'medium', 'high', 'critical'] as const;
+export type RiskLevel = (typeof RISK_LEVELS)[number];
+
+// Defaults for new rows, typed by the tables above: removing either value stops compiling.
+// 新建行的默认值，由上面的词表定型 —— 删掉任一个值都编译不过。
+const DEFAULT_STATUS: CustomerStatus = 'lead';
+const DEFAULT_RISK_LEVEL: RiskLevel = 'low';
+
+/**
+ * AI CRM 旗舰应用：客户主实体。
+ * owner 归属（userId）+ 软删除（RG-3），AI 工具按 userId 限定数据范围。
+ */
+@Entity('crm_customers')
+@Index(['userId'])
+@Index(['status'])
+@Index('IDX_scope_crm_customers_org_dept', ['orgId', 'deptId'])
+export class CrmCustomer {
+  @PrimaryGeneratedColumn()
+  id!: number;
+
+  @Column({ length: 100 })
+  name!: string;
+
+  @Column({ type: 'varchar', length: 120, nullable: true })
+  email?: string | null;
+
+  @Column({ type: 'varchar', length: 32, nullable: true })
+  phone?: string | null;
+
+  @Column({ type: 'varchar', length: 100, nullable: true })
+  company?: string | null;
+
+  @Column({ length: 32, default: DEFAULT_STATUS })
+  status!: string;
+
+  @Column({ length: 16, default: DEFAULT_RISK_LEVEL })
+  riskLevel!: string;
+
+  @Column({ type: 'text', nullable: true })
+  notes?: string | null;
+
+  @Column({ nullable: true, name: 'user_id' })
+  userId?: number;
+
+  /** 权限-2 数据范围：所属组织/部门（null = 仅 owner 可见；写入时盖章） */
+  @Column({ type: 'int', nullable: true, name: 'org_id' })
+  orgId?: number | null;
+
+  @Column({ type: 'int', nullable: true, name: 'dept_id' })
+  deptId?: number | null;
+
+  @CreateDateColumn()
+  createdAt!: Date;
+
+  @UpdateDateColumn()
+  updatedAt!: Date;
+
+  /** RG-3 软删除：删除后仍保留行，管理台回收站可恢复 */
+  @DeleteDateColumn({ type: Date, name: 'deleted_at' })
+  deletedAt?: Date | null;
+}

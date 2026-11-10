@@ -1,0 +1,119 @@
+{
+  "schema": 1,
+  "identity": "keelbase-application",
+  "generator": "keelbase",
+  "generatorVersion": "1.3.0",
+  "protocol": "1.1",
+  "modules": [
+    "achievements",
+    "asset_loans",
+    "badge_awards",
+    "badges",
+    "books",
+    "checkins",
+    "contracts",
+    "daily_reviews",
+    "families",
+    "followup_plans",
+    "inventory_movements",
+    "leave_requests",
+    "notes",
+    "point_records",
+    "points_ledgers",
+    "posts",
+    "reports",
+    "reward_redemptions",
+    "rewards",
+    "suppliers",
+    "tags",
+    "task_notes",
+    "tasks"
+  ],
+  "searchableModules": [
+    {
+      "module": "asset_loans",
+      "fields": [
+        "assetName",
+        "assetTag",
+        "purpose"
+      ]
+    },
+    {
+      "module": "badges",
+      "fields": [
+        "name",
+        "description",
+        "iconUrl"
+      ]
+    },
+    {
+      "module": "books",
+      "fields": [
+        "title",
+        "author"
+      ]
+    },
+    {
+      "module": "daily_reviews",
+      "fields": [
+        "content"
+      ]
+    },
+    {
+      "module": "families",
+      "fields": [
+        "name",
+        "inviteCode",
+        "useTimeStart",
+        "useTimeEnd"
+      ]
+    },
+    {
+      "module": "followup_plans",
+      "fields": [
+        "title",
+        "reason"
+      ]
+    },
+    {
+      "module": "inventory_movements",
+      "fields": [
+        "documentNo",
+        "sku",
+        "itemName",
+        "unit",
+        "partner",
+        "note"
+      ]
+    },
+    {
+      "module": "leave_requests",
+      "fields": [
+        "requestNo",
+        "reason"
+      ]
+    },
+    {
+      "module": "rewards",
+      "fields": [
+        "title",
+        "description"
+      ]
+    },
+    {
+      "module": "task_notes",
+      "fields": [
+        "content",
+        "mediaUrl"
+      ]
+    },
+    {
+      "module": "tasks",
+      "fields": [
+        "title",
+        "description",
+        "helpRequestNote"
+      ]
+    }
+  ]
+}

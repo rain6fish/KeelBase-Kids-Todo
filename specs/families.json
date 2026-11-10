@@ -1,0 +1,16 @@
+{
+  "module": "families",
+  "label": "家庭",
+  "searchable": true,
+  "fields": [
+    { "name": "name", "type": "string", "label": "家庭名称", "required": true },
+    { "name": "inviteCode", "type": "string", "label": "邀请码" },
+    { "name": "approvalMode", "type": "bool", "label": "审批模式" },
+    { "name": "useTimeStart", "type": "string", "label": "可用开始" },
+    { "name": "useTimeEnd", "type": "string", "label": "可用结束" }
+  ],
+  "aiTools": {
+    "query": true,
+    "create": { "riskLevel": "R3", "requiresConfirmation": true }
+  }
+}

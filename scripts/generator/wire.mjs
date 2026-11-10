@@ -1,0 +1,690 @@
+// SPDX-License-Identifier: Apache-2.0
+
+/**
+ * EASY-2 接线：把生成模块注册进既有文件。
+ * 安全策略：锚点唯一命中；0/多次命中 → 跳过该处 + 返回指引，绝不破坏文件；
+ *           marker 已存在 → 幂等跳过（重跑零改动）。
+ */
+import { readFile, writeFile } from 'node:fs/promises';
+import { adminI18nKeys } from './templates-admin.mjs';
+import {
+  aiToolsFlags,
+  attachmentFields,
+  enumLabelGetter,
+  fieldLabelGetter,
+  hasEnumLabels,
+} from './validate.mjs';
+
+/**
+ * Every file the wiring edits, relative to the repository root.
+ *
+ * Exported because a caller that generates into a **shared checkout** has to put the tree back
+ * afterwards, and "put it back" means exactly these files. A blanket `git checkout -- .` also reverts
+ * whatever somebody else had in flight while the run was going — `verify-consulting-to-build.sh`
+ * guards on a clean tree at entry, but a run takes minutes and that guard cannot see the exit. Listed
+ * here rather than in the caller so there is one source: a wiring this list misses leaves a modified
+ * tree behind, which the next run's guard refuses and somebody reads — the failure that shows up,
+ * rather than the one that silently reverts other people's work.
+ *
+ * 接线会改的每一个文件，相对仓库根。
+ *
+ * 之所以导出：往**共用检出**里生成的调用方事后必须把树放回去，而「放回去」指的正是这些文件。一句笼统的
+ * `git checkout -- .` 会连**别人在这趟运行期间**的在途改动一起还原——`verify-consulting-to-build.sh` 只在
+ * **进入时**守着干净工作树，而一趟要跑几分钟，那道守卫看不到出口。把它们列在**这里**而不是调用方，是为了
+ * 只有一个源：漏掉一条接线的后果是**树被留下改动**（下一次运行会被守卫挡下、有人会读它），而不是**悄悄
+ * 还原别人的工作**。
+ */
+export const WIRED_FILES = [
+  'Server-NestJS/src/app.module.ts',
+  'Server-NestJS/src/common/modules/modules-manifest.ts',
+  'Server-NestJS/src/feature-flags/feature-flags.constants.ts',
+  'Server-NestJS/src/authz/generated-role-rules.ts',
+  'Server-NestJS/src/ai/ai.module.ts',
+  'Server-NestJS/src/ai/tools/navigate-page.tool.ts',
+  'Server-NestJS/src/ai/constants/admin-pages.ts',
+  'Front-Flutter/lib/main.dart',
+  'Front-Flutter/lib/core/router/app_router.dart',
+  'Front-Flutter/lib/core/widgets/app_shell.dart',
+  'Front-Flutter/lib/core/i18n/app_localizations.dart',
+  'Web-Admin-Vue/src/router/routes.ts',
+  'Web-Admin-Vue/src/layouts/AdminLayout.vue',
+  'Web-Admin-Vue/src/i18n/zh.ts',
+  'Web-Admin-Vue/src/i18n/en.ts',
+  'Front-Taro/src/app.config.ts',
+  'Front-Taro/src/i18n/zh.ts',
+  'Front-Taro/src/i18n/en.ts',
+  'Front-Taro/src/pages/explore/index.vue',
+  // wireAdmin appends the new module to the console's module list here.
+  // wireAdmin 在这里把新模块补进控制台的模块清单。
+  'CLAUDE.md',
+  '.keelbase/manifest.json',
+];
+
+/** 在 anchor 之后插入；marker 已存在则幂等跳过。 */
+function insertAfter(content, anchor, insertion, marker) {
+  if (marker && content.includes(marker)) {
+    return { content, changed: false, reason: 'already-wired' };
+  }
+  if (!content.includes(anchor)) {
+    return { content, changed: false, reason: 'anchor-not-found' };
+  }
+  if (content.split(anchor).length - 1 > 1) {
+    return { content, changed: false, reason: 'anchor-ambiguous' };
+  }
+  const at = content.indexOf(anchor) + anchor.length;
+  return {
+    content: content.slice(0, at) + insertion + content.slice(at),
+    changed: true,
+  };
+}
+
+/**
+ * 把模块目录追加进 CLAUDE.md §13「生成与示例模块」那一行。
+ *
+ * `check:admin-pages` 拿 `Web-Admin-Vue/src/views/` 下的目录与那一行对账；生成器此前**不碰它**，
+ * 于是每生成一个模块，那道门就红一次、直到有人手工补上 —— 而 `create_module_apply` 只跑 CLI，
+ * 做不到这件事 ⇒ **助手造出来的模块会留下一道红门**（复制模块实测）。补它是接线的一部分，不是人的活。
+ *
+ * The admin-pages gate diffs `views/` against that line. The generator used to leave it stale, so every
+ * generated module turned that gate red until a human edited the doc — and `create_module_apply` only runs
+ * the CLI, so it could not. Wiring it belongs to generating.
+ */
+function wireClaudeModuleList(content, name) {
+  const marker = '**生成与示例模块**(';
+  const at = content.indexOf(marker);
+  if (at === -1) return { content, changed: false, reason: 'claude-module-line-not-found' };
+  const end = content.indexOf(')', at);
+  if (end === -1) return { content, changed: false, reason: 'claude-module-line-not-found' };
+  if (content.slice(at, end).includes(`\`${name}\``)) {
+    return { content, changed: false, reason: 'already-wired' };
+  }
+  return {
+    content: `${content.slice(0, end)} · \`${name}\`${content.slice(end)}`,
+    changed: true,
+  };
+}
+
+/** 在 anchor 之前插入。 */
+function insertBefore(content, anchor, insertion, marker) {
+  if (marker && content.includes(marker)) {
+    return { content, changed: false, reason: 'already-wired' };
+  }
+  if (!content.includes(anchor)) {
+    return { content, changed: false, reason: 'anchor-not-found' };
+  }
+  if (content.split(anchor).length - 1 > 1) {
+    return { content, changed: false, reason: 'anchor-ambiguous' };
+  }
+  const at = content.indexOf(anchor);
+  return {
+    content: content.slice(0, at) + insertion + content.slice(at),
+    changed: true,
+  };
+}
+
+async function applyFile(file, fn) {
+  const abs = `${file}`;
+  let original;
+  try {
+    original = await readFile(abs, 'utf8');
+  } catch {
+    return { file, changed: false, reason: 'file-not-found' };
+  }
+  // CRLF 文件（如 Flutter main.dart）锚点用 LF 匹配不上 → 归一化后匹配，写回恢复原行尾（避免全文件行尾 diff）
+  const crlf = original.includes('\r\n');
+  const normalized = crlf ? original.replace(/\r\n/g, '\n') : original;
+  const { content, changed, reason } = fn(normalized);
+  if (!changed) return { file, changed: false, reason };
+  const out = crlf ? content.replace(/\n/g, '\r\n') : content;
+  await writeFile(abs, out, 'utf8');
+  return { file, changed: true, reason };
+}
+
+/** 后端接线：app.module + modules-manifest + feature-flags（可选）。root 默认仓库根（cwd）。 */
+export async function wireBackend(ctx, root = '') {
+  const results = [];
+  const sep = root ? (root.endsWith('/') ? '' : '/') : '';
+  const BE = `${root}${sep}Server-NestJS/src`;
+
+  // 1) app.module.ts：import + imports 数组
+  results.push(
+    await applyFile(`${BE}/app.module.ts`, (c) =>
+      insertAfter(
+        c,
+        `import { TodosModule } from './todos/todos.module';`,
+        `\nimport { ${ctx.pluralPascal}Module } from './${ctx.plural}/${ctx.plural}.module';`,
+        `./${ctx.plural}/${ctx.plural}.module`,
+      ),
+    ),
+  );
+  results.push(
+    await applyFile(`${BE}/app.module.ts`, (c) =>
+      insertAfter(
+        c,
+        `    TodosModule,`,
+        `\n    ${ctx.pluralPascal}Module,`,
+        `${ctx.pluralPascal}Module,`,
+      ),
+    ),
+  );
+
+  // 2) modules-manifest.ts：BUSINESS_MODULES + businessEntries
+  results.push(
+    await applyFile(`${BE}/common/modules/modules-manifest.ts`, (c) => {
+      if (c.includes(`'${ctx.plural}'`)) return { content: c, changed: false, reason: 'already-wired' };
+      const m = c.match(/(export const BUSINESS_MODULES = \[)([^\]]*)(\])/);
+      if (!m) return { content: c, changed: false, reason: 'anchor-not-found' };
+      const inner = m[2].trim();
+      const next = `${m[1]}${inner}${inner ? ', ' : ''}'${ctx.plural}'${m[3]}`;
+      return { content: c.replace(m[0], next), changed: true };
+    }),
+  );
+  results.push(
+    await applyFile(`${BE}/common/modules/modules-manifest.ts`, (c) =>
+      insertAfter(
+        c,
+        `  { id: 'todos', category: 'business', deps: [], label: '待办', description: '待办清单与完成状态' },`,
+        `\n  { id: '${ctx.plural}', category: 'business', deps: [], label: '${ctx.label}', description: '${ctx.label}（${ctx.plural} 模块，keelbase init 生成）' },`,
+        `id: '${ctx.plural}'`,
+      ),
+    ),
+  );
+
+  // 3) feature-flags.constants.ts（可选）
+  if (ctx.featureFlag) {
+    results.push(
+      await applyFile(`${BE}/feature-flags/feature-flags.constants.ts`, (c) =>
+        insertAfter(
+          c,
+          `  TODOS: 'todos',`,
+          `\n  ${ctx.plural.toUpperCase().replace(/-/g, '_')}: '${ctx.plural}',`,
+          `'${ctx.plural}',`,
+        ),
+      ),
+    );
+  }
+
+  // 4) 生成模块的角色规则（本人所有权）——否则本人更新/删除 403。
+  //    权限-2 Step 2 起规则**数据驱动**：生成期无法向部署期 DB 种数据，故写「代码即配置」的
+  //    generated-role-rules.ts，由 RoleRuleRegistry 装配时并入内存注册表。
+  results.push(
+    await applyFile(`${BE}/authz/generated-role-rules.ts`, (c) =>
+      insertAfter(
+        c,
+        `export const GENERATED_ROLE_RULES: RoleRuleSeed[] = [`,
+        `\n  // keelbase init 生成模块\n  { roleCode: 'user', subject: '${ctx.singlePascal}', ownerField: 'userId' },`,
+        `subject: '${ctx.singlePascal}'`,
+      ),
+    ),
+  );
+
+  return results;
+}
+
+/** 前端接线：main.dart + app_router + app_localizations + navigate-page.tool。 */
+export async function wireFrontend(ctx, root = '') {
+  const results = [];
+  const sep = root ? (root.endsWith('/') ? '' : '/') : '';
+  const FE = `${root}${sep}Front-Flutter/lib`;
+  const BE = `${root}${sep}Server-NestJS/src`;
+
+  // 4) main.dart：imports + Provider
+  results.push(
+    await applyFile(`${FE}/main.dart`, (c) => {
+      const anchor = `import 'features/todos/data/repositories/todos_repository.dart';`;
+      const marker = `features/${ctx.plural}/presentation/providers`;
+      if (c.includes(marker)) return { content: c, changed: false, reason: 'already-wired' };
+      if (!c.includes(anchor)) return { content: c, changed: false, reason: 'anchor-not-found' };
+      const insertion =
+        `\nimport 'features/${ctx.plural}/data/repositories/${ctx.plural}_repository.dart';\n` +
+        `import 'features/${ctx.plural}/presentation/providers/${ctx.plural}_provider.dart';\n`;
+      return {
+        content: c.slice(0, c.indexOf(anchor) + anchor.length) + insertion + c.slice(c.indexOf(anchor) + anchor.length),
+        changed: true,
+      };
+    }),
+  );
+  results.push(
+    await applyFile(`${FE}/main.dart`, (c) =>
+      insertAfter(
+        c,
+        `        ChangeNotifierProvider<TodosProvider>(\n          create: (_) => TodosProvider(TodosRepository(apiClient), cache: AppCache(prefs)),\n        ),`,
+        `\n        // ${ctx.label}（EASY-2 生成）\n        ChangeNotifierProvider<${ctx.pluralPascal}Provider>(\n          create: (_) => ${ctx.pluralPascal}Provider(${ctx.pluralPascal}Repository(apiClient), cache: AppCache(prefs)),\n        ),`,
+        `${ctx.pluralPascal}Provider(`,
+      ),
+    ),
+  );
+
+  // 5) app_router.dart：import + 顶层路由
+  results.push(
+    await applyFile(`${FE}/core/router/app_router.dart`, (c) =>
+      insertAfter(
+        c,
+        `import '../../features/todos/presentation/pages/todos_page.dart';`,
+        `\nimport '../../features/${ctx.plural}/presentation/pages/${ctx.plural}_page.dart';`,
+        `features/${ctx.plural}/presentation/pages`,
+      ),
+    ),
+  );
+  results.push(
+    await applyFile(`${FE}/core/router/app_router.dart`, (c) => {
+      if (ctx.isTab) {
+        // --tab：作为底部 Tab 的 StatefulShellBranch，追加到 todos 分支后
+        return insertAfter(
+          c,
+          `                pageBuilder: (_, _) => const NoTransitionPage(child: TodosPage()),\n              ),\n            ],\n          ),`,
+          `\n          StatefulShellBranch(\n            routes: [\n              GoRoute(\n                path: '/${ctx.plural}',\n                pageBuilder: (_, _) => const NoTransitionPage(child: ${ctx.pluralPascal}Page()),\n              ),\n            ],\n          ),`,
+          `path: '/${ctx.plural}'`,
+        );
+      }
+      // 非 tab：顶层全屏页
+      return insertBefore(
+        c,
+        `      // Legal pages`,
+        `      // ${ctx.label}（EASY-2 生成）\n      GoRoute(\n        path: '/${ctx.plural}',\n        builder: (_, _) => const ${ctx.pluralPascal}Page(),\n      ),\n`,
+        `path: '/${ctx.plural}'`,
+      );
+    }),
+  );
+
+  // 6) --tab：app_shell 底部 Tab + i18n tab 标签
+  if (ctx.isTab) {
+    results.push(
+      await applyFile(`${FE}/core/widgets/app_shell.dart`, (c) =>
+        insertAfter(
+          c,
+          `    _TabItem(icon: CupertinoIcons.checkmark_square, labelKey: 'tabTodos'),`,
+          `\n    _TabItem(icon: CupertinoIcons.doc_text, labelKey: 'tab${ctx.pluralPascal}'),`,
+          `labelKey: 'tab${ctx.pluralPascal}'`,
+        ),
+      ),
+    );
+    results.push(
+      await applyFile(`${FE}/core/widgets/app_shell.dart`, (c) =>
+        insertAfter(
+          c,
+          `      case 'tabTodos':\n        return l10n.tabTodos;`,
+          `\n      case 'tab${ctx.pluralPascal}':\n        return l10n.tab${ctx.pluralPascal};`,
+          `case 'tab${ctx.pluralPascal}'`,
+        ),
+      ),
+    );
+    results.push(
+      await applyFile(`${FE}/core/i18n/app_localizations.dart`, (c) =>
+        insertAfter(
+          c,
+          `  String get tabTodos => _t('Todos', '待办');`,
+          `\n  String get tab${ctx.pluralPascal} => _t('${ctx.singlePascal}', '${ctx.label}');`,
+          `tab${ctx.pluralPascal}`,
+        ),
+      ),
+    );
+  }
+
+  // 7) app_localizations.dart：4 个页面 getter + enum 双标签 getter
+  // 注：守卫仍是 `${ctx.plural}Title` —— 对**已生成过**的模块再次运行（如给已有 spec 补 enumLabels），
+  // 本步会被判为 already-wired 而跳过，标签不会补注入；需显式重建（`--force`，受 manifest 成员校验约束）。
+  // 这是既有的幂等语义，不在本次改动范围内（升级语义归 P0-9 之外的 C7 升级内核）。
+  const enTitle = ctx.singlePascal;
+  const enumGetters = enumLabelGetterDecls(ctx);
+  // 没有附件字段就不发这三个 key（§15.3）；上传/取消两个动作复用应用级已有文案。
+  const attachGetters =
+    attachmentFields(ctx.fields).length === 0
+      ? ''
+      : `\n` +
+        `  String get ${ctx.plural}AttachmentMenuTitle => _t('Attachments', '附件');\n` +
+        `  String get ${ctx.plural}AttachmentRevoke => _t('Revoke', '撤销');\n` +
+        `  String get ${ctx.plural}AttachmentRevokeConfirm => _t('Revoke this attachment?', '撤销该附件？');`;
+  results.push(
+    await applyFile(`${FE}/core/i18n/app_localizations.dart`, (c) =>
+      insertAfter(
+        c,
+        `  String get deleteTodoConfirm => _t('Delete this todo?', '删除该待办？');`,
+        `\n\n  // --- ${ctx.label}（EASY-2 生成） ---\n` +
+          `  String get ${ctx.plural}Title => _t('${enTitle}', '${ctx.label}');\n` +
+          `  String get ${ctx.plural}AddTitle => _t('New ${enTitle}', '新增${ctx.label}');\n` +
+          `  String get ${ctx.plural}Empty => _t('No ${enTitle} yet', '暂无${ctx.label}');\n` +
+          `  String get ${ctx.plural}DeleteConfirm => _t('Delete this ${enTitle.toLowerCase()}?', '删除该${ctx.label}？');` +
+          attachGetters +
+          enumGetters,
+        `String get ${ctx.plural}Title`,
+      ),
+    ),
+  );
+
+  // 字段占位符 getter 单独一段，守卫是**第一个字段的 getter**、不是上面那个 `<plural>Title`：老模块
+  // 的页面块早就注入了（同守卫会让这半步永远补不上），而页面现在**读**这些 getter（CLAUDE.md §3.3）。
+  // The placeholder getters get their own block, guarded by the first field's getter rather than the
+  // one above: a module generated before this existed already has that block, and the page reads these
+  // now — a shared guard would leave every such module permanently half short.
+  if (ctx.fields.length > 0) {
+    const firstGetter = fieldLabelGetter(ctx.plural, ctx.fields[0].name);
+    results.push(
+      await applyFile(`${FE}/core/i18n/app_localizations.dart`, (c) =>
+        insertAfter(
+          c,
+          `  String get deleteTodoConfirm => _t('Delete this todo?', '删除该待办？');`,
+          `\n\n  // --- ${ctx.label} · 字段占位符 / field placeholders ---\n` +
+            ctx.fields
+              .map(
+                (f) =>
+                  `  String get ${fieldLabelGetter(ctx.plural, f.name)} => _t('${f.name}', '${f.label ?? f.name}');\n`,
+              )
+              .join(''),
+          `String get ${firstGetter}`,
+        ),
+      ),
+    );
+  }
+
+  // 8) navigate-page.tool.ts：PAGE_ROUTES
+  results.push(
+    await applyFile(`${BE}/ai/tools/navigate-page.tool.ts`, (c) =>
+      insertAfter(
+        c,
+        `  todos: { route: '/todos', description: '待办清单' },`,
+        `\n  ${ctx.plural}: { route: '/${ctx.plural}', description: '${ctx.label}' },`,
+        `  ${ctx.plural}: { route: '/${ctx.plural}'`,
+      ),
+    ),
+  );
+
+  return results;
+}
+
+/** AI 工具接线（第 11-12 周）：ai.module.ts 注册生成的 query/create 工具。 */
+export async function wireAiModule(ctx, root = '') {
+  const results = [];
+  const flags = aiToolsFlags(ctx.aiTools);
+  const sep = root ? (root.endsWith('/') ? '' : '/') : '';
+  const BE = `${root}${sep}Server-NestJS/src`;
+  const AI = `${BE}/ai/ai.module.ts`;
+
+  // 1) 模块 + service import
+  results.push(
+    await applyFile(AI, (c) =>
+      insertAfter(
+        c,
+        `import { TodosService } from '../todos/todos.service';`,
+        `\nimport { ${ctx.pluralPascal}Module } from '../${ctx.plural}/${ctx.plural}.module';\nimport { ${ctx.pluralPascal}Service } from '../${ctx.plural}/${ctx.plural}.service';`,
+        `../${ctx.plural}/${ctx.plural}.module`,
+      ),
+    ),
+  );
+  // 2) 工具文件 import（按 aiTools 声明开关，Protocol 2.0）
+  const toolImports = [
+    flags.query ? `import { Query${ctx.pluralPascal}Tool } from './tools/query-${ctx.plural}.tool';` : '',
+    flags.create ? `import { Create${ctx.singlePascal}Tool } from './tools/create-${ctx.plural}.tool';` : '',
+  ].filter(Boolean);
+  if (toolImports.length > 0) {
+    results.push(
+      await applyFile(AI, (c) =>
+        insertAfter(
+          c,
+          `import { CreateTodoTool } from './tools/create-todo.tool';`,
+          `\n${toolImports.join('\n')}`,
+          toolImports[0],
+        ),
+      ),
+    );
+  }
+  // 3) imports 数组
+  results.push(
+    await applyFile(AI, (c) =>
+      insertAfter(c, `    TodosModule,`, `\n    ${ctx.pluralPascal}Module,`, `${ctx.pluralPascal}Module,`),
+    ),
+  );
+  // 4) useFactory 参数
+  results.push(
+    await applyFile(AI, (c) =>
+      insertAfter(
+        c,
+        `        todosService: TodosService,`,
+        `\n        ${ctx.plural}Service: ${ctx.pluralPascal}Service,`,
+        `${ctx.plural}Service: ${ctx.pluralPascal}Service`,
+      ),
+    ),
+  );
+  // 5) inject 数组：`TodosService, `（大写 + 逗号 + 空格）仅在 inject 数组出现（useFactory 参数是逗号+换行），唯一锚点
+  // 幂等守卫须与插入 token 同形：插入后 inject 变为 `… TodosService, XService, <其余原条目…`，
+  // 故 marker = `${X}Service, `（provider 行是 `: XService,` + 换行，无尾空格，不误命中）。
+  results.push(
+    await applyFile(AI, (c) =>
+      insertAfter(
+        c,
+        `TodosService, `,
+        `${ctx.pluralPascal}Service, `,
+        `${ctx.pluralPascal}Service, `,
+      ),
+    ),
+  );
+  // 6) 注册 query + create 工具（按 aiTools 声明开关，Protocol 2.0）
+  const toolRegs = [
+    flags.query ? `        toolRegistry.register(new Query${ctx.pluralPascal}Tool(${ctx.plural}Service));` : '',
+    flags.create ? `        toolRegistry.register(new Create${ctx.singlePascal}Tool(${ctx.plural}Service));` : '',
+  ].filter(Boolean);
+  if (toolRegs.length > 0) {
+    results.push(
+      await applyFile(AI, (c) =>
+        insertAfter(
+          c,
+          `        toolRegistry.register(new CreateTodoTool(todosService));`,
+          `\n        // ${ctx.label}（EASY-2 自动生成 AI 工具）\n${toolRegs.join('\n')}`,
+          toolRegs[0],
+        ),
+      ),
+    );
+  }
+
+  return results;
+}
+
+/** Web-Admin-Vue 接线（⑤-2）：routes + navGroups + i18n zh/en。 */
+export async function wireAdmin(ctx, root = '') {
+  const results = [];
+  const sep = root ? (root.endsWith('/') ? '' : '/') : '';
+  const WA = `${root}${sep}Web-Admin-Vue/src`;
+  const BE = `${root}${sep}Server-NestJS/src`;
+  const keys = adminI18nKeys(ctx);
+
+  // 1) 路由：data-import 后加懒加载管理路由
+  //    这条 meta 必须带 `module:` —— 菜单（AdminLayout）与路由守卫（guards.ts）都只读这一处，而
+  //    两者正好是 MOD-4 能力门的两个消费者。少了它，生成模块的页面在模块被禁用后仍留在菜单里、
+  //    也仍进得去：那道门对生成模块从不生效（2026-10-11 之前的实况）。
+  //    The `module:` key is what makes the MOD-4 gate apply: the menu (AdminLayout) and the route
+  //    guard (guards.ts) both read it and nothing else. Without it the page stays in the menu and
+  //    stays reachable even when the module is disabled — the gate never fires for generated modules.
+  results.push(
+    await applyFile(`${WA}/router/routes.ts`, (c) =>
+      insertAfter(
+        c,
+        `{ path: 'data-import', name: 'data-import', component: () => import('@/views/data-import/DataImportView.vue'), meta: { title: 'navDataImport' } },`,
+        `\n      { path: '${ctx.plural}', name: '${ctx.plural}', component: () => import('@/views/${ctx.plural}/${ctx.pluralPascal}View.vue'), meta: { title: 'nav${ctx.pluralPascal}', module: '${ctx.plural}' } },`,
+        `name: '${ctx.plural}'`,
+      ),
+    ),
+  );
+
+  // 2) 侧边栏：navData 组 data-import 后加菜单项
+  results.push(
+    await applyFile(`${WA}/layouts/AdminLayout.vue`, (c) =>
+      insertAfter(
+        c,
+        `{ name: 'data-import', to: '/data-import', icon: 'mdi-upload-multiple', label: t('navDataImport') },`,
+        `\n      { name: '${ctx.plural}', to: '/${ctx.plural}', icon: 'mdi-database-outline', label: t('nav${ctx.pluralPascal}') },`,
+        `name: '${ctx.plural}'`,
+      ),
+    ),
+  );
+
+  // 3) i18n：zh + en
+  for (const [lang, zh] of [['zh', keys.zh], ['en', keys.en]]) {
+    const anchor = lang === 'zh' ? `  navDataImport: '数据导入',` : `  navDataImport: 'Data Import',`;
+    const insertion =
+      `\n  ${Object.entries(zh).map(([k, v]) => `${k}: '${v}',`).join('\n  ')}`;
+    results.push(
+      await applyFile(`${WA}/i18n/${lang}.ts`, (c) =>
+        insertAfter(c, anchor, insertion, `nav${ctx.pluralPascal}`),
+      ),
+    );
+  }
+
+  // 4) 后端导航映射：ADMIN_PAGE_ROUTES 也要加一条 —— System AI Assistant 的 navigate_admin_page
+  //    靠这张表认页；只写前端两处（路由 + 菜单）而漏了它，页面就在管理台里活着、AI 却到不了，
+  //    而 navigation-parity 门禁会因此判「孤页」。锚点取 base 页 `data-import`（与前端那两处同一个
+  //    锚点：它在任何 KeelBase 应用里都存在，而 `notes` 之类的示例模块可能被人删掉）。
+  //    ADMIN_SYSTEM_PROMPT 的页面清单由本表模板生成，故不必另改。
+  //
+  //    两点刻意为之：键**不加引号**（模块名恒为 `[a-z][a-z0-9_]*`，本身就是合法标识符；本表已有的
+  //    生成模块 `contracts`/`suppliers`/`tags`/`notes` 也都是这个写法），而**幂等判据取路由串而不是
+  //    键名** —— 判据若带引号，一条手工补的、没带引号的同名条目就躲过检查，于是插出第二份、编译期
+  //    报 TS1117「object literal cannot have multiple properties with the same name」（实测就是这么
+  //    撞上的：`followup_plans`）。路由串两种写法都一样，故拿它当判据。
+  //
+  // The backend navigation map needs an entry too: System AI Assistant's `navigate_admin_page` reads
+  // this table, so wiring only the two frontend places leaves a page that exists but that the AI
+  // cannot reach — and the navigation-parity gate calls that an orphan. Anchored on the base
+  // `data-import` page (the same anchor as the two frontend edits: it exists in every KeelBase app,
+  // whereas a sample module like `notes` can be deleted). The prompt's page list is generated from
+  // this table, so it needs no separate edit.
+  //
+  // Two deliberate details: the key is **unquoted** (a module name is always `[a-z][a-z0-9_]*`, hence
+  // already a legal identifier — the generated entries already in this table read the same way), and
+  // the idempotency marker is the **route string rather than the key** — a marker carrying quotes
+  // would let a hand-added entry without them slip past, and the second entry then fails the build
+  // with TS1117 `object literal cannot have multiple properties with the same name`, which is exactly
+  // how `followup_plans` surfaced. The route string reads the same either way, so it is the marker.
+  results.push(
+    await applyFile(`${BE}/ai/constants/admin-pages.ts`, (c) =>
+      insertAfter(
+        c,
+        `  'data-import': { route: '/data-import', description: '数据导入' },`,
+        `\n  ${ctx.plural}: { route: '/${ctx.plural}', description: '${ctx.label}管理' },`,
+        `route: '/${ctx.plural}'`,
+      ),
+    ),
+  );
+
+  // 5) CLAUDE.md §13 的模块清单 —— 见 `wireClaudeModuleList` 的注释：不补它，每生成一个模块
+  //    `check:admin-pages` 就红一次，而 `create_module_apply` 只跑 CLI、补不了。
+  results.push(
+    await applyFile(`${root}${sep}CLAUDE.md`, (c) => wireClaudeModuleList(c, ctx.plural)),
+  );
+
+  return results;
+}
+
+/** Taro（Vue3）接线（⑤-3）：app.config pages + explore quickCards。 */
+export async function wireTaro(ctx, root = '') {
+  const results = [];
+  const sep = root ? (root.endsWith('/') ? '' : '/') : '';
+  const TARO = `${root}${sep}Front-Taro/src`;
+
+  // Taro 的两份词典（H5/小程序）：页面与 store 的文案都走 `t()` / `translate()`，键在这里**声明一次**、
+  // 两种语言同时加；`'<plural>.title'` 既当守卫也当幂等 marker —— 已生成过的模块不会再插一遍。
+  // The Taro dictionaries: page and store word everything through `t()` / `translate()`, so the keys are
+  // declared here once, in both languages, guarded by the module's own title key.
+  const taroKeys = (labels) =>
+    `\n  // ── ${ctx.label}（EASY-2 生成）──\n` +
+    Object.entries(labels)
+      .map(([k, v]) => `  '${ctx.plural}.${k}': ${v},\n`)
+      .join('');
+  results.push(
+    await applyFile(`${TARO}/i18n/zh.ts`, (c) =>
+      insertAfter(
+        c,
+        `export const zh: I18nDictionary = {`,
+        taroKeys({
+          title: `'${ctx.label}'`,
+          count: `'{total} 条'`,
+          placeholder: `'新增${ctx.label}…'`,
+          add: `'添加'`,
+          empty: `'暂无${ctx.label}'`,
+          inputRequired: `'请输入${ctx.label}内容'`,
+          createFailed: `'创建失败'`,
+          deleteTitle: `'删除${ctx.label}'`,
+          deleteFailed: `'删除失败'`,
+          loadFailed: `'加载${ctx.label}失败'`,
+        }),
+        `'${ctx.plural}.title'`,
+      ),
+    ),
+  );
+  results.push(
+    await applyFile(`${TARO}/i18n/en.ts`, (c) =>
+      insertAfter(
+        c,
+        `export const en: I18nDictionary = {`,
+        taroKeys({
+          title: `'${ctx.pluralPascal}'`,
+          count: `'{total} items'`,
+          // The identifier is an internal name; user-visible English reads it as words, not snake_case.
+          // 模块标识符是内部名；用户看到的英文按词读，不出现下划线。
+          placeholder: `'Add ${ctx.singular.replace(/_/g, ' ')}…'`,
+          add: `'Add'`,
+          empty: `'No ${ctx.plural.replace(/_/g, ' ')} yet'`,
+          inputRequired: `'Please enter a ${ctx.singular.replace(/_/g, ' ')} name'`,
+          createFailed: `'Failed to create'`,
+          deleteTitle: `'Delete ${ctx.singlePascal}'`,
+          deleteFailed: `'Failed to delete'`,
+          loadFailed: `'Failed to load ${ctx.plural.replace(/_/g, ' ')}'`,
+        }),
+        `'${ctx.plural}.title'`,
+      ),
+    ),
+  );
+
+  results.push(
+    await applyFile(`${TARO}/app.config.ts`, (c) =>
+      insertAfter(
+        c,
+        `    'pages/search/index',`,
+        `\n    'pages/${ctx.plural}/index',`,
+        `'pages/${ctx.plural}/index'`,
+      ),
+    ),
+  );
+  results.push(
+    await applyFile(`${TARO}/pages/explore/index.vue`, (c) =>
+      insertAfter(
+        c,
+        `  { icon: '⚙️', label: t('explore.settings'), color: '#9333EA', path: '/pages/settings/index' },`,
+        `\n  { icon: '📦', label: '${ctx.label}', color: '#F97316', path: '/pages/${ctx.plural}/index' },`,
+        `path: '/pages/${ctx.plural}/index'`,
+      ),
+    ),
+  );
+
+  return results;
+}
+
+/** 汇总接线结果，打印已接入/跳过清单。 */
+export function summarize(results) {
+  const wired = results.filter((r) => r.changed).map((r) => r.file);
+  const skipped = results.filter((r) => !r.changed);
+  return { wired, skipped };
+}
+
+/**
+ * Dart getter declarations for every declared enum label, ready to append to
+ * app_localizations.dart. Exported so the emission itself is unit-testable:
+ * asserting the getter *name* alone would not prove the zh/en pair survives
+ * into the generated localizations.
+ *
+ * 为每个已声明标签的 enum 选项生成 Dart getter 声明，供追加进 app_localizations.dart。
+ * 导出以便对**发射物本身**做单测 —— 只断言 getter 名字不足以证明 zh/en 成对
+ * 落进了生成的本地化文件。
+ */
+export function enumLabelGetterDecls(ctx) {
+  return ctx.fields
+    .filter((f) => hasEnumLabels(f))
+    .flatMap((f) =>
+      f.enum
+        .filter((opt) => f.enumLabels[opt])
+        .map(
+          (opt) =>
+            `\n  String get ${enumLabelGetter(ctx, f.name, opt)} => _t('${f.enumLabels[opt].en}', '${f.enumLabels[opt].zh}');`,
+        ),
+    )
+    .join('');
+}

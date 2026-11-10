@@ -1,0 +1,291 @@
+// SPDX-License-Identifier: Apache-2.0
+
+/**
+ * 子代理编排器 — SubAgentOrchestrator
+ *
+ * 把复杂请求分解为子代理任务（技能命中用固定组合，否则 LLM 分解），
+ * 顺序执行（后续任务能看到先前结果），聚合结果交回主线程做总结 + 反思。
+ *
+ * 子代理只读：写工具泄漏进工具集时拒绝执行。plain class，由 useFactory 手动组合。
+ */
+
+import { LlmProvider, ChatMessage, ToolCall } from '../interfaces/llm-provider.interface';
+import { ToolDefinition, ToolResult } from '../interfaces/tool.interface';
+import { ToolRegistry } from '../tools/tool-registry';
+import { SkillsRegistry } from '../skills/skills-registry';
+import { SkillDefinition } from '../skills/skill.interface';
+import { SUB_AGENTS, SUB_AGENT_NAMES, SubAgentDefinition } from './sub-agent.types';
+import { ReadOnlyToolExecutor } from './plan-execute-agent.service';
+import { actorContext } from '../../governance-shared/actor-context';
+import { LlmUsage, addLlmUsage } from '../llm-usage';
+
+export interface SubAgentTask {
+  subAgent: string;
+  query: string;
+}
+
+/**
+ * §22.19 AU-2: what a sub-agent proposed but was not allowed to run. The orchestrator's guard turns
+ * such a call away before any executor sees it, so without this callback the attempt leaves no trace.
+ *
+ * §22.19 AU-2：子代理**提议了但没被允许执行**的调用。编排器的守卫在执行器之前就把它挡掉了，没有这个
+ * 回调，这次尝试就不留任何痕迹。
+ */
+export interface SubAgentToolDenial {
+  toolName: string;
+  /** 模型给出的原文参数串（未解析，守卫在此之前就拦下了） */
+  argsJson: string;
+  userId: string;
+  reason: string;
+}
+
+/** 三层贯穿的同一份执行参数（run → 循环 → executeSafe），故抽成具名类型而不是三处内联。 */
+interface SubAgentRunParams {
+  provider: LlmProvider;
+  toolRegistry: ToolRegistry;
+  userId: string;
+  model?: string;
+  readOnlyExecutor?: ReadOnlyToolExecutor;
+  /** §22.19 AU-2：越界尝试的留痕口子（可选——未注入执行器的场景天然也无处落行） */
+  onDenied?: (denial: SubAgentToolDenial) => Promise<void>;
+}
+
+export interface SubAgentOrchestratorResult {
+  content: string;
+  stepResults: string[];
+  usedSkill?: string;
+  /** 任务分解 + 各子代理多轮工具循环的全部 LLM 用量（调用方并入整轮口径） */
+  usage?: LlmUsage;
+}
+
+const MAX_SUBAGENT_TOOL_ROUNDS = 3;
+const MAX_DECOMPOSE_TASKS = 5;
+
+const DECOMPOSITION_PROMPT = `你是任务分解器。把用户的复杂请求拆分成多个子任务，交给不同的子代理执行，最后汇总。
+可用的子代理：
+- calendar：日程/事件助手，工具：query_events、count_events_by_status、query_events_by_keyword
+- stats：统计/洞察助手，工具：count_events_by_status、get_user_stats
+- organizer：安排/规划助手，工具：query_events、count_events_by_status、query_events_by_keyword
+
+只返回 JSON，不要任何其他文字，格式：
+{"tasks":[{"subAgent":"calendar","query":"给该子代理的具体问题"}]}
+要求：
+- 最多 ${MAX_DECOMPOSE_TASKS} 个任务
+- 任务按顺序执行，后面的任务可以看到前面的结果，所以查询问题可以依赖前面
+- 子代理名必须从上面列表选`;
+
+export class SubAgentOrchestrator {
+  constructor(private readonly skillsRegistry: SkillsRegistry) {
+    // 断言所有子代理工具集都是只读
+    for (const agent of Object.values(SUB_AGENTS)) {
+      for (const tool of agent.tools) {
+        if (tool === 'create_event' || tool === 'create_todo') {
+          throw new Error(`Sub-agent "${agent.name}" contains write tool "${tool}"`);
+        }
+      }
+    }
+  }
+
+  matchSkill(request: string): SkillDefinition | null {
+    return this.skillsRegistry.match(request);
+  }
+
+  async run(
+    params: SubAgentRunParams & { messages: ChatMessage[]; userRequest: string },
+  ): Promise<SubAgentOrchestratorResult> {
+    // 1. 技能命中 → 固定任务组合；否则 LLM 分解
+    let usage: LlmUsage | undefined;
+    const skill = this.skillsRegistry.match(params.userRequest);
+    let tasks: SubAgentTask[];
+    if (skill) {
+      tasks = skill.tasks;
+    } else {
+      const decomposed = await this.decompose(params);
+      usage = decomposed.usage;
+      tasks = decomposed.tasks;
+      if (tasks.length === 0) {
+        return { content: '', stepResults: [], usage };
+      }
+    }
+
+    // 2. 顺序执行，后续任务注入先前结果
+    const stepResults: string[] = [];
+    const priorResults: string[] = [];
+    for (const task of tasks) {
+      const agent = SUB_AGENTS[task.subAgent];
+      if (!agent) {
+        stepResults.push(`ERROR: unknown sub-agent "${task.subAgent}"`);
+        priorResults.push(`[${task.subAgent}] ERROR: unknown sub-agent`);
+        continue;
+      }
+      const result = await this.runSubAgentLoop(agent, task, priorResults, params);
+      // 每个子代理各自跑多轮 LLM，逐个子代理累加
+      usage = addLlmUsage(usage, result.usage);
+      stepResults.push(result.content);
+      priorResults.push(`[${task.subAgent}] ${result.content}`);
+    }
+
+    if (stepResults.length === 0) {
+      return { content: '', stepResults: [], usage };
+    }
+
+    // 3. 聚合
+    const content = stepResults
+      .map((r, i) => `步骤 ${i + 1}（${tasks[i]?.subAgent ?? '?'}）: ${tasks[i]?.query ?? ''}\n结果: ${r}`)
+      .join('\n\n');
+
+    return { content, stepResults, usedSkill: skill?.name, usage };
+  }
+
+  private async decompose(params: {
+    messages: ChatMessage[];
+    userRequest: string;
+    provider: LlmProvider;
+    model?: string;
+  }): Promise<{ tasks: SubAgentTask[]; usage?: LlmUsage }> {
+    let result;
+    try {
+      result = await params.provider.generate({
+        messages: [
+          ...params.messages.slice(0, 1),
+          { role: 'user', content: `${DECOMPOSITION_PROMPT}\n\n用户请求：${params.userRequest}` },
+        ],
+        model: params.model ?? params.provider.availableModels[0],
+        maxTokens: 1024,
+        temperature: 0.2,
+      });
+      const stripped = result.content.replace(/```(?:json)?/g, '').trim();
+      const parsed = JSON.parse(stripped);
+      if (!parsed.tasks || !Array.isArray(parsed.tasks)) return { tasks: [], usage: result.usage };
+      const tasks = parsed.tasks
+        .filter((t: any) => t && typeof t.subAgent === 'string' && typeof t.query === 'string')
+        .map((t: any) => ({ subAgent: t.subAgent, query: t.query }))
+        .filter((t: SubAgentTask) => SUB_AGENT_NAMES.includes(t.subAgent));
+      return { tasks: tasks.slice(0, MAX_DECOMPOSE_TASKS), usage: result.usage };
+    } catch {
+      // provider 抛错时无用量；解析失败时 result 已在手，照样带回那笔已花的 token
+      return { tasks: [], usage: result?.usage };
+    }
+  }
+
+  private async runSubAgentLoop(
+    agent: SubAgentDefinition,
+    task: SubAgentTask,
+    priorResults: string[],
+    params: SubAgentRunParams,
+  ): Promise<{ content: string; usage?: LlmUsage }> {
+    // D4 多 Agent 归责：子 agent 运行期间审计带 agentId（子 agent 名）+ callerAgentId（父 agent）。
+    //
+    // ACT-1：**继承**父上下文，只覆盖本次委托要改的字段。此前是新建一个只含这三个字段的 context，
+    // 于是父作用域的 `sessionId` / `username` / `source` 全部丢失 —— 子代理作用域内写出的
+    // 审计行与副作用行会拿到 `agentId` 却丢掉身份链的另外三段，责任链在此断掉。
+    // 这不只影响「子代理补审计行」（§22.19 AU-2 余项）：那一行正是写在这个作用域里的，
+    // 若不同时继承，补出来的行仍然是断链的。
+    const parent = actorContext.getStore();
+    return actorContext.run(
+      {
+        ...parent,
+        agentId: agent.name,
+        callerAgentId: parent?.agentId,
+        businessIntent: 'sub-agent',
+      },
+      () => this.runSubAgentLoopInner(agent, task, priorResults, params),
+    );
+  }
+
+  private async runSubAgentLoopInner(
+    agent: SubAgentDefinition,
+    task: SubAgentTask,
+    priorResults: string[],
+    params: SubAgentRunParams,
+  ): Promise<{ content: string; usage?: LlmUsage }> {
+    const messages: ChatMessage[] = [{ role: 'system', content: agent.systemPrompt }];
+    if (priorResults.length > 0) {
+      messages.push({
+        role: 'system',
+        content: `以下是之前子代理已获取的结果（供参考，无需重复查询）：\n${priorResults.join('\n')}`,
+      });
+    }
+    messages.push({ role: 'user', content: task.query });
+
+    const toolDefs = this.filterToolDefs(agent.tools, params.toolRegistry);
+    let usage: LlmUsage | undefined;
+
+    for (let round = 0; round < MAX_SUBAGENT_TOOL_ROUNDS; round++) {
+      let result;
+      try {
+        result = await params.provider.generate({
+          messages,
+          tools: toolDefs.length > 0 ? toolDefs : undefined,
+          model: params.model ?? params.provider.availableModels[0],
+        });
+      } catch {
+        return { content: 'ERROR: 子代理执行失败', usage };
+      }
+      // 每一轮都是一次真实 LLM 调用，逐轮累加
+      usage = addLlmUsage(usage, result.usage);
+
+      if (!result.toolCalls || result.toolCalls.length === 0) {
+        return { content: result.content || '', usage };
+      }
+
+      messages.push({
+        role: 'assistant',
+        content: result.content || '',
+        tool_calls: result.toolCalls,
+      });
+
+      for (const tc of result.toolCalls) {
+        const toolResult = await this.executeSafe(tc, agent, params);
+        // usage 只供审计记账，不进 LLM 上下文（同 ToolPresentationService.truncateToolResult）
+        const toolPayload: ToolResult = { ...toolResult };
+        delete toolPayload.usage;
+        messages.push({
+          role: 'tool',
+          content: JSON.stringify(toolPayload),
+          tool_call_id: tc.id,
+        });
+      }
+    }
+
+    return { content: '子代理执行超出最大轮数', usage };
+  }
+
+  private async executeSafe(
+    tc: ToolCall,
+    agent: SubAgentDefinition,
+    params: SubAgentRunParams,
+  ): Promise<ToolResult> {
+    // 安全守卫：只允许该子代理工具集内的只读工具
+    if (!agent.tools.includes(tc.name) || params.toolRegistry.requiresConfirmation(tc.name)) {
+      const reason = `Tool "${tc.name}" not allowed for sub-agent "${agent.name}"`;
+      // §22.19 AU-2：越界尝试留痕——守卫在触到执行器之前就返回，故这一行由编排器自己上交，
+      // 否则「子代理试了什么」在审计里完全不存在。留痕失败不吞：审计写是本条路径的一半。
+      await params.onDenied?.({
+        toolName: tc.name,
+        argsJson: tc.arguments,
+        userId: params.userId,
+        reason,
+      });
+      return { success: false, error: reason };
+    }
+    try {
+      const args = JSON.parse(tc.arguments);
+      // NC-3 只读门控：注入 executor 时经其执行（_assertToolAllowed + 写工具拒绝），
+      // 防治理策略禁用/角色受限的只读工具被子代理直调执行。
+      const execute =
+        params.readOnlyExecutor ??
+        ((tool: string, a: Record<string, unknown>, uid: string) => params.toolRegistry.execute(tool, a, uid));
+      return await execute(tc.name, args, params.userId);
+    } catch {
+      return { success: false, error: `Failed to execute tool "${tc.name}"` };
+    }
+  }
+
+  private filterToolDefs(toolNames: string[], toolRegistry: ToolRegistry): ToolDefinition[] {
+    const all = toolRegistry.getAllTools();
+    return all
+      .filter((t) => toolNames.includes(t.name))
+      .map((t) => t.toToolDefinition());
+  }
+}

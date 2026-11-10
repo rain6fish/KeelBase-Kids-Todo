@@ -1,0 +1,490 @@
+// SPDX-License-Identifier: Apache-2.0
+
+/**
+ * R4 双人审批（W5 Risk-based Tool Contract；从 `AiService` 拆出的第三个领域，健康清单 §3 阶段 3「主战场」）。
+ *
+ * R4 高影响动作需要**第二人**审批：operator 发起（不阻塞对话）→ approver 稍后裁决 → 以 operator 维度执行。
+ * 本服务管的是这条**生命周期**：创建请求、待批/已批列表、裁决、裁决后执行。
+ *
+ * 裁决后的执行复用写管道（`ToolExecutionService.executeWrite`）——门控复查 + 幂等 + 副作用登记 + 审计，
+ * 一行都不另写。R3 的**离线裁决**（Action Center）走的也是这个方法，同一条管道。
+ *
+ * 与呈现面的分工：把一条确认行还原成「人读摘要 / 影响预览 / 撤销档 / 展示模式」的 `describeConfirmation`
+ * **不在本服务**——它要 `writeSummary` / `writeImpact` / `revokeClass` 三个呈现侧知识，
+ * 属另一刀（呈现/摘要域），现由 `ToolPresentationService` 提供。
+ *
+ * **行为与拆分前逐字一致**——搬迁不改逻辑（阶段 3 纪律：行为不变，测试作护栏）。
+ */
+import { Injectable, Optional } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { In, IsNull, Repository } from 'typeorm';
+import { randomUUID } from 'crypto';
+import { AiConfirmationRequest } from '../../governance-shared/entities/ai-confirmation-request.entity';
+import { ToolExecutionService } from '../tools/tool-execution.service';
+import { AuditService } from '../../governance-shared/services/audit.service';
+import { deriveAiBusinessEvent } from '../audit/ai-business-event';
+import { boundedToolArgs, toolCallOutcome } from '../audit/tool-call-audit';
+import { AiToolEffectsService } from '../../governance-shared/services/ai-tool-effects.service';
+import { PresentationText, ToolResult } from '../interfaces/tool.interface';
+import { buildConfirmationRenderProof } from '../confirmation/confirmation-render';
+import { UsersService } from '../../users/users.service';
+import { AuthorizationExplainerService, buildAllowSnapshot } from '../authorization-explainer.service';
+import { ToolGateService } from '../tools/tool-gate.service';
+import {
+  ExecutionState,
+  deriveExecutionState,
+  isExecutionClaimable,
+} from '../confirmation/execution-state';
+
+/** 管理端审批列表项 = 行投影（显式白名单，见 `_toWireItem`）+ 用户名 + 执行态。 */
+export type ApprovalListItem = {
+  id: number;
+  token: string;
+  toolName: string;
+  args: string;
+  operatorId: string;
+  conversationId: string | null;
+  riskLevel: string;
+  status: string;
+  /** 契约要求非空且取单值枚举；迁移前旧行为 NULL，查询层已按 single 处理，投影处同口径归一 */
+  kind: 'single' | 'run';
+  runItems: string | null;
+  approverId: string | null;
+  decidedAt: string | null;
+  createdAt: string;
+  operatorName?: string;
+  approverName: string | null;
+  /** 执行轴（P2）——非 approved 行为 null */
+  executionState: ExecutionState | null;
+  executedAt: string | null;
+  executionError: string | null;
+};
+
+@Injectable()
+export class R4ApprovalService {
+  constructor(
+    private readonly toolExecution: ToolExecutionService,
+    private readonly auditService: AuditService,
+    // 未注入时各方法降级（单测/裁剪场景），与拆分前 `this.approvalsRepo?` / `this.usersService?` 同一语义
+    @Optional()
+    @InjectRepository(AiConfirmationRequest)
+    private readonly approvalsRepo?: Repository<AiConfirmationRequest>,
+    @Optional() private readonly usersService?: UsersService,
+    // This class writes its own row, so it also has to work out "why allowed" itself. Missing
+    // injection degrades to "no snapshot" — the same tolerance the MCP export takes.
+    // 本类自己拼行，故「为何允许」也得自己算；未注入时降级为不落快照 —— 与 MCP 出口同一容错。
+    @Optional() private readonly authorizationExplainer?: AuthorizationExplainerService,
+    @Optional() private readonly toolGate?: ToolGateService,
+    // AW-11's forward edge: this executor writes its own audit row, so it must also link that row
+    // to the write claim `executeWrite` created — otherwise the claim's `audit_row_id` stays null and
+    // the explanation surface has no effect to point at. Optional for trimmed test assemblies.
+    // AW-11 的正向边：本执行器自己写审计行，故也必须把该行接到 `executeWrite` 创建的写占位上 ——
+    // 否则占位的 `audit_row_id` 恒空、解释面没有副作用可指。裁剪装配里可缺省。
+    @Optional() private readonly toolEffectsService?: AiToolEffectsService,
+  ) {}
+
+  /**
+   * 创建持久化审批请求（operator 触发，approver 稍后决策；不阻塞 operator 对话）。
+   * `audience` = 该 artifact 被批准写往的目的地（AUTHZ-1）——R4 的等待窗口可达小时/天级，
+   * 正是目的地可能被改指的那种窗口，故这里的绑定最吃重。
+   * `summary` = 本次审批请求**实际下发**的呈现文案（CONF-3）：给出时把那份渲染的哈希记进行，
+   * 否则留 `null`（渲染代次不可考）。
+   */
+  async createR4ApprovalRequest(
+    operatorId: string,
+    toolName: string,
+    args: Record<string, unknown>,
+    conversationId?: string,
+    audience?: string,
+    summary?: PresentationText,
+  ): Promise<{ token: string; id: number }> {
+    if (!this.approvalsRepo) throw new Error('Approvals repository not injected');
+    const token = randomUUID();
+    // CONF-3：与确认卡同一份下发文案参与哈希，不另拼一份。
+    const renderProof = summary ? buildConfirmationRenderProof(toolName, args, summary) : undefined;
+    const saved = await this.approvalsRepo.save(
+      this.approvalsRepo.create({
+        token,
+        toolName,
+        args: JSON.stringify(args),
+        operatorId,
+        riskLevel: 'R4',
+        status: 'pending',
+        conversationId,
+        ...(audience !== undefined ? { audience } : {}),
+        ...(renderProof
+          ? { renderHash: renderProof.renderHash, renderVersion: renderProof.renderVersion }
+          : {}),
+      }),
+    );
+    return { token, id: saved.id };
+  }
+
+  /**
+   * 行 → wire 投影（**显式白名单**）。
+   *
+   * 为什么不再直接返回实体：P2 给实体加了 `executionClaimedAt`（执行**租约**，内部并发控制用），
+   * 而契约 `governance-confirmation-item` 是 `additionalProperties: false` —— 直接透传会把内部列泄进响应。
+   * 白名单同时让「响应形状 == 契约形状」成为可读事实，而不是靠实体定义碰巧对得上。
+   *
+   * Project the row explicitly rather than returning the entity: the P2 lease column is internal
+   * concurrency state, and the contract forbids extra properties.
+   */
+  private _toWireItem(
+    row: AiConfirmationRequest & { operatorName?: string; approverName?: string },
+    now: number,
+  ): ApprovalListItem {
+    return {
+      id: row.id,
+      token: row.token,
+      toolName: row.toolName,
+      args: row.args,
+      operatorId: row.operatorId,
+      conversationId: row.conversationId ?? null,
+      riskLevel: row.riskLevel,
+      status: row.status,
+      kind: row.kind === 'run' ? 'run' : 'single',
+      runItems: row.runItems ?? null,
+      approverId: row.approverId ?? null,
+      decidedAt: row.decidedAt ? row.decidedAt.toISOString() : null,
+      createdAt: row.createdAt.toISOString(),
+      ...(row.operatorName !== undefined ? { operatorName: row.operatorName } : {}),
+      approverName: row.approverName ?? null,
+      executionState: deriveExecutionState(row, now),
+      executedAt: row.executedAt ? row.executedAt.toISOString() : null,
+      executionError: row.executionError ?? null,
+    };
+  }
+
+  /** 待审批 R4 列表（管理端审批页）。 */
+  async listPendingApprovals(limit = 50): Promise<ApprovalListItem[]> {
+    if (!this.approvalsRepo) return [];
+    // D2-1e：R3 确认也落库（riskLevel=R3），R4 审批列表只列 R4 高影响请求，避免混入。
+    // KB-5：另排除 kind='run' 的整批授权聚合行——R4 工具经策略降为同步确认并入 run 后，
+    // 该行 riskLevel=runRisk 可能为 'R4'，但它不是单个审批请求（toolName='run'），混入即伪审批。
+    // 单条行 kind 为 'single'，迁移前旧行为 NULL——两者都保留。
+    const base = { status: 'pending' as const, riskLevel: 'R4' as const };
+    const items = await this.approvalsRepo.find({
+      where: [{ ...base, kind: 'single' }, { ...base, kind: IsNull() }],
+      order: { createdAt: 'DESC' },
+      take: limit,
+    });
+    const now = Date.now();
+    const rows = await this.withUserNames(items);
+    return rows.map((r) => this._toWireItem(r, now));
+  }
+
+  /** 已审批历史（管理端审批页）。 */
+  async listDecidedApprovals(limit = 50): Promise<ApprovalListItem[]> {
+    if (!this.approvalsRepo) return [];
+    const base = { status: In(['approved', 'declined']), riskLevel: 'R4' };
+    const items = await this.approvalsRepo.find({
+      where: [{ ...base, kind: 'single' }, { ...base, kind: IsNull() }],
+      order: { decidedAt: 'DESC' },
+      take: limit,
+    });
+    const now = Date.now();
+    const rows = await this.withUserNames(items);
+    return rows.map((r) => this._toWireItem(r, now));
+  }
+
+  /** 审批路径可见：为审批列表附提交人/审批人用户名（operator → approver），审批路上的人可读。 */
+  private async withUserNames(items: AiConfirmationRequest[]): Promise<Array<AiConfirmationRequest & { operatorName?: string; approverName?: string }>> {
+    if (!this.usersService) return items;
+    const ids = [
+      ...new Set(
+        items.flatMap((i) => [Number(i.operatorId), i.approverId ? Number(i.approverId) : null].filter((x): x is number => x != null)),
+      ),
+    ];
+    const nameById = new Map<string, string>();
+    await Promise.all(
+      ids.map(async (id) => {
+        try {
+          const u = await this.usersService!.findOne(id, true);
+          if (u.username) nameById.set(String(id), u.username);
+        } catch {
+          // 用户可能已删除
+        }
+      }),
+    );
+    return items.map((i) => ({
+      ...i,
+      operatorName: nameById.get(String(i.operatorId)) || String(i.operatorId),
+      approverName: i.approverId ? nameById.get(String(i.approverId)) || String(i.approverId) : undefined,
+    }));
+  }
+
+  /** approver 决策：approve → 以 operator 维度执行工具；decline → 拒绝。 */
+  async decideApproval(
+    token: string,
+    approverId: string,
+    decision: 'approve' | 'decline',
+  ): Promise<{ ok: boolean; message?: string; success?: boolean; resultId?: unknown }> {
+    if (!this.approvalsRepo) return { ok: false, message: 'not supported' };
+    const req = await this.approvalsRepo.findOne({ where: { token } });
+    if (!req || req.status !== 'pending') {
+      return { ok: false, message: req ? 'already decided' : 'not found' };
+    }
+    // KB-5：run 聚合行（kind='run'，toolName='run'）不是单个审批请求——生命周期由 ConfirmationStore 的
+    // run token 决策驱动。此处放行会把 run 行状态越权翻成 approved/declined，绕过 run 语义（且在途 SSE 决策
+    // 仍挂在内存 promise 上）。该端点服务身份可达，故在边界拒绝，不依赖「列表不显示 run 行」这层约定。
+    if (req.kind === 'run') {
+      return { ok: false, message: 'run confirmation cannot be decided via approval endpoint' };
+    }
+    if (decision === 'approve' && req.operatorId === approverId) {
+      return { ok: false, message: 'cannot self-approve' };
+    }
+    // The conditional update is the **sole arbitration point** — the same stance
+    // `ConfirmationStore.decideOutOfBand` already takes. When two approvers decide at once,
+    // exactly one gets affected=1 and only that one executes the tool. The previous
+    // read-modify-write (`findOne` then `save`) let both pass the `pending` check, so the high-risk
+    // write tool ran twice.
+    //
+    // 条件更新是**唯一仲裁点** —— 与 `ConfirmationStore.decideOutOfBand` 同一口径。
+    // 双人并发裁决时只有一方 affected=1，也只有那一方执行工具；
+    // 原先的 `findOne` + `save` 读改写会让两人都通过 pending 检查 → 高风险写工具执行两次。
+    const res = await this.approvalsRepo.update(
+      { token, status: 'pending' },
+      {
+        status: decision === 'approve' ? 'approved' : 'declined',
+        approverId,
+        decidedAt: new Date(),
+      },
+    );
+    if (!res || res.affected === undefined || res.affected === 0) {
+      return { ok: false, message: 'already decided' };
+    }
+    // 状态已由上面的条件更新落库；这里只回填 `executeApprovedTool` 默认注记要用的审批人
+    req.approverId = approverId;
+
+    if (decision === 'approve') {
+      const result = await this.executeApprovedTool(req);
+      return { ok: true, success: result.success, resultId: (result.data as any)?.id, message: result.error };
+    }
+    return { ok: true, success: false };
+  }
+
+  /**
+   * 裁决通过后以 operator 维度执行工具：复用写工具执行（幂等 + 副作用登记）+ 审计。
+   * `outcomeNote` 记录**谁在哪儿批的**（R4 审批人 / R3 离线裁决），进 `tool_call` 审计行便于追溯。
+   */
+  async executeApprovedTool(
+    req: AiConfirmationRequest,
+    outcomeNote?: string,
+    opts: { retry?: boolean } = {},
+  ): Promise<ToolResult> {
+    let args: Record<string, unknown> = {};
+    try {
+      args = JSON.parse(req.args || '{}');
+    } catch {
+      args = {};
+    }
+
+    // Claim the execution (a lease). A retry clears a stale claim first, so the claim below is the
+    // atomic gate: exactly one caller gets a hit and only that one runs the tool — a retry cannot
+    // race a live execution.
+    // 认领这次执行（租约）。重试会先清掉过期认领，故下面的条件更新就是原子闸门：只有一方命中、
+    // 也只有那一方跑工具——重试不会与在途执行撞车。
+    if (!(await this._claimExecution(req.token, opts.retry === true))) {
+      return { success: false, error: 'execution already in progress or already completed' };
+    }
+
+    const note = outcomeNote ?? `R4 approved by approver ${req.approverId}`;
+    let result: ToolResult;
+    try {
+      // AUTHZ-1：把 artifact 的 audience 带到执行点——本行从签发到执行跨请求（R4 可达小时/天级、
+      // Action Center 离线裁决亦然），目的地在这段窗口里可被改指，故校验必须在执行点做。
+      result = await this.toolExecution.executeWrite(
+        req.toolName,
+        args,
+        req.operatorId,
+        req.conversationId,
+        undefined,
+        {
+          ...(req.audience ? { audience: req.audience } : {}),
+          // REV-7：审批 token 落进占位行 —— 「这次写依据哪次授权、因而在哪个窗口上」由占位行回答。
+          authorizationRef: req.token,
+        },
+      );
+    } catch (err) {
+      result = { success: false, error: err instanceof Error ? err.message : String(err) };
+    }
+    await this._settleExecution(req.token, result);
+    // D2-1c: this row's executor is the operator, and the path does **not** go through `actorContext`
+    // (the approve-by entry never sets it) — so the username snapshot has to be named here. Without
+    // it every sibling row of the event has one and only this row cannot say who executed.
+    //
+    // D2-1c：本行的执行者是 operator，而这条路**不经过** `actorContext`（approve-by 入口不设它）——
+    // 故 username 必须在这里显式带出。否则同一事件里其余各行都有快照，只有它说不出执行的是谁。
+    const username = await this._userNameOf(req.operatorId);
+    // A-5 / T5: the executor writes the basis through the same builder as the chat path and the MCP
+    // export — of the three doors, only this one used to omit it. The narrower condition is right
+    // here: this row's non-success shape is a *failure* (`isError=true`), not the `pending` shape the
+    // relaxation covers, and a basis on a failed row would be read as a refusal by A-8.
+    //
+    // A-5 / T5 跨入口一致：本执行器与对话流、MCP 出口共用同一个构造 —— 三个入口此前只有这一个漏了它。
+    // 这里仍只在成功时写是对的：本行的非成功形状是**失败**（`isError=true`），不是本次放宽所覆盖的
+    // `pending` 形状；失败行带依据会被 A-8 读成一次拒绝。
+    let allowSnapshot: string | undefined;
+    if (result.success) {
+      try {
+        const reasons = await this.authorizationExplainer?.getAuthorizationReasons(
+          req.toolName,
+          req.operatorId,
+          true,
+          await this.toolGate?.riskLevelFor(req.toolName),
+        );
+        if (reasons) allowSnapshot = buildAllowSnapshot(req.toolName, reasons);
+      } catch {
+        // Enrichment failing must not turn "it ran" into a caller-visible error (fail-after-execute):
+        // degrade to no snapshot and still write the row.
+        // 富化失败不得把「已执行成功」翻成调用方可见的错误（fail-after-execute）——降级为无快照，审计照写。
+        allowSnapshot = undefined;
+      }
+    }
+    const auditRow = await this.auditService.log({
+      userId: req.operatorId,
+      username,
+      conversationId: req.conversationId,
+      action: 'tool_call',
+      detail: `${req.toolName}(${JSON.stringify(args)})`,
+      // P0-19's machine-shaped arguments column, on this door too — the chat path and the MCP export
+      // already write it; without it the same action loses its parseable arguments here.
+      // P0-19 的机器可读参数列，这扇门也要写 —— 对话流与 MCP 出口都已写；缺了它，同一个动作在这里
+      // 就没有可解析的参数。
+      toolArgs: boundedToolArgs(JSON.stringify(args)),
+      authorization: allowSnapshot,
+      isError: !result.success,
+      errorMessage: result.success ? note : `${note}; execution failed: ${result.error}`,
+      // 工具内部自调 LLM 时的开销记在工具自己这行
+      promptTokens: result.usage?.promptTokens,
+      completionTokens: result.usage?.completionTokens,
+      // §internal.16 A-1 业务事件名
+      businessEvent: deriveAiBusinessEvent(req.toolName) ?? undefined,
+      // C-3's two out-of-chain attribution columns. This site writes its row by hand — it is the R4
+      // executor, not the chat path — so it has to name them itself, and it names them through the
+      // same helper the chat path uses, so the two ends cannot spell one outcome two ways.
+      // C-3 的两列链外归因列。本处**自己拼行**（它是 R4 执行器那条路，不是对话那条），故得自己点名；
+      // 且经由对话那条**同一个** helper 点名，两端才不会把同一个结局写成两个词。
+      outcome: toolCallOutcome(result),
+      tool: req.toolName,
+    });
+    // Same condition as the chat path: only a call that actually ran has a claim to link. A failed
+    // execution has its claim settled/released elsewhere, and a pending one never reached this door.
+    // 与对话流同一条件：只有真正跑过的调用才有占位可挂。失败执行由别处结算/释放占位，待批的到不了这扇门。
+    if (result.success) {
+      await this.toolEffectsService?.attachAuditRow(
+        {
+          userId: req.operatorId,
+          conversationId: req.conversationId,
+          toolName: req.toolName,
+          argsJson: JSON.stringify(args),
+        },
+        auditRow.id,
+      );
+    }
+    return result;
+  }
+
+  /**
+   * D2-1c username snapshot, resolved from the row's own `userId` (the operator). A deleted user or
+   * a service assembled without `UsersService` leaves it empty: a missing name never blocks the row.
+   *
+   * D2-1c username 快照：按这行的 `userId`（operator）取，用户已删/未注入时留空 —— 审计行不因取不到名字而不写。
+   */
+  private async _userNameOf(userId: string): Promise<string | undefined> {
+    if (!this.usersService) return undefined;
+    try {
+      const user = await this.usersService.findOne(Number(userId), true);
+      return user.username ?? undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Claim one execution attempt (the lease). The conditional update is the sole arbitration point:
+   * only the caller that gets a hit may run the tool. `allowRetry` first clears a previous claim —
+   * that clear is itself idempotent, so two concurrent retries still produce exactly one winner.
+   *
+   * `affected === 0` is the only value that refuses; an `update` that reports no count at all is
+   * treated as a hit, matching the tolerance `ConfirmationStore.resolve` already documents for
+   * drivers that omit the field. A real driver always reports it.
+   *
+   * 认领一次执行（租约）。条件更新是唯一仲裁点：只有命中者可以跑工具。`allowRetry` 会先清掉上一次认领
+   * —— 该清空本身幂等，故两次并发重试仍只有一方胜出。只有 `affected === 0` 才拒绝；驱动完全没报行数时
+   * 视为命中（与 `ConfirmationStore.resolve` 已记录的宽容口径一致；真实驱动总会报）。
+   */
+  private async _claimExecution(token: string, allowRetry: boolean): Promise<boolean> {
+    if (!this.approvalsRepo) return true; // 无仓储（单测/裁剪装配）→ 保持拆分前行为：直接执行
+    if (allowRetry) {
+      await this.approvalsRepo.update(
+        { token, status: 'approved', executedAt: IsNull() },
+        { executionClaimedAt: null },
+      );
+    }
+    const res = await this.approvalsRepo.update(
+      { token, status: 'approved', executedAt: IsNull(), executionClaimedAt: IsNull() },
+      { executionClaimedAt: new Date() },
+    );
+    return res?.affected !== 0;
+  }
+
+  /**
+   * Record the attempt's outcome. Success stamps `executedAt` and clears the error; a failure keeps
+   * the claim (so the row reads `failed` once the lease expires) and stores the reason. A crash
+   * never reaches here at all — that is exactly the case whose absence of a recorded result the
+   * outward `failed` state has to admit.
+   *
+   * 落这次尝试的结果。成功写 `executedAt` 并清错误；失败保留认领（租约过期后该行即报 failed）并记原因。
+   * 崩溃根本走不到这里 —— 这正是对外 `failed` 必须承认的「没有记录结果」那种情形。
+   */
+  private async _settleExecution(token: string, result: ToolResult): Promise<void> {
+    if (!this.approvalsRepo) return;
+    if (result.success) {
+      await this.approvalsRepo.update({ token }, { executedAt: new Date(), executionError: null });
+      return;
+    }
+    await this.approvalsRepo.update(
+      { token },
+      { executionError: result.error ?? 'execution failed' },
+    );
+  }
+
+  /**
+   * P2 retry entry: run an approved-but-not-succeeded confirmation again.
+   *
+   * Refused when the token is unknown, the row is not `approved`, it already succeeded, or its
+   * claim is **still fresh** (the execution may be running right now — refusing there is what keeps
+   * a retry from racing it). Re-running is safe because the write pipeline is idempotent, so no
+   * second side effect is produced.
+   *
+   * P2 重试入口：把一条「已批准但未成功执行」的确认重跑一次。以下情形拒绝：token 不存在、
+   * 行非 approved、已成功、或认领**仍新鲜**（可能正在执行——拒绝正是为了不让重试与它撞车）。
+   * 重跑是安全的：写管道自带幂等，不会产生第二次副作用。
+   */
+  async retryExecution(
+    token: string,
+  ): Promise<{ ok: boolean; reason?: 'not_found' | 'not_retryable'; message?: string; success?: boolean; resultId?: unknown }> {
+    if (!this.approvalsRepo) return { ok: false, reason: 'not_retryable', message: 'not supported' };
+    const row = await this.approvalsRepo.findOne({ where: { token } });
+    if (!row) return { ok: false, reason: 'not_found', message: 'not found' };
+    if (row.executedAt) return { ok: false, reason: 'not_retryable', message: 'already executed' };
+    if (!isExecutionClaimable(row)) {
+      return { ok: false, reason: 'not_retryable', message: 'execution in progress' };
+    }
+    if (row.status !== 'approved') {
+      return { ok: false, reason: 'not_retryable', message: `cannot retry a ${row.status} confirmation` };
+    }
+
+    const result = await this.executeApprovedTool(row, 'R4 execution retried by admin', {
+      retry: true,
+    });
+    return {
+      ok: true,
+      success: result.success,
+      resultId: (result.data as { id?: unknown } | undefined)?.id,
+      message: result.error,
+    };
+  }
+}

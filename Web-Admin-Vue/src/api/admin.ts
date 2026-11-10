@@ -1,0 +1,92 @@
+// SPDX-License-Identifier: Apache-2.0
+
+import { api } from './client'
+import type {AdminSession,
+  AiConversationMessage,
+  AiConversationMeta,
+  AiConversationSummary,
+  AnalyticsResponse,
+  AppVersionInfo,
+  BroadcastResult,
+  MonitorSummary,
+  OpsSummary,
+  PlatformOverview,
+  ProxyIntegrationStatus,
+  TrashResponse,
+  TrashRestoreResult,
+  BehaviorAlertRow,
+} from '@/types/admin'
+
+/** 校验对话 id，防止路径穿越（与 Flutter AiConversationRepository 一致） */
+function validateConversationId(id: string): string {
+  if (!id || id.includes('/') || id.includes('?') || id.includes('#') || id.includes('..')) {
+    throw new Error('Invalid conversation id')
+  }
+  return id
+}
+
+export const adminApi = {
+  monitorSummary(): Promise<MonitorSummary> {
+    return api.get<MonitorSummary>('/admin/monitor/summary')
+  },
+  /** B-proxy 外部系统（Java 集成）接入状态（监控中心） */
+  proxyIntegrationsStatus(): Promise<ProxyIntegrationStatus> {
+    return api.get<ProxyIntegrationStatus>('/ai/proxy/integrations/status')
+  },
+  opsSummary(): Promise<OpsSummary> {
+    return api.get<OpsSummary>('/admin/ops/summary')
+  },
+  /** BA 异常行为基线：告警列表（默认只给未处理；'all' 看全部） */
+  behaviorAlerts(scope: 'open' | 'all' = 'open'): Promise<BehaviorAlertRow[]> {
+    return api.get<BehaviorAlertRow[]>('/admin/ai/behavior-alerts', scope === 'all' ? { status: 'all' } : undefined)
+  },
+  /** BA：标记告警已处理 */
+  acknowledgeBehaviorAlert(id: number): Promise<{ ok: boolean }> {
+    return api.post<{ ok: boolean }>(`/admin/ai/behavior-alerts/${id}/acknowledge`, {})
+  },
+  overview(days = 7): Promise<PlatformOverview> {
+    return api.get<PlatformOverview>('/admin/overview', { days })
+  },
+  sessions(): Promise<AdminSession[]> {
+    return api.get<AdminSession[]>('/admin/sessions')
+  },
+  revokeSession(id: number): Promise<null> {
+    return api.delete<null>(`/admin/sessions/${id}`)
+  },
+  broadcast(data: { title: string; body?: string; type?: string; userIds?: number[] }): Promise<BroadcastResult> {
+    return api.post<BroadcastResult>('/admin/notifications/broadcast', data)
+  },
+  appVersion(): Promise<AppVersionInfo> {
+    return api.get<AppVersionInfo>('/app/version')
+  },
+  // P3 新增
+  trash(page = 1, limit = 20): Promise<TrashResponse> {
+    return api.get<TrashResponse>('/admin/trash', { page, limit })
+  },
+  restoreTrash(type: string, id: number): Promise<TrashRestoreResult> {
+    return api.post<TrashRestoreResult>(`/admin/trash/${type}/${id}/restore`)
+  },
+  analytics(days = 30): Promise<AnalyticsResponse> {
+    return api.get<AnalyticsResponse>('/admin/analytics', { days })
+  },
+  // 对话历史（admin 复用本人 /ai/conversations，与普通用户 AI 聊天一致）
+  aiConversations(): Promise<AiConversationSummary[]> {
+    return api.get<AiConversationSummary[]>('/ai/conversations')
+  },
+  aiConversation(id: string): Promise<AiConversationSummary & { messages: AiConversationMessage[] }> {
+    return api.get<AiConversationSummary & { messages: AiConversationMessage[] }>(
+      `/ai/conversations/${validateConversationId(id)}`,
+    )
+  },
+  /** 工作账本：重命名会话（空串 = 清除标题，回退到首条消息派生的预览）。权限与读取同源（本人或管理员） */
+  renameAiConversation(id: string, title: string): Promise<AiConversationSummary> {
+    return api.patch<AiConversationSummary>(`/ai/conversations/${validateConversationId(id)}`, { title })
+  },
+  /** AU-4（§22.19）：会话元数据（**不含消息正文**）——审计行下钻的第一步；正文另请 aiConversation(id) */
+  aiConversationMeta(id: string): Promise<AiConversationMeta> {
+    return api.get<AiConversationMeta>(`/ai/conversations/${validateConversationId(id)}/meta`)
+  },
+  deleteAiConversation(id: string): Promise<null> {
+    return api.delete<null>(`/ai/conversations/${validateConversationId(id)}`)
+  },
+}

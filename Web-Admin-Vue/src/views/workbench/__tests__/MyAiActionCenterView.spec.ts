@@ -1,0 +1,382 @@
+// SPDX-License-Identifier: Apache-2.0
+
+import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { mount, flushPromises } from '@vue/test-utils'
+import { createI18n } from 'vue-i18n'
+import zh from '@/i18n/zh'
+import en from '@/i18n/en'
+
+const {
+  myEffectsMock,
+  conversationsMock,
+  revokeMock,
+  revokeConvMock,
+  pushMock,
+  myConfirmationsMock,
+  decideMock,
+  snackbarMock,
+} = vi.hoisted(() => ({
+  myEffectsMock: vi.fn(),
+  conversationsMock: vi.fn(),
+  revokeMock: vi.fn(),
+  revokeConvMock: vi.fn(),
+  pushMock: vi.fn(),
+  myConfirmationsMock: vi.fn(),
+  decideMock: vi.fn(),
+  // 稳定 spy（旧实现每次调用返回新对象 → toast 不可断言）
+  snackbarMock: { success: vi.fn(), error: vi.fn(), warning: vi.fn() },
+}))
+
+vi.mock('@/api/aiTrace', () => ({
+  aiTraceApi: {
+    myEffects: myEffectsMock,
+    conversations: conversationsMock,
+    revokeEffect: revokeMock,
+    revokeConversationEffects: revokeConvMock,
+    myConfirmations: myConfirmationsMock,
+    decideMyConfirmation: decideMock,
+  },
+}))
+vi.mock('@/stores/snackbar', () => ({
+  useSnackbarStore: () => snackbarMock,
+}))
+vi.mock('vue-router', () => ({
+  useRouter: () => ({ push: pushMock }),
+}))
+
+import ElementPlus from 'element-plus'
+import MyAiActionCenterView from '../MyAiActionCenterView.vue'
+
+const effectExecuted = {
+  id: 1,
+  toolName: 'create_followup_task',
+  conversationId: 'conv-1',
+  resultType: 'crm_task',
+  resultId: 42,
+  createdAt: '2026-09-04T09:30:00Z',
+  targetExists: true,
+  targetSoftDeleted: false,
+  targetTitle: '跟进：辰光建材 逾期回款',
+  status: 'executed',
+  revokeClass: 'local_compensate',
+  revocable: true,
+  change: { kind: 'created', fields: ['title', 'dueDate'] },
+}
+const effectRevoked = {
+  id: 2,
+  toolName: 'create_followup_task',
+  conversationId: 'conv-1',
+  resultType: 'crm_task',
+  resultId: 43,
+  createdAt: '2026-09-04T09:31:00Z',
+  targetExists: true,
+  targetSoftDeleted: true,
+  targetTitle: '跟进：澄海地产',
+  status: 'revoked',
+  revokeClass: 'local_compensate',
+  revocable: false,
+}
+/** KB-6：governed_external 撤销后 = 外部撤销中（结果未知），禁显示"已撤销" */
+const effectRevokingExternal = {
+  id: 3,
+  toolName: 'java_ext_order',
+  conversationId: 'conv-1',
+  resultType: 'proxy_call',
+  resultId: 7,
+  createdAt: '2026-09-04T09:32:00Z',
+  targetExists: true,
+  targetSoftDeleted: false,
+  targetTitle: '外部系统写调用（B 路径）',
+  status: 'revoking_external',
+  revokeClass: 'governed_external',
+  revokeStatus: 'compensating',
+  revocable: false,
+}
+/** KB-6：revokeClass=none（不可撤）→ 即使 executed 也不显示撤销钮 */
+const effectNotRevocable = {
+  id: 4,
+  toolName: 'external_write_no_path',
+  conversationId: 'conv-1',
+  resultType: 'proxy_call',
+  resultId: 8,
+  createdAt: '2026-09-04T09:33:00Z',
+  targetExists: true,
+  targetSoftDeleted: false,
+  targetTitle: '外部系统写调用（B 路径）',
+  status: 'executed',
+  revokeClass: 'none',
+  revocable: false,
+}
+
+/** ConfirmDialog 桩：可点出 `confirm`（真组件被 stub 成 true 时点不动）；按钮无文本，故不干扰「撤销」按钮计数 */
+const ConfirmDialogStub = {
+  name: 'ConfirmDialog',
+  emits: ['confirm'],
+  template: '<button class="confirm-stub" @click="$emit(\'confirm\')" />',
+}
+
+function mountView() {
+  const i18n = createI18n({ legacy: false, locale: 'zh', messages: { zh, en } })
+  return mount(MyAiActionCenterView, {
+    global: {
+      plugins: [i18n, ElementPlus],
+      stubs: {
+        PageHeader: true,
+        AppIcon: true,
+        AppPagination: true,
+        ConfirmDialog: ConfirmDialogStub,
+        BusinessHistoryDrawer: true,
+      },
+    },
+  })
+}
+
+beforeEach(() => {
+  vi.clearAllMocks()
+  // 默认「无待确认」——未显式设置的用例不该因 GA 模块拿到 undefined 而炸
+  myConfirmationsMock.mockResolvedValue([])
+})
+
+describe('MyAiActionCenterView（AI Action Center 本人面）', () => {
+  it('加载 AI 写副作用：显示人类标签 + 状态（已执行/已撤销）+ 撤销按钮仅 executed 显示', async () => {
+    myEffectsMock.mockResolvedValue({ items: [effectExecuted, effectRevoked], total: 2, page: 1, limit: 20 })
+    conversationsMock.mockResolvedValue([])
+
+    const wrapper = mountView()
+    await flushPromises()
+
+    expect(myEffectsMock).toHaveBeenCalledWith(1, 20)
+    expect(wrapper.text()).toContain('创建跟进任务') // D2 toolLabel 人类标签
+    expect(wrapper.text()).toContain('已执行')
+    expect(wrapper.text()).toContain('已撤销')
+    // 撤销按钮仅 executed 行出现（两条中 1 条）→ 只出现 1 次
+    expect(wrapper.findAll('button').filter((b) => b.text().includes('撤销'))).toHaveLength(1)
+    expect(wrapper.text()).toContain('跟进：辰光建材 逾期回款')
+  })
+
+  it('D2：显示实际状态变化摘要（新建 N 个字段）', async () => {
+    myEffectsMock.mockResolvedValue({ items: [effectExecuted], total: 1, page: 1, limit: 20 })
+    conversationsMock.mockResolvedValue([])
+
+    const wrapper = mountView()
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('新建')
+    expect(wrapper.text()).toContain('2') // 字段数
+  })
+
+  it('空写副作用 → 空态引导文案', async () => {
+    myEffectsMock.mockResolvedValue({ items: [], total: 0, page: 1, limit: 20 })
+    conversationsMock.mockResolvedValue([])
+
+    const wrapper = mountView()
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('还没有 AI 写操作')
+  })
+
+  it('加载失败 → 显示错误信息', async () => {
+    myEffectsMock.mockRejectedValue(new Error('boom'))
+
+    const wrapper = mountView()
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('boom')
+  })
+
+  it('「查看证据」→ 跳转 Business Action Detail（B4）', async () => {
+    myEffectsMock.mockResolvedValue({ items: [effectExecuted], total: 1, page: 1, limit: 20 })
+    conversationsMock.mockResolvedValue([])
+
+    const wrapper = mountView()
+    await flushPromises()
+
+    const evidenceBtn = wrapper.findAll('button').find((b) => b.text().includes('查看证据'))!
+    await evidenceBtn.trigger('click')
+    expect(pushMock).toHaveBeenCalledWith({
+      name: 'workbench-action-detail',
+      params: { resultType: 'crm_task', resultId: '42' },
+    })
+  })
+
+  it('最近 AI 会话模块渲染「打开轨迹」并可跳 AiTrace', async () => {
+    myEffectsMock.mockResolvedValue({ items: [], total: 0, page: 1, limit: 20 })
+    conversationsMock.mockResolvedValue([
+      { id: 'conv-1', provider: 'deepseek', model: 'deepseek-v4-flash', summary: null, createdAt: '2026-09-04T09:00:00Z', lastActivityAt: '2026-09-04T09:30:00Z', messages: [{ role: 'user', content: '查一下风险客户', timestamp: '2026-09-04T09:00:00Z' }] },
+    ])
+
+    const wrapper = mountView()
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('查一下风险客户')
+    const openBtn = wrapper.findAll('button').find((b) => b.text().includes('打开轨迹'))!
+    await openBtn.trigger('click')
+    expect(pushMock).toHaveBeenCalledWith({ path: '/workbench/ai-trace', query: { conv: 'conv-1' } })
+  })
+
+  // GA 待我确认中心（docs/ai-action-center.spec.md §5.4）
+  const confirmation = {
+    token: 'tok-1',
+    toolName: 'create_followup_task',
+    // 真实 key + 参数：确认列表渲染的是本端语言，而不是服务端的兜底英文
+    summary: {
+      key: 'ai.present.write.createFollowupTask',
+      fallback: 'Create follow-up task: 回访 Acme',
+      params: { title: '回访 Acme' },
+    },
+    arguments: { customerId: 17 },
+    mode: 'immediate' as const,
+    riskLevel: 'R3',
+    status: 'pending' as const,
+    impact: { actions: 1, targets: [{ resultType: 'crm_task', count: 1 }] },
+    revokeClass: 'local_compensate',
+    run: null,
+    createdAt: '2026-09-18T02:15:00.000Z',
+    decidedAt: null,
+    expiresAt: '2026-09-19T02:15:00.000Z',
+  }
+
+  it('待确认：有待办时显示模块，批准 → 调离线裁决并刷新', async () => {
+    myEffectsMock.mockResolvedValue({ items: [], total: 0 })
+    conversationsMock.mockResolvedValue([])
+    myConfirmationsMock.mockResolvedValue([confirmation])
+    decideMock.mockResolvedValue({ ok: true, success: true })
+
+    const wrapper = mountView()
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('待我确认')
+    expect(wrapper.text()).toContain('创建跟进任务：回访 Acme')
+    const approve = wrapper.findAll('button').find((b) => b.text().includes('批准'))
+    expect(approve).toBeTruthy()
+    await approve!.trigger('click')
+    await flushPromises()
+    expect(decideMock).toHaveBeenCalledWith('tok-1', 'approve')
+  })
+
+  it('待确认：无待办时不占版面', async () => {
+    myEffectsMock.mockResolvedValue({ items: [], total: 0 })
+    conversationsMock.mockResolvedValue([])
+    myConfirmationsMock.mockResolvedValue([])
+
+    const wrapper = mountView()
+    await flushPromises()
+
+    expect(wrapper.text()).not.toContain('待我确认')
+  })
+
+  it('待确认：run / R4 不在本页裁决——给去处提示而非假按钮', async () => {
+    myEffectsMock.mockResolvedValue({ items: [], total: 0 })
+    conversationsMock.mockResolvedValue([])
+    myConfirmationsMock.mockResolvedValue([
+      { ...confirmation, token: 'tok-run', mode: 'run' },
+      { ...confirmation, token: 'tok-r4', mode: 'approval' },
+    ])
+
+    const wrapper = mountView()
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('请在对话中处理')
+    expect(wrapper.text()).toContain('等待审批人处理')
+    expect(wrapper.findAll('button').filter((b) => b.text().includes('批准'))).toHaveLength(0)
+  })
+
+  it('KB-6: governed_external 撤销后 → 显示「外部撤销中」+ 补偿提示，禁显示「已撤销」且无撤销钮', async () => {
+    myEffectsMock.mockResolvedValue({ items: [effectRevokingExternal], total: 1, page: 1, limit: 20 })
+    conversationsMock.mockResolvedValue([])
+
+    const wrapper = mountView()
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('外部撤销中')
+    expect(wrapper.text()).toContain('补偿已请求')
+    expect(wrapper.text()).not.toContain('已撤销')
+    // 无撤销钮（已进入撤销流程）
+    expect(wrapper.findAll('button').filter((b) => b.text().includes('撤销'))).toHaveLength(0)
+  })
+
+  it('KB-6: revokeClass=none（不可撤）→ executed 也不显示撤销钮', async () => {
+    myEffectsMock.mockResolvedValue({ items: [effectNotRevocable], total: 1, page: 1, limit: 20 })
+    conversationsMock.mockResolvedValue([])
+
+    const wrapper = mountView()
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('已执行')
+    expect(wrapper.findAll('button').filter((b) => b.text().includes('撤销'))).toHaveLength(0)
+  })
+
+  it('G1: 会话行提供「撤销本会话写操作」批量入口', async () => {
+    myEffectsMock.mockResolvedValue({ items: [], total: 0, page: 1, limit: 20 })
+    conversationsMock.mockResolvedValue([
+      { id: 'conv-x', messages: [{ role: 'user', content: '帮我改价格' }], lastActivityAt: '2026-09-01T00:00:00Z' },
+    ])
+
+    const wrapper = mountView()
+    await flushPromises()
+
+    const revokeConvBtns = wrapper.findAll('button').filter((b) => b.text().includes('撤销本会话写操作'))
+    expect(revokeConvBtns).toHaveLength(1)
+  })
+
+  /** 会话批量撤销：点会话行的按钮 → 第一个 ConfirmDialog（单条）不动，第二个（会话）出 confirm */
+  async function revokeConversation(wrapper: ReturnType<typeof mountView>) {
+    const btn = wrapper.findAll('button').find((b) => b.text().includes('撤销本会话写操作'))!
+    await btn.trigger('click')
+    await flushPromises()
+    await wrapper.findAll('.confirm-stub')[1].trigger('click')
+    await flushPromises()
+  }
+
+  const convRow = {
+    id: 'conv-d',
+    messages: [{ role: 'user', content: '批量改价' }],
+    lastActivityAt: '2026-09-01T00:00:00Z',
+  }
+
+  it('§5.1.3：批量撤销含 disputed 行 → 告警而非无保留成功（不念 aiCenterConvRevokeDone）', async () => {
+    myEffectsMock.mockResolvedValue({ items: [], total: 0, page: 1, limit: 20 })
+    conversationsMock.mockResolvedValue([convRow])
+    revokeConvMock.mockResolvedValue({
+      conversationId: 'conv-d',
+      total: 2,
+      revoked: 2,
+      skipped: 0,
+      failed: 0,
+      results: [
+        { effectId: 1, revoked: true, disputed: true },
+        { effectId: 2, revoked: true },
+      ],
+    })
+
+    const wrapper = mountView()
+    await flushPromises()
+    await revokeConversation(wrapper)
+
+    expect(revokeConvMock).toHaveBeenCalledWith('conv-d')
+    expect(snackbarMock.warning).toHaveBeenCalledWith(expect.stringContaining('声明与持有不一致'))
+    // 逐条计数照旧出现在告警里（行级事实不丢），但不得再报成无保留的成功
+    expect(snackbarMock.warning).toHaveBeenCalledWith(expect.stringContaining('（撤销 2 项 / 跳过 0 项 / 失败 0 项）'))
+    expect(snackbarMock.success).not.toHaveBeenCalled()
+  })
+
+  it('§5.1.3：无争议的批量撤销仍是常规成功汇总', async () => {
+    myEffectsMock.mockResolvedValue({ items: [], total: 0, page: 1, limit: 20 })
+    conversationsMock.mockResolvedValue([convRow])
+    revokeConvMock.mockResolvedValue({
+      conversationId: 'conv-d',
+      total: 1,
+      revoked: 1,
+      skipped: 0,
+      failed: 0,
+      results: [{ effectId: 1, revoked: true }],
+    })
+
+    const wrapper = mountView()
+    await flushPromises()
+    await revokeConversation(wrapper)
+
+    expect(snackbarMock.success).toHaveBeenCalledWith('已撤销 1 项，跳过 0 项，失败 0 项')
+    expect(snackbarMock.warning).not.toHaveBeenCalled()
+  })
+})

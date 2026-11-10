@@ -1,0 +1,51 @@
+# Dependabot 依赖 PR 批量合并（低峰时段统一落库）
+# 目的：避免零散依赖 PR 频繁打断主分支节奏——Asia/Shanghai 周一至五 05:00-18:59 视为日间高峰，
+#       一律跳过合并，攒批到低峰（夜间/周末）由 CI 全绿后批量 squash 合入。
+# 手动触发：workflow_dispatch；也可在 GitHub 网页直接跑。
+name: Dependabot Merge
+
+on:
+  schedule:
+    # 每小时 :37 跑一次（public 仓库 Actions 免费；实际由下方时间门决定是否真合并）
+    - cron: '37 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 时间门——日间高峰不合并
+        id: gate
+        run: |
+          DOW=$(TZ='Asia/Shanghai' date +%u)        # 1=Mon … 7=Sun
+          H=$(TZ='Asia/Shanghai' date +%-H)         # 0-23（本地小时，无前导零）
+          if [ "$DOW" -le 5 ] && [ "$H" -ge 5 ] && [ "$H" -lt 19 ]; then
+            echo "Asia/Shanghai 日间高峰 ${H}:xx，跳过合并，攒批到低峰"
+            echo "work_time=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "work_time=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 合并 CI 全绿的 dependabot PR
+        if: steps.gate.outputs.work_time == '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PRS=$(gh pr list --repo "$GITHUB_REPOSITORY" --author 'app/dependabot' \
+            --state open --json number --jq '.[].number' 2>/dev/null)
+          if [ -z "$PRS" ]; then
+            echo '无待合并的 dependabot PR'
+            exit 0
+          fi
+          for PR in $PRS; do
+            if gh pr checks "$PR" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --squash --delete-branch \
+                || echo "#$PR 合并失败，留待下轮重试"
+            else
+              echo "#$PR CI 未全绿（含进行中），跳过"
+            fi
+          done

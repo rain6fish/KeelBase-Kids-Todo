@@ -1,0 +1,15 @@
+{
+  "module": "checkins",
+  "label": "打卡",
+  "fields": [
+    { "name": "checkDate", "type": "date", "label": "打卡日期", "required": true },
+    { "name": "totalTasks", "type": "int", "label": "任务总数" },
+    { "name": "doneTasks", "type": "int", "label": "完成数" },
+    { "name": "isPerfect", "type": "bool", "label": "全部完成" },
+    { "name": "pointsEarned", "type": "int", "label": "获得积分" }
+  ],
+  "aiTools": {
+    "query": true,
+    "create": { "riskLevel": "R2", "requiresConfirmation": false }
+  }
+}

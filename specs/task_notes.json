@@ -1,0 +1,15 @@
+{
+  "module": "task_notes",
+  "label": "任务备注",
+  "searchable": true,
+  "fields": [
+    { "name": "taskId", "type": "ref", "target": "tasks", "display": "title", "label": "任务", "required": true, "onDelete": "cascade" },
+    { "name": "content", "type": "text", "label": "内容", "required": true },
+    { "name": "contentType", "type": "enum", "label": "类型", "enum": ["text", "voice", "image"] },
+    { "name": "mediaUrl", "type": "string", "label": "媒体地址" }
+  ],
+  "aiTools": {
+    "query": true,
+    "create": { "riskLevel": "R3", "requiresConfirmation": true }
+  }
+}

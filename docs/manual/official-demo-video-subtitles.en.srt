@@ -1,0 +1,147 @@
+1
+00:00:00,000 --> 00:00:05,000
+AI is no longer just a chat box.
+
+2
+00:00:05,000 --> 00:00:09,000
+It reads your business data, assesses risk, calls tools — and writes into your systems.
+
+3
+00:00:09,000 --> 00:00:13,000
+But once AI starts acting, what's missing may not be a smarter agent.
+
+4
+00:00:13,000 --> 00:00:18,000
+It's trust: can it reach data it shouldn't? Write without approval? When something goes wrong, can we trace it — and undo it?
+
+5
+00:00:18,000 --> 00:00:20,000
+KeelBase answers with an open-source, business-safe AI runtime.
+
+6
+00:00:20,000 --> 00:00:32,000
+Agents on top. Your systems below — CRM, ERP, OA. KeelBase's governance layer sits between them, guarding every boundary.
+
+7
+00:00:32,000 --> 00:00:40,000
+Identity, policy, permission, human confirmation, audit, revocation — rules for every step, a record for every action.
+
+8
+00:00:40,000 --> 00:00:45,000
+In one line: AI can act — but only within explicit business boundaries.
+
+9
+00:00:45,000 --> 00:00:52,000
+Let's run the real flow.
+
+10
+00:00:52,000 --> 00:00:58,000
+Ask which customers deserve attention this week — and it actually reads orders and activity history.
+
+11
+00:00:58,000 --> 00:01:05,000
+HanYu Manufacturing — 2.8 million overdue, highest risk, worth an immediate call.
+
+12
+00:01:05,000 --> 00:01:12,000
+Now the AI wants to create a follow-up task. Writing is a real business side effect, so it stops and asks first.
+
+13
+00:01:12,000 --> 00:01:20,000
+The confirmation card doesn't just say what it will do — it shows what the action affects, and how it can be revoked.
+
+14
+00:01:20,000 --> 00:01:25,000
+Only after you approve does it act.
+
+15
+00:01:25,000 --> 00:01:32,000
+Permission checked, approval received, record written — all three leave a trace.
+
+16
+00:01:32,000 --> 00:01:40,000
+A real task now exists in the CRM. This is not a simulated answer.
+
+17
+00:01:40,000 --> 00:01:50,000
+The chain is fully traceable: who asked, how the AI decided, which tool it called, why it was allowed, who approved, what changed.
+
+18
+00:01:50,000 --> 00:01:58,000
+It all lands in a tamper-evident audit chain — verifiable offline.
+
+19
+00:01:58,000 --> 00:02:10,000
+If one action wrote to several tables, revocation isn't click-by-click — the whole write group is compensated together.
+
+20
+00:02:10,000 --> 00:02:20,000
+One revoke, the whole group rolls back.
+
+21
+00:02:20,000 --> 00:02:25,000
+Read, decide, confirm, act, audit, revoke — a closed loop.
+
+22
+00:02:25,000 --> 00:02:38,000
+The governance layer isn't tied to one agent. MCP, OpenAPI, function calling — whatever you connect obeys the same rules.
+
+23
+00:02:38,000 --> 00:02:45,000
+This is not another agent framework. It is a business-safe AI runtime.
+
+24
+00:02:45,000 --> 00:02:52,000
+What if the AI overreaches beyond its own data scope?
+
+25
+00:02:52,000 --> 00:02:57,000
+The runtime denies it outright. Reason, policy and scope all land in the audit — a denial here is the system working, not failing.
+
+26
+00:02:57,000 --> 00:03:11,000
+These boundaries are not marketing. The console runs adversarial scenarios on the spot and shows the outcome and the decision trace.
+
+27
+00:03:11,000 --> 00:03:16,000
+Security boundaries are not prompt instructions. They are enforced at runtime.
+
+28
+00:03:16,000 --> 00:03:25,000
+Need a new business module? Start from one business request, mapped into a structured business spec.
+
+29
+00:03:25,000 --> 00:03:38,000
+Then deterministically mapped into a module protocol — one command, and real business source code comes out.
+
+30
+00:03:38,000 --> 00:03:46,000
+What you get is ordinary source code — readable, editable, in your own repository.
+
+31
+00:03:49,000 --> 00:04:02,000
+Existing systems don't need a rewrite. Hand their APIs to KeelBase and they become governed AI tools.
+
+32
+00:04:02,000 --> 00:04:09,000
+Reads run automatically, writes require approval — without changing a single line of core code.
+
+33
+00:04:09,000 --> 00:04:16,000
+Sensitive data? Deploy privately: local model, local embeddings, local audit — data never leaves your domain.
+
+34
+00:04:16,000 --> 00:04:20,000
+Docker, offline, on-premise — data sovereignty stays in your own hands.
+
+35
+00:04:20,000 --> 00:04:30,000
+Every business action exports to a self-contained HTML evidence report — auditors verify it offline, without installing KeelBase.
+
+36
+00:04:30,000 --> 00:04:39,000
+From the first launch, a readiness list shows where you stand — runtime, database, AI, governance, demo — each with its own next step.
+
+37
+00:04:41,000 --> 00:04:45,000
+Build, run, trust, private deploy. KeelBase: AI can act — but only within explicit business boundaries.

@@ -1,0 +1,14 @@
+{
+  "module": "achievements",
+  "label": "成就",
+  "fields": [
+    { "name": "totalPoints", "type": "int", "label": "累计积分" },
+    { "name": "currentStreak", "type": "int", "label": "当前连签" },
+    { "name": "longestStreak", "type": "int", "label": "最长连签" },
+    { "name": "lastActiveDate", "type": "date", "label": "最后活跃日" }
+  ],
+  "aiTools": {
+    "query": true,
+    "create": { "riskLevel": "R2", "requiresConfirmation": false }
+  }
+}

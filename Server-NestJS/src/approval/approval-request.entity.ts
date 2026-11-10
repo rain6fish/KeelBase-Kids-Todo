@@ -1,0 +1,120 @@
+// SPDX-License-Identifier: Apache-2.0
+
+import {
+  Entity,
+  PrimaryGeneratedColumn,
+  Column,
+  Index,
+  CreateDateColumn,
+  UpdateDateColumn,
+  DeleteDateColumn,
+} from 'typeorm';
+
+/** 审批类型 */
+export const REQUEST_TYPES = ['reimbursement', 'purchase', 'leave', 'contract'] as const;
+export type RequestType = (typeof REQUEST_TYPES)[number];
+
+/** 审批状态 */
+export const REQUEST_STATUSES = [
+  'pending',
+  'needs_review',
+  'approved',
+  'rejected',
+  'auto_approved',
+] as const;
+export type RequestStatus = (typeof REQUEST_STATUSES)[number];
+
+/**
+ * The human decision values accepted by `POST /approval/requests/:id/decide`.
+ *
+ * Single source: the DTO validates against it, the service types its parameter with it, and the
+ * operation-audit interceptor derives `ApprovalRequestApproved` / `ApprovalRequestRejected` from it.
+ * It was duplicated as `approve`/`reject` in the interceptor and its tests, so real requests (which
+ * carry `approved`/`rejected`) always fell through to `ApprovalRequestDecided` while the tests stayed
+ * green — the tests were pinning a shape the endpoint rejects.
+ *
+ * 人工裁决取值（`POST /approval/requests/:id/decide` 的 `decision`）。
+ *
+ * 单一来源：DTO 用它校验、服务用它定型入参、操作审计拦截器用它派生 Approved / Rejected。
+ * 此前拦截器与其测试各写了一份 `approve`/`reject`，而真实请求带的是 `approved`/`rejected` ——
+ * 于是真实决策恒记成 `ApprovalRequestDecided`，测试却因为钉了接口根本不接受的形状而常绿。
+ */
+export const APPROVAL_DECISIONS = ['approved', 'rejected'] as const;
+export type ApprovalDecision = (typeof APPROVAL_DECISIONS)[number];
+
+/**
+ * 审批风险等级（阶段 4 M4：本域风险词汇的单一来源）。
+ *
+ * **三值，且不是 CRM 客户风险词汇的子集**：CRM 的 `RISK_LEVELS`（low/medium/high/**critical**）描述
+ * 「这个客户有多危险」，本词汇描述「这笔申请超阈值多少」——`critical` 的有无是**语义差异而非遗漏**。
+ * 故两者**不共用常量**：共用会把两个概念焊死，日后任一边调整都要惊动另一边。
+ * 单一来源只在**本域内**：预审打分的两处赋值由此受检（写错等级名会在编译期暴露）。
+ */
+export const APPROVAL_RISK_LEVELS = ['low', 'medium', 'high'] as const;
+export type ApprovalRiskLevel = (typeof APPROVAL_RISK_LEVELS)[number];
+
+// Defaults for new rows, typed by the two tables above: removing either value stops compiling.
+// 新建行的默认值，由上面两张词表定型 —— 删掉任一个值都编译不过。
+const DEFAULT_STATUS: RequestStatus = 'pending';
+const DEFAULT_RISK_LEVEL: ApprovalRiskLevel = 'low';
+
+/**
+ * AI Approval 旗舰应用：审批请求主实体。
+ * 流程：提交(pending) → AI 预审(review_approval_request) →
+ *   低风险自动通过(auto_approved) 或 转人工复核(needs_review) → 人工决定(approved/rejected) → 审计。
+ */
+@Entity('app_requests')
+@Index(['requesterId'])
+@Index(['status'])
+@Index('IDX_scope_app_requests_org_dept', ['orgId', 'deptId'])
+export class ApprovalRequest {
+  @PrimaryGeneratedColumn()
+  id!: number;
+
+  @Column({ length: 200 })
+  title!: string;
+
+  @Column({ length: 32, default: 'general' })
+  type!: string;
+
+  @Column({ type: 'float', default: 0 })
+  amount!: number;
+
+  @Column({ type: 'text' })
+  reason!: string;
+
+  @Column({ length: 16, default: DEFAULT_STATUS })
+  status!: string;
+
+  @Column({ length: 16, default: DEFAULT_RISK_LEVEL })
+  riskLevel!: string;
+
+  @Column({ type: 'text', nullable: true })
+  aiRecommendation?: string | null;
+
+  @Column({ nullable: true, name: 'requester_id' })
+  requesterId?: number;
+
+  @Column({ type: 'int', nullable: true, name: 'reviewer_id' })
+  reviewerId?: number | null;
+
+  /** 权限-2 数据范围：所属组织/部门（null = 仅 owner 可见；写入时盖章） */
+  @Column({ type: 'int', nullable: true, name: 'org_id' })
+  orgId?: number | null;
+
+  @Column({ type: 'int', nullable: true, name: 'dept_id' })
+  deptId?: number | null;
+
+  @Column({ type: Date, nullable: true })
+  decidedAt?: Date | null;
+
+  @CreateDateColumn()
+  createdAt!: Date;
+
+  @UpdateDateColumn()
+  updatedAt!: Date;
+
+  /** RG-3 软删除 */
+  @DeleteDateColumn({ type: Date, name: 'deleted_at' })
+  deletedAt?: Date | null;
+}

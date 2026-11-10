@@ -1,0 +1,535 @@
+// SPDX-License-Identifier: Apache-2.0
+
+import { Test, TestingModule } from '@nestjs/testing';
+import { NotFoundException, ForbiddenException, Logger } from '@nestjs/common';
+import { getRepositoryToken } from '@nestjs/typeorm';
+import { getQueueToken } from '@nestjs/bullmq';
+import { Repository } from 'typeorm';
+import { AbilityBuilder, createMongoAbility } from '@casl/ability';
+import { EventsService } from './events.service';
+import { CacheService } from '../common/cache/cache.service';
+import { Event } from './event.entity';
+import { CreateEventDto } from './dto/create-event.dto';
+import { UpdateEventDto } from './dto/update-event.dto';
+import type { AppAbility } from '../common/casl/casl-ability.factory';
+
+/** 构造"只能管理自己事件"的能力（与 CaslAbilityFactory 规则一致） */
+function makeAbility(userId: number): AppAbility {
+  const { can, build } = new AbilityBuilder<AppAbility>(createMongoAbility);
+  can('manage', 'Event', { userId });
+  return build();
+}
+
+describe('EventsService', () => {
+  let service: EventsService;
+  let eventsRepository: Repository<Event>;
+
+  const mockEvent: Event = {
+    id: 1,
+    title: 'Test Event',
+    description: 'A test event',
+    startTime: new Date('2026-08-01T09:00:00Z'),
+    endTime: new Date('2026-08-01T10:00:00Z'),
+    colorRole: 0 as any,
+    location: 'Office',
+    isCancelled: false,
+    isRecurring: false,
+    userId: 1,
+    orgId: null,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  };
+
+  const mockRepository = {
+    create: jest.fn(),
+    save: jest.fn(),
+    findOne: jest.fn(),
+    find: jest.fn(),
+    findAndCount: jest.fn(),
+    createQueryBuilder: jest.fn(),
+    delete: jest.fn(),
+    softDelete: jest.fn(),
+  };
+
+  beforeEach(async () => {
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        EventsService,
+        { provide: getRepositoryToken(Event), useValue: mockRepository },
+        {
+          provide: CacheService,
+          useValue: {
+            get: jest.fn().mockResolvedValue(undefined),
+            set: jest.fn().mockResolvedValue(undefined),
+            delete: jest.fn().mockResolvedValue(undefined),
+            delByPrefix: jest.fn().mockResolvedValue(undefined),
+          },
+        },
+        {
+          provide: getQueueToken('reminder'),
+          useValue: {
+            add: jest.fn().mockResolvedValue(undefined),
+            remove: jest.fn().mockResolvedValue(undefined),
+          },
+        },
+      ],
+    }).compile();
+
+    service = module.get<EventsService>(EventsService);
+    jest.clearAllMocks();
+  });
+
+  // ─── REL-1：队列关闭不得静默 ────────────────────────────────────────────────
+
+  describe('onModuleInit（REL-1）', () => {
+    it('队列缺失（QUEUE_ENABLED=false）→ 启动告警，「提醒不会触发」这件事可见', async () => {
+      const warnSpy = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+      // 刻意**不**提供 reminder 队列 → 等价于 QUEUE_ENABLED=false（QueueModule 不注册 BullMQ）
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          EventsService,
+          { provide: getRepositoryToken(Event), useValue: mockRepository },
+          {
+            provide: CacheService,
+            useValue: {
+              get: jest.fn().mockResolvedValue(undefined),
+              set: jest.fn().mockResolvedValue(undefined),
+              delete: jest.fn().mockResolvedValue(undefined),
+              delByPrefix: jest.fn().mockResolvedValue(undefined),
+            },
+          },
+        ],
+      }).compile();
+
+      module.get<EventsService>(EventsService).onModuleInit();
+
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('事件提醒不会触发'));
+      warnSpy.mockRestore();
+    });
+
+    it('队列在位 → 不告警（不制造噪声）', () => {
+      const warnSpy = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+      service.onModuleInit();
+      expect(warnSpy).not.toHaveBeenCalled();
+      warnSpy.mockRestore();
+    });
+  });
+
+  // ─── Create ────────────────────────────────────────────────────────────────
+
+  describe('create', () => {
+    const dto: CreateEventDto = {
+      title: 'New Event',
+      description: 'A new event',
+      startTime: '2026-08-01T09:00:00Z',
+      endTime: '2026-08-01T10:00:00Z',
+    };
+
+    it('should create an event linked to the user', async () => {
+      mockRepository.create.mockReturnValue(mockEvent);
+      mockRepository.save.mockResolvedValue(mockEvent);
+
+      const result = await service.create(dto, 1);
+
+      expect(result.title).toBe('Test Event');
+      expect(mockRepository.create).toHaveBeenCalledWith(
+        expect.objectContaining({ userId: 1 }),
+      );
+    });
+
+    it('schedules a reminder job when reminderMinutes set', async () => {
+      const future = new Date(Date.now() + 3600 * 1000); // 1 小时后
+      const withReminder = {
+        ...mockEvent,
+        startTime: future,
+        reminderMinutes: 30,
+        id: 7,
+      };
+      mockRepository.create.mockReturnValue(withReminder);
+      mockRepository.save.mockResolvedValue(withReminder);
+      const queue = (service as any).reminderQueue;
+
+      await service.create({ ...dto, reminderMinutes: 30 }, 1);
+
+      expect(queue.add).toHaveBeenCalledWith(
+        'event-remind',
+        expect.objectContaining({ eventId: 7, userId: 1 }),
+        expect.objectContaining({ jobId: 'event-remind-7', delay: expect.any(Number) }),
+      );
+    });
+
+    it('does not schedule reminder when reminderMinutes null', async () => {
+      mockRepository.create.mockReturnValue(mockEvent);
+      mockRepository.save.mockResolvedValue(mockEvent);
+      const queue = (service as any).reminderQueue;
+
+      await service.create(dto, 1);
+
+      expect(queue.add).not.toHaveBeenCalled();
+    });
+  });
+
+  // ─── Get Events For Range ──────────────────────────────────────────────────
+
+  describe('getEventsForRange', () => {
+    it('should return events within date range for a user', async () => {
+      mockRepository.find.mockResolvedValue([mockEvent]);
+
+      const result = await service.getEventsForRange('2026-08-01', '2026-08-31', 1);
+
+      expect(result).toHaveLength(1);
+      expect(result[0].title).toBe('Test Event');
+    });
+
+    it('should return empty array when no events match', async () => {
+      mockRepository.find.mockResolvedValue([]);
+
+      const result = await service.getEventsForRange('2026-09-01', '2026-09-30', 1);
+
+      expect(result).toHaveLength(0);
+    });
+
+    it('ORG-3: 同组织成员事件对用户可见（查询含 orgId 条件）', async () => {
+      // 注入 mock OrgService（user 5 属于 org 3）
+      const mockOrgService = { getUserOrgContext: jest.fn().mockResolvedValue({ orgId: 3, deptId: null }) };
+      (service as any).orgService = mockOrgService;
+      mockRepository.find.mockResolvedValue([{ ...mockEvent, userId: 9, orgId: 3 }]);
+
+      const result = await service.getEventsForRange('2026-08-01', '2026-08-31', 5);
+
+      expect(result).toHaveLength(1);
+      expect(mockOrgService.getUserOrgContext).toHaveBeenCalledWith(5);
+      // 查询条件应包含 orgId: 3
+      const findWhere = mockRepository.find.mock.calls[0][0].where;
+      const hasOrgCond = JSON.stringify(findWhere).includes('orgId');
+      expect(hasOrgCond).toBe(true);
+      // 清理，避免影响后续测试
+      (service as any).orgService = undefined;
+    });
+
+    it('ORG-3: 非组织成员不注入 orgId 条件', async () => {
+      const mockOrgService = { getUserOrgId: jest.fn().mockResolvedValue(null) };
+      (service as any).orgService = mockOrgService;
+      mockRepository.find.mockResolvedValue([mockEvent]);
+
+      await service.getEventsForRange('2026-08-01', '2026-08-31', 5);
+
+      const findWhere = mockRepository.find.mock.calls[0][0].where;
+      expect(JSON.stringify(findWhere)).not.toContain('orgId');
+      (service as any).orgService = undefined;
+    });
+
+    it('完全包住查询范围的事件也命中（区间重叠，非 Between OR Between）', async () => {
+      mockRepository.find.mockResolvedValue([mockEvent]);
+
+      await service.getEventsForRange('2026-08-01', '2026-08-31', 1);
+
+      const findWhere = mockRepository.find.mock.calls[0][0].where as any[];
+      expect(findWhere.length).toBeGreaterThan(0);
+      for (const cond of findWhere) {
+        // 每个条件项同时含 startTime(<=endDate) 与 endTime(>=startDate) → 区间重叠判断
+        const json = JSON.stringify(cond);
+        expect(json).toContain('startTime');
+        expect(json).toContain('endTime');
+      }
+    });
+
+    it('无范围参数时不加时间条件、仅按所有权过滤（postgres Invalid Date 防护）', async () => {
+      mockRepository.find.mockResolvedValue([mockEvent]);
+
+      await service.getEventsForRange(undefined as any, undefined as any, 1);
+
+      const findWhere = mockRepository.find.mock.calls[0][0].where as any[];
+      expect(findWhere).toHaveLength(1);
+      expect(JSON.stringify(findWhere[0])).toContain('userId');
+      // 时间范围条件不应出现（避免 Invalid Date 参数 → postgres 语法错）
+      expect(JSON.stringify(findWhere[0])).not.toContain('startTime');
+      expect(JSON.stringify(findWhere[0])).not.toContain('endTime');
+    });
+  });
+
+  // ─── Search ────────────────────────────────────────────────────────────────
+
+  describe('search', () => {
+    it('should return paginated search results', async () => {
+      mockRepository.findAndCount.mockResolvedValue([[mockEvent], 1]);
+
+      const result = await service.search(
+        { keyword: 'Test', page: 1, limit: 20 },
+        1,
+      );
+
+      expect(result.items).toHaveLength(1);
+      expect(result.total).toBe(1);
+      expect(result.totalPages).toBe(1);
+    });
+
+    it('returns cached search result on second call', async () => {
+      const cache = (service as any).cacheService;
+      cache.get.mockResolvedValueOnce(undefined); // first: miss
+      cache.get.mockResolvedValueOnce({ items: [mockEvent], total: 1, page: 1, limit: 20, totalPages: 1 });
+      mockRepository.findAndCount.mockResolvedValue([[mockEvent], 1]);
+
+      await service.search({ keyword: 'X', page: 1, limit: 20 }, 1);
+      const second = await service.search({ keyword: 'X', page: 1, limit: 20 }, 1);
+
+      expect(second.items).toHaveLength(1);
+      // 第二次命中缓存，不再查库
+      expect(mockRepository.findAndCount).toHaveBeenCalledTimes(1);
+    });
+
+    it('should apply date range filters', async () => {
+      mockRepository.findAndCount.mockResolvedValue([[], 0]);
+
+      await service.search(
+        { keyword: '', start: '2026-08-01', end: '2026-08-31', page: 1, limit: 20 },
+        1,
+      );
+
+      // 时间条件是 AND，须**分发**到每条行级分支上
+      const where = mockRepository.findAndCount.mock.calls[0][0].where as Array<Record<string, unknown>>;
+      expect(where.length).toBeGreaterThan(0);
+      expect(where.every((b) => b.startTime != null && b.endTime != null)).toBe(true);
+    });
+
+    // ① 强制点：搜索与列表同一行级谓词（此前自己写 `event.userId = :userId`，比列表更窄）
+    it('ORG-3/权限-2: 行级谓词与列表同源（含组织分支，非 owner-only）', async () => {
+      const mockOrgService = { getUserOrgContext: jest.fn().mockResolvedValue({ orgId: 3, deptId: null }) };
+      (service as any).orgService = mockOrgService;
+      mockRepository.findAndCount.mockResolvedValue([[], 0]);
+
+      await service.search({ keyword: 'X', page: 1, limit: 20 }, 5);
+
+      const where = mockRepository.findAndCount.mock.calls[0][0].where as Array<Record<string, unknown>>;
+      // 组织分支在场（orgId: 3），且关键词已分发到每条分支
+      expect(JSON.stringify(where)).toContain('"orgId":3');
+      expect(where.every((b) => b.title != null || b.description != null)).toBe(true);
+      (service as any).orgService = undefined;
+    });
+
+    it('无 userId 时拒绝（fail-closed）', async () => {
+      await expect(
+        (service.search as any)({ keyword: 'X', page: 1, limit: 20 }),
+      ).rejects.toThrow(ForbiddenException);
+      expect(mockRepository.findAndCount).not.toHaveBeenCalled();
+    });
+  });
+
+  // ─── Find One ──────────────────────────────────────────────────────────────
+
+  describe('findOne', () => {
+    it('should return event when user owns it', async () => {
+      mockRepository.findOne.mockResolvedValue(mockEvent);
+
+      const result = await service.findOne(1, makeAbility(1), 1);
+
+      expect(result.title).toBe('Test Event');
+    });
+
+    it('should throw NotFoundException if event does not exist', async () => {
+      mockRepository.findOne.mockResolvedValue(null);
+
+      await expect(service.findOne(999, makeAbility(1), 1)).rejects.toThrow(NotFoundException);
+    });
+
+    it('should throw ForbiddenException if user does not own event', async () => {
+      mockRepository.findOne.mockResolvedValue(mockEvent);
+
+      await expect(service.findOne(1, makeAbility(999), 999)).rejects.toThrow(ForbiddenException);
+    });
+
+    it('无 userId 时拒绝（fail-closed，不退化为仅 CASL）', async () => {
+      mockRepository.findOne.mockResolvedValue(mockEvent);
+      // 模拟 TS 看不见的调用方：身份缺席必须拒绝
+      await expect((service.findOne as any)(1, makeAbility(1))).rejects.toThrow(ForbiddenException);
+      expect(mockRepository.findOne).not.toHaveBeenCalled();
+    });
+
+    // ① 强制点：明细与列表必须同一行级谓词（此前明细只走 CASL ⇒「列表可见但明细 403」）
+    it('ORG-3/权限-2: 同组织成员按 userId 可读他人事件（明细与列表同源）', async () => {
+      const mockOrgService = { getUserOrgContext: jest.fn().mockResolvedValue({ orgId: 3, deptId: null }) };
+      (service as any).orgService = mockOrgService;
+      mockRepository.findOne.mockResolvedValue({ ...mockEvent, userId: 9, orgId: 3 });
+
+      const result = await service.findOne(1, makeAbility(5), 5);
+
+      expect(result.userId).toBe(9);
+      (service as any).orgService = undefined;
+    });
+
+    it('ORG-3/权限-2: 非组织成员按 id 读他人事件仍然 403（对齐列表不等于放宽）', async () => {
+      const mockOrgService = { getUserOrgContext: jest.fn().mockResolvedValue(null) };
+      (service as any).orgService = mockOrgService;
+      mockRepository.findOne.mockResolvedValue({ ...mockEvent, userId: 9, orgId: 3 });
+
+      await expect(service.findOne(1, makeAbility(5), 5)).rejects.toThrow(ForbiddenException);
+      (service as any).orgService = undefined;
+    });
+  });
+
+  // ─── Update ────────────────────────────────────────────────────────────────
+
+  describe('update', () => {
+    const dto: UpdateEventDto = {
+      title: 'Updated Title',
+    };
+
+    it('should update own event', async () => {
+      mockRepository.findOne.mockResolvedValue(mockEvent);
+      mockRepository.save.mockResolvedValue({ ...mockEvent, title: 'Updated Title' });
+
+      const result = await service.update(1, dto, makeAbility(1), 1);
+
+      expect(result.title).toBe('Updated Title');
+    });
+
+    it('should throw ForbiddenException when updating other user event', async () => {
+      mockRepository.findOne.mockResolvedValue(mockEvent);
+
+      await expect(service.update(1, dto, makeAbility(999), 999)).rejects.toThrow(ForbiddenException);
+    });
+
+    it('should throw NotFoundException if event does not exist', async () => {
+      mockRepository.findOne.mockResolvedValue(null);
+
+      await expect(service.update(999, dto, makeAbility(1), 1)).rejects.toThrow(NotFoundException);
+    });
+
+    it('update 清空提醒时移除旧 reminder job', async () => {
+      mockRepository.findOne.mockResolvedValue({ ...mockEvent, reminderMinutes: 30 });
+      mockRepository.save.mockResolvedValue({ ...mockEvent, reminderMinutes: null });
+      const queue = (service as any).reminderQueue;
+
+      await service.update(1, { reminderMinutes: null } as UpdateEventDto, makeAbility(1), 1);
+
+      expect(queue.remove).toHaveBeenCalledWith('event-remind-1');
+    });
+
+    it('update 把提醒时间改到过去时移除旧 reminder job', async () => {
+      const pastStart = new Date(Date.now() - 3600 * 1000);
+      mockRepository.findOne.mockResolvedValue({ ...mockEvent, reminderMinutes: 30 });
+      mockRepository.save.mockResolvedValue({ ...mockEvent, reminderMinutes: 30, startTime: pastStart });
+      const queue = (service as any).reminderQueue;
+
+      await service.update(1, { startTime: pastStart.toISOString() } as UpdateEventDto, makeAbility(1), 1);
+
+      expect(queue.remove).toHaveBeenCalledWith('event-remind-1');
+    });
+  });
+
+  // ─── Remove ────────────────────────────────────────────────────────────────
+
+  describe('remove', () => {
+    it('should soft-delete own event', async () => {
+      mockRepository.findOne.mockResolvedValue(mockEvent);
+      mockRepository.softDelete.mockResolvedValue({ affected: 1, raw: {} } as any);
+
+      await expect(service.remove(1, makeAbility(1), 1)).resolves.toBeUndefined();
+      expect(mockRepository.softDelete).toHaveBeenCalledWith(1);
+    });
+
+    it('should throw ForbiddenException when deleting other user event', async () => {
+      mockRepository.findOne.mockResolvedValue(mockEvent);
+
+      await expect(service.remove(1, makeAbility(999), 999)).rejects.toThrow(ForbiddenException);
+    });
+
+    it('软删受影响行数为 0 时抛 NotFound', async () => {
+      mockRepository.findOne.mockResolvedValue(mockEvent);
+      mockRepository.softDelete.mockResolvedValue({ affected: 0, raw: {} } as any);
+      await expect(service.remove(1, makeAbility(1), 1)).rejects.toThrow(NotFoundException);
+    });
+
+    it('移除提醒 job 失败仅记日志不阻断删除', async () => {
+      mockRepository.findOne.mockResolvedValue({ ...mockEvent, reminderMinutes: 30 });
+      mockRepository.softDelete.mockResolvedValue({ affected: 1, raw: {} } as any);
+      (service as any).reminderQueue.remove.mockRejectedValue(new Error('job gone'));
+      await expect(service.remove(1, makeAbility(1), 1)).resolves.toBeUndefined();
+    });
+  });
+
+  // ─── 补充覆盖：findAll / 范围查询边界 / 提醒失败 ───────────────────────────
+
+  describe('findAll', () => {
+    beforeEach(() => {
+      (mockRepository as any).findAndCount = jest.fn().mockResolvedValue([
+        [{ ...mockEvent, user: { id: 1, username: 'alex' } }],
+        1,
+      ]);
+    });
+
+    it('无过滤时走缓存：set 写回', async () => {
+      const result = await service.findAll(1, 20);
+      expect(result.items[0].user).toEqual({ id: 1, username: 'alex' });
+      expect(result.totalPages).toBe(1);
+      const cache = (service as any).cacheService;
+      expect(cache.set).toHaveBeenCalledWith('events:list:1:20', result, expect.any(Number));
+    });
+
+    it('缓存命中时直接返回且不查库', async () => {
+      const cached = { items: [{ id: 99 }], total: 1, page: 1, limit: 20, totalPages: 1 };
+      (service as any).cacheService.get.mockResolvedValue(cached);
+      const result = await service.findAll(1, 20);
+      expect(result).toEqual(cached);
+      expect(mockRepository.findAndCount).not.toHaveBeenCalled();
+    });
+
+    it('带过滤时不读写缓存', async () => {
+      await service.findAll(1, 20, { keyword: '会', userId: 3, isCancelled: true, start: '2026-08-01', end: '2026-08-31' });
+      const cache = (service as any).cacheService;
+      expect(cache.set).not.toHaveBeenCalled();
+      const where = mockRepository.findAndCount.mock.calls[0][0].where;
+      expect(where.title).toBeDefined();
+      expect(where.userId).toBe(3);
+      expect(where.isCancelled).toBe(true);
+      expect(where.startTime).toBeDefined(); // Between
+    });
+
+    it('只给 start / 只给 end 分别用 >= / <=', async () => {
+      await service.findAll(1, 20, { start: '2026-08-01' });
+      let where = mockRepository.findAndCount.mock.calls[0][0].where;
+      expect(where.startTime._type).toBe('moreThanOrEqual');
+
+      await service.findAll(1, 20, { end: '2026-08-31' });
+      where = mockRepository.findAndCount.mock.calls[1][0].where;
+      expect(where.startTime._type).toBe('lessThanOrEqual');
+    });
+
+    it('limit 钳制 1-100（CR-19）', async () => {
+      await service.findAll(-5, 9999);
+      expect(mockRepository.findAndCount).toHaveBeenCalledWith(
+        expect.objectContaining({ skip: 0, take: 100 }),
+      );
+    });
+  });
+
+  describe('范围查询与提醒边界', () => {
+    it('无 userId 时拒绝（fail-closed，不再退化为全表扫描）', async () => {
+      mockRepository.find.mockResolvedValue([]);
+      // 模拟 TS 看不见的调用方（JS / `as any`）：身份缺席必须拒绝，而不是放宽成「每一行」
+      await expect(
+        (service.getEventsForRange as any)('2026-08-01', '2026-08-31'),
+      ).rejects.toThrow(ForbiddenException);
+      expect(mockRepository.find).not.toHaveBeenCalled();
+    });
+
+    it('orgService 抛错时降级为仅本人（不阻断）', async () => {
+      (service as any).orgService = { getUserOrgId: jest.fn().mockRejectedValue(new Error('db down')) };
+      mockRepository.find.mockResolvedValue([mockEvent]);
+      const result = await service.getEventsForRange('2026-08-01', '2026-08-31', 5);
+      expect(result).toHaveLength(1);
+      const where = mockRepository.find.mock.calls[0][0].where;
+      expect(JSON.stringify(where)).not.toContain('orgId');
+      (service as any).orgService = undefined;
+    });
+
+    it('提醒 job 入队失败仅记日志（create 不阻断）', async () => {
+      const future = new Date(Date.now() + 3600 * 1000).toISOString();
+      const withReminder = { ...mockEvent, id: 8, startTime: new Date(future), reminderMinutes: 30 };
+      mockRepository.create.mockReturnValue(withReminder);
+      mockRepository.save.mockResolvedValue(withReminder);
+      (service as any).reminderQueue.add.mockRejectedValue(new Error('queue down'));
+      await expect(service.create({ title: 'T', startTime: future, endTime: future } as any, 1)).resolves.toBeDefined();
+    });
+  });
+});

@@ -1,0 +1,12 @@
+{
+  "module": "badge_awards",
+  "label": "徽章授予",
+  "fields": [
+    { "name": "badgeId", "type": "ref", "target": "badges", "display": "name", "label": "徽章", "required": true },
+    { "name": "earnedOn", "type": "date", "label": "获得日期" }
+  ],
+  "aiTools": {
+    "query": true,
+    "create": { "riskLevel": "R3", "requiresConfirmation": true }
+  }
+}

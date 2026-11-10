@@ -1,0 +1,277 @@
+// SPDX-License-Identifier: Apache-2.0
+
+/**
+ * AI 审计日志服务
+ *
+ * 记录所有 AI 交互：对话、工具调用、错误等。
+ * 数据持久化到 ai_audit_logs 表，支持后续的用量分析和安全审计。
+ */
+
+import { Injectable, Optional, Inject } from '@nestjs/common';
+import { InjectDataSource, InjectRepository } from '@nestjs/typeorm';
+import { DataSource, QueryRunner, Repository } from 'typeorm';
+import { AiAuditLog } from '../entities/ai-audit-log.entity';
+import { actorContext } from '../actor-context';
+import { requestContext } from '../../common/request-context';
+import { AuditChainService } from '../../common/audit-chain/audit-chain.service';
+import { buildPayload } from '../../governance-core/payload';
+import { auditVerifyCacheKey } from '../../governance-core/cache-keys';
+import { GOVERNANCE_REPORTER } from './governance-reporter.service';
+import type { GovernanceReporter } from './governance-reporter.service';
+import { CacheService } from '../../common/cache/cache.service';
+
+export interface AuditEntry {
+  userId: string;
+  /** D2-1c username 快照：写审计时快照用户名（独立治理库后查询无需左联 users） */
+  username?: string;
+  conversationId?: string;
+  action: 'chat' | 'tool_call' | 'navigate' | 'error' | 'login' | 'plan' | 'analyze' | 'knowledge' | 'delegate' | 'tool_confirmation' | 'flow_node' | 'content_blocked' | 'effect_revoke';
+  detail?: string;
+  model?: string;
+  provider?: string;
+  /** W4-⑤ Agent Identity：调用方 agent 标识（headless key id / 子 agent） */
+  agentId?: string;
+  /** W4-⑤ 会话标识（access token 暂无 jti，接入前可空） */
+  sessionId?: string;
+  /** D4 Agent Delegation Chain（多 Agent 归责最小必需）：调用链父动作 id / 上层 agent / 委托上下文 / 业务意图 / 来源通道 */
+  parentActionId?: string;
+  callerAgentId?: string;
+  delegationContext?: string;
+  businessIntent?: string;
+  source?: string;
+  promptTokens?: number;
+  completionTokens?: number;
+  durationMs?: number;
+  isError?: boolean;
+  errorMessage?: string;
+  /** W5-⑦ Explainable Authz：工具被拒时 AuthorizationDeniedError.reasons 的 JSON（checks[]） */
+  authorization?: string;
+  /** §internal.16 A-1 业务事件名（CustomerRiskAssessed/FollowupTaskCreated 等，跨系统归一；链外） */
+  businessEvent?: string;
+  /** §internal.16 A-1 Decision Evidence（JSON：{decision, evidence[], policy, confidence}；链外） */
+  evidence?: string;
+  /**
+   * C-3: the frozen result code for this proposal, and the tool the row is about. Off-chain columns —
+   * not part of the hash payload. Which values are legal for which `action` belongs to the contract,
+   * not to this file: see `ai-audit-log-outcome-v1-vector.json` in the contract repository.
+   *
+   * C-3：这一次提议的**结构化结果码**，以及本行所属的**工具名**。链外列 —— 不入 hash payload。
+   * 哪些值对哪种 `action` 合法**归契约管**、不归本文件管：见契约仓的
+   * `ai-audit-log-outcome-v1-vector.json`。
+   */
+  outcome?: string;
+  tool?: string;
+  /**
+   * P0-19: the call's arguments as a machine-shaped column (off-chain — see the entity's comment).
+   * Callers pass the JSON they already have; the row does not re-serialize or truncate it.
+   *
+   * P0-19：本次调用的参数，机器可读的一列（链外 —— 见实体的注释）。调用方把它手上的那份 JSON 交过来；
+   * 本行不重新序列化、也不截断。
+   */
+  toolArgs?: string;
+}
+
+
+
+@Injectable()
+export class AuditService {
+  constructor(
+    @InjectRepository(AiAuditLog)
+    private readonly logRepo: Repository<AiAuditLog>,
+    private readonly auditChain: AuditChainService,
+    @InjectDataSource()
+    private readonly dataSource: DataSource,
+    // D2-3b：可选治理上报（主应用配 GOVERNANCE_URL 时双写上报；治理台自身不提供 → 不上报）
+    @Optional() @Inject(GOVERNANCE_REPORTER)
+    private reporter?: GovernanceReporter,
+    // E-3 聚合缓存（审计统计/成本/报告/verify 短 TTL；log 热路径只失效 verify 单 key 族）
+    @Optional() private readonly cacheService?: CacheService,
+  ) {}
+
+  /** 审计写串行队列：sqlite（单写者，better-sqlite3 单连接不支持多 QueryRunner 并发事务）用进程内串行；postgres 用 DB 级串行锁（internal-roadmap §internal.10 B） */
+  private _tail: Promise<unknown> = Promise.resolve();
+
+  /**
+   * Attach (or clear) the governance reporter after construction.
+   *
+   * `GOVERNANCE_REPORTER` is provided by the business-side `AiAuditModule`, not by the shared module
+   * that owns this service — the governance process imports the shared module too and must not report
+   * to itself. Keeping the constructor signature unchanged lets `AiAuditModule` mount the reporter on
+   * the very instance the rest of the process injects, instead of creating a second `AuditService`.
+   *
+   * 构造之后再挂载（或清除）治理上报器。
+   *
+   * `GOVERNANCE_REPORTER` 由业务侧的 `AiAuditModule` 提供，而**不是**由持有本服务的共享模块提供 ——
+   * 治理进程同样 import 共享模块，且不得给自己上报。保持构造器签名不变，是为了让 `AiAuditModule`
+   * 把 reporter 挂到**进程里其他消费者注入的那个**实例上，而不是再新建一个 `AuditService`。
+   */
+  attachReporter(reporter?: GovernanceReporter): void {
+    this.reporter = reporter;
+  }
+
+  /**
+   * 写一条审计行并**回传落库的那一行**（含 `id`）。
+   *
+   * 回传是加法：既有的 `await this.auditService.log(...)` 调用点都不消费返回值，行为逐字不变。
+   * 需要它的只有 ACT-5 —— 工具调用审计行写完之后，把它的 id 挂到这次写的**占位行**上，证据根才能
+   * 配到 effect 自己那条触发行，而不用在会话里的同名调用之间猜。
+   */
+  async log(entry: AuditEntry): Promise<AiAuditLog> {
+    // Agent Identity（评审二 §5）：从请求级 ActorContext 读 sessionId/agentId（entry 显式传值优先）
+    const actor = actorContext.getStore();
+    const sessionId = entry.sessionId ?? actor?.sessionId;
+    const agentId = entry.agentId ?? actor?.agentId;
+    // D2-1c username 快照：entry 显式传值优先，fallback 请求级 actor 上下文（JWT username）
+    const username = entry.username ?? actor?.username;
+    // D4 多 Agent 归责：callerAgentId/businessIntent 从 ActorContext fallback（子 agent 场景自动填充）
+    const callerAgentId = entry.callerAgentId ?? actor?.callerAgentId;
+    const businessIntent = entry.businessIntent ?? actor?.businessIntent;
+    // AU-6（§22.19 归因层）：入口来源 source 从 ActorContext fallback（各入口设置，entry 显式传值优先）
+    const source = entry.source ?? actor?.source;
+    // AU-2 / AU-3（§22.19）：客户端 IP 与访客标识从请求级 requestContext（中间件设置）；链外列，不入 payload
+    const { ip, guestId, deviceId } = requestContext.getStore() ?? {};
+
+    // G-2（§internal.17 ① G-2）：payload v2 = 既有字段 + 链外归责/意图/来源/业务注解列（businessEvent/evidence/agentId/...）。
+    // 新行 payloadVersion=2 → _payload 走 v2 含真实注解值（DB 层篡改链外列会破链）；历史行 null → v1 恒空（不破坏既有链）。
+    const payload = buildPayload({
+      payloadVersion: 2,
+      userId: entry.userId,
+      conversationId: entry.conversationId,
+      action: entry.action,
+      detail: entry.detail ? entry.detail.slice(0, 2000) : null,
+      model: entry.model,
+      provider: entry.provider,
+      promptTokens: entry.promptTokens,
+      completionTokens: entry.completionTokens,
+      durationMs: entry.durationMs,
+      isError: entry.isError ?? false,
+      errorMessage: entry.errorMessage,
+      authorization: entry.authorization,
+      agentId,
+      sessionId,
+      parentActionId: entry.parentActionId,
+      callerAgentId,
+      delegationContext: entry.delegationContext,
+      businessIntent,
+      source,
+      businessEvent: entry.businessEvent,
+      evidence: entry.evidence,
+    });
+    const entity = {
+      userId: entry.userId,
+      username,
+      conversationId: entry.conversationId,
+      action: entry.action,
+      detail: entry.detail ? entry.detail.slice(0, 2000) : undefined,
+      model: entry.model,
+      provider: entry.provider,
+      agentId,
+      sessionId,
+      parentActionId: entry.parentActionId,
+      callerAgentId,
+      delegationContext: entry.delegationContext,
+      businessIntent,
+      source,
+      ip,
+      guestId,
+      deviceId,
+      promptTokens: entry.promptTokens,
+      completionTokens: entry.completionTokens,
+      durationMs: entry.durationMs,
+      isError: entry.isError ?? false,
+      errorMessage: entry.errorMessage,
+      authorization: entry.authorization,
+      businessEvent: entry.businessEvent,
+      evidence: entry.evidence,
+      // C-3's two out-of-chain attribution columns. They go to the row and deliberately NOT into
+      // `payload` above: an out-of-chain column that entered the hash would fork the chain, which is
+      // the exact opposite of what these are for.
+      // C-3 的两列**链外归因列**。它们去的是**行**，并**有意不进**上面的 `payload` —— 链外列一旦入链
+      // 就会把链劈叉，那正是它们要避免的事。
+      outcome: entry.outcome,
+      tool: entry.tool,
+      // P0-19: same stance as the two above — the row, never the payload.
+      // P0-19：与上面两列同一立场 —— 去的是**行**，不进 payload。
+      toolArgs: entry.toolArgs,
+      payloadVersion: 2,
+    };
+
+    let saved: AiAuditLog;
+    if (this.dataSource.options.type === 'postgres') {
+      // DB 级串行（internal-roadmap §internal.10 B）：事务内锁 audit_chain_lock id=1（SELECT FOR UPDATE），
+      // 跨实例串行化「读 lastHash → 计算 → 插入」——多副本不再分叉。
+      const runner = this.dataSource.createQueryRunner();
+      await runner.connect();
+      try {
+        await runner.startTransaction();
+        // 锁行可能缺失（synchronize 建表不 seed / 治理台独立库）→ 先幂等 ensure，再取行锁
+        await runner.query(
+          `INSERT INTO "audit_chain_lock" (id, holder) VALUES (1, 'seed') ON CONFLICT (id) DO NOTHING`,
+        );
+        await runner.query('SELECT id FROM "audit_chain_lock" WHERE id = 1 FOR UPDATE');
+        const prevHash = await this._lastHash(runner);
+        const hash = this.auditChain.computeHash(prevHash, payload);
+        saved = await runner.manager.save(AiAuditLog, { ...entity, prevHash, hash });
+        await runner.commitTransaction();
+      } catch (err) {
+        await runner.rollbackTransaction().catch(() => {});
+        throw err;
+      } finally {
+        await runner.release();
+      }
+    } else {
+      // sqlite：进程内串行（better-sqlite3 单连接，多 QueryRunner 并发事务不支持；sqlite 单写者）
+      const job = this._tail.then(async () => {
+        const prevHash = await this._lastHash();
+        const hash = this.auditChain.computeHash(prevHash, payload);
+        return this.logRepo.save({ ...entity, prevHash, hash });
+      });
+      this._tail = job.catch(() => {});
+      saved = await job;
+    }
+    // D2-3b：审计双写上报治理台（配置 GOVERNANCE_URL 时；治理台自身不配不启用）
+    if (this.reporter?.enabled) {
+      void this.reporter
+        .reportAudit({
+          userId: entry.userId,
+          username,
+          action: entry.action,
+          detail: entry.detail,
+          model: entry.model,
+          provider: entry.provider,
+          agentId,
+          conversationId: entry.conversationId,
+          source: entry.source,
+          promptTokens: entry.promptTokens,
+          completionTokens: entry.completionTokens,
+          durationMs: entry.durationMs,
+          isError: entry.isError ?? false,
+          errorMessage: entry.errorMessage,
+          authorization: entry.authorization,
+        })
+        .catch(() => {});
+    }
+    // E-3：新审计入链 → 哈希链 verify 缓存失效（聚合 stats/cost/report 靠 60s TTL 自过期，不做热路径失效）
+    // AW-5：只失效**本库**的 verify 键（键带数据库身份）——按前缀删，作用域收窄到一个库。
+    // AW-5: invalidate only **this database's** verify key (the key carries the database identity);
+    // the prefix delete is scoped to one database.
+    await this.cacheService?.delByPrefix(auditVerifyCacheKey(this.dataSource));
+    return saved;
+  }
+
+  private async _lastHash(runner?: QueryRunner): Promise<string | null> {
+    if (runner) {
+      // DB 级串行：在锁事务内读（与插入同事务，跨实例原子）
+      const rows = await runner.query('SELECT hash FROM "ai_audit_logs" ORDER BY id DESC LIMIT 1');
+      return rows?.[0]?.hash ?? null;
+    }
+    const row = await this.logRepo
+      .createQueryBuilder('log')
+      .select('log.hash', 'hash')
+      .orderBy('log.id', 'DESC')
+      .limit(1)
+      .getRawOne<{ hash: string }>();
+    return row?.hash ?? null;
+  }
+
+}

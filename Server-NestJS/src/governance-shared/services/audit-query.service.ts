@@ -1,0 +1,236 @@
+// SPDX-License-Identifier: Apache-2.0
+
+/**
+ * 审计日志查询（从 `AuditService` 拆出的第二个领域，健康清单 §3 阶段 3）。
+ *
+ * 与聚合域同一理由：这些方法只**读**日志、只做过滤与行映射，与「写进哈希链」毫无关系，
+ * 却和写入路径挤在同一个 1300 行的类里。拆开后写入（`AuditService`）与读取（本类）各自独立。
+ *
+ * **行为与拆分前逐字一致**——搬迁不改逻辑（阶段 3 纪律：行为不变，测试作护栏）。
+ */
+import { Injectable, Optional } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
+import { AiAuditLog } from '../../governance-shared/entities/ai-audit-log.entity';
+import { aiActionLabel } from './ai-feature-map';
+import { OrgService } from '../../org/org.service';
+import {
+  auditScopeSql,
+  resolveAuditReaderScope,
+  type AuditReaderContext,
+} from './audit-reader-scope';
+
+export interface AiAuditLogWithUser {
+  id: number;
+  userId: string;
+  conversationId?: string | null;
+  action: string;
+  detail?: string | null;
+  /** D2 人类语言审计标签：语义 key（前端 i18n）+ 兜底人类可读描述（含工具名） */
+  actionKey?: string | null;
+  actionLabel?: string | null;
+  /** W4-⑤ Agent Identity：调用方 agent（headless key id / 子 agent），Agent Registry name 归责于此 */
+  agentId?: string | null;
+  /** D4 Agent Delegation Chain 增量字段（多 Agent 归责） */
+  parentActionId?: string | null;
+  callerAgentId?: string | null;
+  delegationContext?: string | null;
+  businessIntent?: string | null;
+  source?: string | null;
+  /** AU-2（§22.19）：客户端来源 IP（链外归因列） */
+  ip?: string | null;
+  /** AU-3（§22.19）：访客标识（链外归因列，与账号无关——演示端共享账号下区分访客） */
+  guestId?: string | null;
+  /** AU-2 余项（§22.19）：客户端设备标识（链外归因列；NAT 之后多个客户端共用一个 IP 时用它分辨） */
+  deviceId?: string | null;
+  /**
+   * C-3（契约 `ai-audit-log-row` v5）：这一次提议的**结构化结果码**（冻结词表）与**所属工具名**。
+   * 两者都是链外归因列。合法取值按 `action` 分，见契约仓 `ai-audit-log-outcome-v1-vector.json`。
+   */
+  outcome?: string | null;
+  tool?: string | null;
+  /**
+   * Contract `ai-audit-log-row` v6: the correlation key of one governed execution, carrying the same
+   * value as the side-effect row that execution wrote. Chain-external, never in the hash payload. This
+   * runtime has no execution-id concept, so the projection always emits null — the field is optional,
+   * but the key-set binding in `audit-query.service.spec.ts` compares against the declared properties
+   * exactly, so it is listed explicitly.
+   * 契约 `ai-audit-log-row` v6：同一次受治理执行的关联键，与那次执行写下的副作用行同值。链外列，
+   * 不入 hash payload。本运行时没有执行号概念，故投影恒发 null —— 该字段可选，但
+   * `audit-query.service.spec.ts` 的键集绑定与声明属性**全等**比较，故此处显式列出。
+   */
+  executionId?: string | null;
+  model?: string | null;
+  provider?: string | null;
+  promptTokens?: number | null;
+  completionTokens?: number | null;
+  durationMs?: number | null;
+  isError: boolean;
+  errorMessage?: string | null;
+  authorization?: string | null;
+  createdAt: string;
+  username?: string | null;
+  /** §internal.16 A-1 业务事件名（CustomerRiskAssessed 等；链外） */
+  businessEvent?: string | null;
+  /** §internal.16 A-1 Decision Evidence（JSON 字符串；链外） */
+  evidence?: string | null;
+}
+
+/** Re-exported so callers have one import site for the reader context. */
+export type { AuditReaderContext };
+
+interface AuditRowQueryOptions {
+  userId?: string;
+  limit?: number;
+  offset?: number;
+  since?: Date;
+  until?: Date;
+  feedback?: string;
+  orgId?: number;
+  agentId?: string;
+  isError?: 'true' | 'false';
+  denied?: 'true';
+}
+
+@Injectable()
+export class AuditQueryService {
+  constructor(
+    @InjectRepository(AiAuditLog) private readonly logRepo: Repository<AiAuditLog>,
+    // Optional like the other scope helpers, so unit tests (and deployments without the org module)
+    // degrade to the reader's own rows rather than failing construction.
+    // 与其余范围助手一样是可选的，故单测（以及没接组织模块的部署）会退回读者的本人行，而不是构造失败。
+    @Optional() private readonly orgService?: OrgService,
+  ) {}
+
+  async getUserLogs(
+    userId: string,
+    options: { limit?: number; offset?: number; since?: Date; until?: Date } = {},
+    reader?: AuditReaderContext,
+  ): Promise<AiAuditLogWithUser[]> {
+    return this._queryLogs({ userId, ...options }, reader);
+  }
+
+  async getLogs(
+    options: AuditRowQueryOptions = {},
+    reader?: AuditReaderContext,
+  ): Promise<AiAuditLogWithUser[]> {
+    return this._queryLogs(options, reader);
+  }
+
+  /**
+   * AI-18 对话反馈：用户对某次对话点赞/点踩（+可选原因）。
+   * 反馈落在这条对话最近一条非错误审计日志上。
+   */
+  async submitFeedback(
+    userId: string,
+    conversationId: string,
+    feedback: 'thumbs_up' | 'thumbs_down',
+    note?: string,
+  ): Promise<{ updated: boolean }> {
+    const log = await this.logRepo
+      .createQueryBuilder('log')
+      .where('log.userId = :userId', { userId })
+      .andWhere('log.conversationId = :conversationId', { conversationId })
+      .andWhere('log.isError = :err', { err: false })
+      .orderBy('log.createdAt', 'DESC')
+      .getOne();
+
+    if (!log) return { updated: false };
+    await this.logRepo.update(log.id, { feedback, feedbackNote: note ?? undefined });
+    return { updated: true };
+  }
+
+  /** 查询审计日志并左联用户表带出 username（原则 3：审计显示用户名）。userId 存的是数字字符串，需 CAST。ORG-5 支持按组织维度过滤。 */
+  private async _queryLogs(
+    options: AuditRowQueryOptions = {},
+    reader?: AuditReaderContext,
+  ): Promise<AiAuditLogWithUser[]> {
+    const qb = this.logRepo
+      .createQueryBuilder('log')
+      // D2-1c username 快照：读快照列，不再左联业务 users 表（独立治理库后无 users）
+      .addSelect('log.username', 'username')
+      .orderBy('log.createdAt', 'DESC')
+      .take(options.limit ?? 50)
+      .skip(options.offset ?? 0);
+    if (options.userId) qb.where('log.userId = :userId', { userId: options.userId });
+    // Period: the window is closed on both ends. `until` used to be honoured only by the coverage
+    // statement; the log list ignored it, so a caller asking for a period got an open-ended read.
+    // 期间：窗口两端闭合。`until` 以前只有覆盖声明在用，日志列表忽略它 —— 于是要求一段期间的调用者
+    // 实际拿到的是无界读取。
+    if (options.since) qb.andWhere('log.createdAt >= :since', { since: options.since });
+    if (options.until) qb.andWhere('log.createdAt <= :until', { until: options.until });
+    if (options.feedback) qb.andWhere('log.feedback = :feedback', { feedback: options.feedback });
+    if (options.agentId) qb.andWhere('log.agent_id = :agentId', { agentId: options.agentId });
+    if (options.isError) qb.andWhere('log.is_error = :isError', { isError: options.isError === 'true' });
+    // A-8 越权专门视图：错误事件 + 携带**拒绝理由**（越权/阻断而非普通失败——「AI 被拒」同样是安全证据）。
+    // 判据按**形状**，不按「非空」：拒绝理由是 JSON **数组**，放行快照是 JSON **对象**
+    // （docs/audit-authz-snapshot.spec.md §2）。自 2026-10-28 起，「没发生」的行（超时/拒绝）也带放行快照，
+    // 按非空判别会把它们读成一次越权。
+    //
+    // A-8: error rows carrying **deny reasons** — judged by **shape**, not by "non-empty". Deny reasons
+    // are a JSON **array**, an allow snapshot is a JSON **object**. Since 2026-10-28 the never-executed
+    // rows (timeout / declined) carry an allow snapshot too, and "non-empty" would read them as denials.
+    if (options.denied) {
+      qb.andWhere('log.is_error = :deniedIsErr', { deniedIsErr: true });
+      qb.andWhere("log.authorization IS NOT NULL AND substr(log.authorization, 1, 1) = '['");
+    }
+    if (options.orgId != null) {
+      qb.andWhere(
+        'CAST(log.userId AS INTEGER) IN (SELECT user_id FROM org_members WHERE org_id = :orgId)',
+        { orgId: options.orgId },
+      );
+    }
+    // Row scope for the audit reader: an ADDITIONAL constraint, never a replacement for the filters
+    // above. An org in the request therefore cannot widen the account's org.
+    // 审计读者的行范围：**追加**约束，绝不替换上面的过滤。故请求里的组织无法把账号的组织放大。
+    const scope = auditScopeSql(await resolveAuditReaderScope(reader, this.orgService));
+    if (scope) qb.andWhere(scope.sql, scope.params);
+
+    const rows = await qb.getRawMany();
+    return rows.map((r) => {
+      const label = aiActionLabel(r.log_action, r.log_detail);
+      return {
+      id: Number(r.log_id),
+      userId: String(r.log_user_id),
+      conversationId: r.log_conversation_id ?? null,
+      action: r.log_action,
+      detail: r.log_detail ?? null,
+      actionKey: label.key,
+      actionLabel: label.fallback,
+      agentId: r.log_agent_id ?? null,
+      parentActionId: r.log_parent_action_id ?? null,
+      callerAgentId: r.log_caller_agent_id ?? null,
+      delegationContext: r.log_delegation_context ?? null,
+      businessIntent: r.log_business_intent ?? null,
+      source: r.log_source ?? null,
+      ip: r.log_ip ?? null,
+      guestId: r.log_guest_id ?? null,
+      deviceId: r.log_device_id ?? null,
+      outcome: r.log_outcome ?? null,
+      tool: r.log_tool ?? null,
+      // v6: this runtime has no execution-id concept, so the column is always null — the contract
+      // allows omission or null. Emitted explicitly because the key-set binding compares the row
+      // against the schema's declared properties in full.
+      // v6：本运行时没有执行号概念，故该列恒为 null —— 契约允许省略或 null。显式发出的原因是
+      // 键集绑定会拿整行与声明的属性全集做全等比较。
+      executionId: null,
+      model: r.log_model ?? null,
+      provider: r.log_provider ?? null,
+      promptTokens: r.log_prompt_tokens != null ? Number(r.log_prompt_tokens) : null,
+      completionTokens: r.log_completion_tokens != null ? Number(r.log_completion_tokens) : null,
+      durationMs: r.log_duration_ms != null ? Number(r.log_duration_ms) : null,
+      isError: Boolean(r.log_is_error),
+      errorMessage: r.log_error_message ?? null,
+      authorization: r.log_authorization ?? null,
+      feedback: r.log_feedback ?? null,
+      feedbackNote: r.log_feedback_note ?? null,
+      createdAt: String(r.log_createdAt),
+      username: r.username ?? null,
+      // §internal.16 A-1 业务行为取证：业务事件名 + Decision Evidence（链外透出）
+      businessEvent: r.log_business_event ?? null,
+      evidence: r.log_evidence ?? null,
+    };
+    });
+  }
+
+}

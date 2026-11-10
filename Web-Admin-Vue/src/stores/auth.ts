@@ -1,0 +1,152 @@
+// SPDX-License-Identifier: Apache-2.0
+
+import { defineStore } from 'pinia'
+import { authApi, type MyPermissions } from '@/api/auth'
+import { ApiError } from '@/api/client'
+import { storage } from '@/utils/storage'
+import { PERMISSION_MAP } from '@/constants/permissions'
+import type { AuthUser } from '@/types/api'
+
+export type AuthStatus = 'initial' | 'loading' | 'authenticated' | 'unauthenticated'
+
+export interface LoginErrorDetails {
+  reason?: string
+  impact?: string
+  nextStep?: string
+}
+
+export const useAuthStore = defineStore('auth', {
+  state: () => ({
+    status: 'initial' as AuthStatus,
+    user: null as AuthUser | null,
+    errorMessage: '',
+    loginDetails: null as LoginErrorDetails | null,
+    permissions: null as MyPermissions | null,
+    permissionsLoaded: false,
+  }),
+  getters: {
+    isAdmin: (state) => state.user?.role === 'admin',
+    /**
+     * Audit reader (AW-2): read-only on the audit surface. Mutually exclusive with `isAdmin` — an
+     * account carries one role. Used only to pick the navigation; the server decides every request,
+     * and hiding a page is not what keeps anyone out.
+     *
+     * 审计读者（AW-2）：在审计面上只读。与 `isAdmin` 互斥 —— 一个账号一个角色。**只**用来挑导航；
+     * 每个请求由服务端裁决，**隐藏页面不是把人挡在外面的那件事**。
+     */
+    isAuditor: (state) => state.user?.role === 'auditor',
+    /** 渲染层权限点：admin（resources 含 all/all）全有；否则按 subject + scope 判定。 */
+    hasPermission: (state) => (point: string) => {
+      const resources = state.permissions?.resources
+      if (!resources) return false
+      if (resources.some((r) => r.subject === 'all' && r.scope === 'all')) return true
+      const req = PERMISSION_MAP[point]
+      if (!req) return false
+      return resources.some((r) => r.subject === req.subject && r.scope === req.scope)
+    },
+  },
+  actions: {
+    /** 清空能力清单（登录切换 / 登出 / 会话失效时调用，防跨用户脏授权）。 */
+    clearPermissions() {
+      this.permissions = null
+      this.permissionsLoaded = false
+    },
+    /**
+     * 拉取当前用户能力清单（Explainable Authz）。
+     * 在**认证点**调用（tryAutoLogin / login / oidcLogin），不在每次导航时调用——避免失败请求被反复重试。
+     * force=false 且已加载过则跳过；失败保持 null 且不置 loaded。调用方在清单为空时回退角色门（见 router/guards.ts）。
+     */
+    async loadPermissions(force = false) {
+      if (this.permissionsLoaded && !force) return
+      try {
+        this.permissions = await authApi.myPermissions()
+        this.permissionsLoaded = true
+      } catch {
+        this.permissions = null
+        this.permissionsLoaded = false
+      }
+    },
+    async tryAutoLogin() {
+      const { accessToken } = storage.readTokens()
+      if (!accessToken) {
+        this.status = 'unauthenticated'
+        return
+      }
+      this.status = 'loading'
+      try {
+        this.user = await authApi.me()
+        this.status = 'authenticated'
+        await this.loadPermissions()
+      } catch {
+        storage.clearTokens()
+        this.status = 'unauthenticated'
+        this.user = null
+      }
+    },
+    async login(username: string, password: string): Promise<boolean> {
+      this.status = 'loading'
+      this.errorMessage = ''
+      try {
+        const result = await authApi.login(username, password)
+        storage.saveTokens(result.accessToken, result.refreshToken)
+        this.clearPermissions()
+        this.user = result.user
+        this.status = 'authenticated'
+        await this.loadPermissions(true)
+        return true
+      } catch (err) {
+        this.status = 'unauthenticated'
+        this.errorMessage = err instanceof Error ? err.message : '登录失败'
+        // NC-2：登录失败带可执行指引（EMAIL_NOT_VERIFIED「查收邮箱」/ ACCOUNT_LOCKED「等解锁」等）
+        this.loginDetails = err instanceof ApiError ? { reason: err.reason, impact: err.impact, nextStep: err.nextStep } : null
+        return false
+      }
+    },
+    async childLogin(username: string, pin: string, inviteCode?: string): Promise<boolean> {
+      this.status = 'loading'
+      this.errorMessage = ''
+      try {
+        const result = await authApi.childLogin(username, pin, inviteCode)
+        storage.saveTokens(result.accessToken, result.refreshToken)
+        this.clearPermissions()
+        this.user = result.user
+        this.status = 'authenticated'
+        await this.loadPermissions(true)
+        return true
+      } catch (err) {
+        this.status = 'unauthenticated'
+        this.errorMessage = err instanceof Error ? err.message : '登录失败'
+        this.loginDetails = err instanceof ApiError ? { reason: err.reason, impact: err.impact, nextStep: err.nextStep } : null
+        return false
+      }
+    },
+    async oidcLogin(code: string, redirectUri: string): Promise<boolean> {
+      this.status = 'loading'
+      this.errorMessage = ''
+      try {
+        const result = await authApi.oidcLogin(code, redirectUri)
+        storage.saveTokens(result.accessToken, result.refreshToken)
+        this.clearPermissions()
+        this.user = result.user
+        this.status = 'authenticated'
+        await this.loadPermissions(true)
+        return true
+      } catch (err) {
+        this.status = 'unauthenticated'
+        this.errorMessage = err instanceof Error ? err.message : '登录失败'
+        return false
+      }
+    },
+    async logout() {
+      try {
+        await authApi.logout()
+      } catch {
+        // best-effort：登出失败也继续清本地
+      }
+      storage.clearTokens()
+      this.clearPermissions()
+      this.user = null
+      this.status = 'unauthenticated'
+    },
+  },
+})

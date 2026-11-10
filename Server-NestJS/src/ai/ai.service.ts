@@ -1,0 +1,1934 @@
+// SPDX-License-Identifier: Apache-2.0
+
+/**
+ * AI 对话编排服务
+ *
+ * 核心编排层：整合 Provider 调用、工具执行、对话管理。
+ * 处理多轮工具调用循环、Fallback 机制、对话保存。
+ */
+
+import { randomUUID } from 'node:crypto';
+import { R4ApprovalService } from './approvals/r4-approval.service';
+import { ProviderRoutingService } from './providers/provider-routing.service';
+import { StreamAccumulator } from './providers/stream-accumulator';
+import { ToolRegistry } from './tools/tool-registry';
+import { ToolGateService } from './tools/tool-gate.service';
+import { ToolExecutionService } from './tools/tool-execution.service';
+import { ToolPresentationService } from './tools/tool-presentation.service';
+import { ToolExposureService } from './tools/tool-exposure.service';
+import { PAGE_ROUTES, NAV_KEYWORDS } from './tools/navigate-page.tool';
+import { AuthorizationExplainerService, buildAllowSnapshot } from './authorization-explainer.service';
+import { ConversationService } from './conversation/conversation.service';
+import { AuditService } from '../governance-shared/services/audit.service';
+import { captureDecisionEvidence } from './audit/decision-evidence';
+import { buildToolCallAudit, confirmationOutcome } from './audit/tool-call-audit';
+// ACT-3：免确认作用域键要按**规范化**参数算（与副作用幂等键同一口径，防同一逻辑调用两种写法算出两个键）
+import { AiToolEffectsService, sortKeys } from '../governance-shared/services/ai-tool-effects.service';
+import { AiDailyUsageService } from './audit/ai-daily-usage.service';
+import { RouterAgent, Intent, WRITE_ACTION_VERBS } from './agents/router-agent.service';
+import { LlmUsage, addLlmUsage } from './llm-usage';
+import { CaslAbilityFactory } from '../common/casl/casl-ability.factory';
+import { ReflectionAgent } from './agents/reflection-agent.service';
+import { tracer, withSpan } from '../common/tracing/tracer';
+import { SpanStatusCode } from '@opentelemetry/api';
+import { PlanExecuteAgent, ReadOnlyToolExecutor } from './agents/plan-execute-agent.service';
+import { RagAgent } from './agents/rag-agent.service';
+import { MemoriesService } from './memory/memory.service';
+import { ConfirmationStore } from './confirmation/confirmation.store';
+import { ConversationCompactor } from './conversation/conversation-compactor';
+import { SubAgentOrchestrator } from './agents/sub-agent-orchestrator.service';
+import {
+  PresentationText,
+  ToolResult,
+  RISK_STRATEGY,
+  AuthorizationDeniedError,
+} from './interfaces/tool.interface';
+import { GovernancePolicyService } from '../governance-shared/services/governance-policy.service';
+import {
+  buildDenialExplanation,
+  type DenialLanguage,
+} from '../common/errors/denial-guidance';
+import {
+  markSystemBoundary,
+  sanitizeExternalContent,
+  sanitizeMemoryEntry,
+} from './security/injection-guard';
+import { checkContentSafety } from './security/content-safety';
+import { ContentSafetyService } from './security/content-safety.service';
+import { deriveAiBusinessEvent } from './audit/ai-business-event';
+import { SettingsService, SETTING_KEYS } from '../settings/settings.service';
+import { NotFoundException, Optional } from '@nestjs/common';
+import { BusinessException } from '../common/errors/business.exception';
+import {
+  LlmProvider,
+  GenerateResult,
+  StreamChunk,
+  ChatMessage,
+} from './interfaces/llm-provider.interface';
+
+const MAX_TOOL_ROUNDS = 5;
+
+export interface ChatRequest {
+  message: string;
+  provider?: string;
+  model?: string;
+  conversationId?: string;
+  /** AI-12 多模态：用户消息附带的图片 URL 列表 */
+  images?: string[];
+  /** System AI Assistant：覆盖默认 system prompt（管理员专用提示词，内部字段不暴露 HTTP DTO） */
+  systemPrompt?: string;
+  /** System AI Assistant：跳过关键词导航短路，导航交给 LLM + navigate_admin_page 工具 */
+  adminMode?: boolean;
+}
+
+export interface ChatResponse {
+  conversationId: string;
+  reply: string;
+  provider: string;
+  model: string;
+  usage?: { promptTokens: number; completionTokens: number };
+  /** AI 请求跳转的页面路由（前端收到后执行导航） */
+  navigateTo?: string;
+  /** 本次对话实际调用的工具名（HS-1 评测断言用） */
+  toolCalls?: string[];
+}
+
+export interface AiServiceConfig {
+  defaultProvider: string;
+  defaultModel: string;
+  systemPrompt: string;
+}
+
+export class AiService {
+  private readonly routerAgent = new RouterAgent();
+  private readonly reflectionAgent = new ReflectionAgent();
+  private readonly planExecuteAgent = new PlanExecuteAgent();
+
+  constructor(
+    // Provider 路由与回退（第六刀）：选路 / 回退链 / 流式回退
+    private readonly llmRouter: ProviderRoutingService,
+    private readonly toolRegistry: ToolRegistry,
+    private readonly conversationService: ConversationService,
+    private readonly config: AiServiceConfig,
+    private readonly auditService: AuditService,
+    // 每日配额已从 AuditService 拆出（不属审计职责）；此处只做用量预留/释放
+    private readonly usageQuota: AiDailyUsageService,
+    // 工具门控（阶段 3「主战场」第一刀）：能不能跑 / 要不要确认 / 走不走 R4 / 什么风险级
+    private readonly toolGate: ToolGateService,
+    // 工具执行（第二刀）：读/写工具的真正执行与副作用登记；门控在它内部被复用
+    private readonly toolExecution: ToolExecutionService,
+    // R4 双人审批（第三刀）：审批请求生命周期；裁决后的执行仍走上面的写管道
+    private readonly r4Approval: R4ApprovalService,
+    // 呈现/摘要（第四刀）：确认卡文案 / 影响预览 / 撤销档 / 结果截断
+    private readonly presentation: ToolPresentationService,
+    // 工具对外面（第五刀）：清单 / 指纹 / MCP 出口 / 集成诊断
+    private readonly toolExposure: ToolExposureService,
+    private readonly ragAgent: RagAgent,
+    private readonly abilityFactory: CaslAbilityFactory,
+    private readonly memoryService: MemoriesService,
+    private readonly confirmationStore: ConfirmationStore,
+    private readonly compactor: ConversationCompactor,
+    private readonly subAgentOrchestrator: SubAgentOrchestrator,
+    private readonly authorizationExplainer: AuthorizationExplainerService,
+    private readonly settingsService?: SettingsService,
+    private readonly governancePolicy?: GovernancePolicyService,
+    // N-6 AI-23 深度化：统一内容安全（读 Settings 配置 + 命中审计）；缺省降级静态 checkContentSafety
+    @Optional() private readonly contentSafety?: ContentSafetyService,
+    /**
+     * ACT-5（消费者①）：工具调用审计行写完，把它挂到这次写的**占位行**上，证据根才能配到 effect
+     * **自己**那条触发行。**@Optional** —— 缺失时挂链静默跳过（旧数据继续走保守配对），不影响任何判定。
+     */
+    @Optional() private readonly toolEffectsService?: AiToolEffectsService,
+  ) {}
+
+  /**
+   * RG-2.1 AI 每日限额：Settings 里 ai_daily_limit（>0 时启用）原子预留当日槽位
+   * （AuditService.reserveDailyUsage 条件递增），并发请求不再集体越限。
+   * 返回 true=已预留（对话进行中即计入，成功后保留、失败由调用方 release）；
+   * false=未注入 SettingsService / 未启用限额（单测/降级场景）。
+   */
+  private async enforceDailyLimit(userId: string): Promise<boolean> {
+    const settings = this.settingsService;
+    if (!settings) return false;
+    const limit = await settings.getAiDailyLimit();
+    if (limit <= 0) return false; // 0 = 不限
+
+    const reserved = await this.usageQuota.reserveDailyUsage(userId, limit);
+    if (!reserved) throw BusinessException.of('AI_DAILY_LIMIT');
+    return true;
+  }
+
+  /** 对话所有权 CASL ability（userId 是 string，sub 转 number；普通 user） */
+  private _abilityFor(userId: string) {
+    return this.abilityFactory.createForUser({
+      sub: Number(userId),
+      username: '',
+      role: 'user' as any,
+    });
+  }
+
+  /**
+   * HS-9 审计粒度：all = 记对话+工具；write = 只记工具调用；off = 不记。
+   */
+  private async _shouldAudit(scope: 'conversation' | 'tool'): Promise<boolean> {
+    if (!this.governancePolicy) return true;
+    const granularity = await this.governancePolicy.getAuditGranularity();
+    if (granularity === 'off') return false;
+    if (granularity === 'write') return scope === 'tool';
+    return true;
+  }
+
+  /**
+   * §22.19 AU-2: the read-only executor for the plan / sub-agent paths — it executes **and** writes
+   * one `tool_call` row, the same row shape the main loop writes, so that one read tool call leaves
+   * the same evidence whichever path invoked it.
+   *
+   * Both agent paths take this one executor: covering only the sub-agent would need a switch here and
+   * would leave the platform with a third rule (main logs, plan silent, sub-agent logs).
+   *
+   * Two differences from the main loop, stated rather than papered over:
+   * - `argsJson` is `JSON.stringify(args)` — these paths hold the parsed object only (the plan path
+   *   never had an argument string; it parses its steps out of the planner's JSON).
+   * - the attribution fields (`agentId` / `callerAgentId` / `businessIntent` / `sessionId` /
+   *   `username` / `source`) are deliberately **not** passed here — `AuditService.log` fills them from
+   *   `actorContext`, whose sub-agent scope has inherited the parent since ACT-1.
+   *
+   * §22.19 AU-2：plan / 子代理路径的只读执行器 —— 执行 **且** 写一行 `tool_call`，行形状与主循环同源，
+   * 使同一次只读工具调用无论走哪条路径都留下同一份证据。
+   *
+   * 两条 agent 路径共用这一个执行器：只覆盖子代理就得在此加开关，且平台会多出第三种口径
+   * （主链路记、plan 不记、子代理记）。
+   *
+   * 与主循环的两处差异，写明而不是抹平：
+   * - `argsJson` 取 `JSON.stringify(args)`——这两条路径手上只有解析后的对象（plan 路径本就没有原文串：
+   *   它的步骤是从规划器返回的 JSON 里解析出来的）。
+   * - 归责字段（`agentId` / `callerAgentId` / `businessIntent` / `sessionId` / `username` / `source`）
+   *   有意**不在此显式传**——由 `AuditService.log` 从 `actorContext` 填充，而子代理那层作用域自 ACT-1
+   *   起已继承父上下文。
+   */
+  private _agentStepExecutor(
+    conversationId: string,
+    providerName: string,
+    agentRunId: string,
+  ): ReadOnlyToolExecutor {
+    return async (toolName, args, userId) => {
+      const argsJson = JSON.stringify(args);
+      const bridge = this.toolExecution.isProxyTool(toolName);
+      const shouldAudit = await this._shouldAudit('tool');
+      try {
+        const result = await this.toolExecution.executeAgentRead(toolName, args, userId);
+        if (shouldAudit) {
+          // 放行快照只在**真正放行并成功执行**时写（与主链路成功分支同一条件）；失败行带非空
+          // authorization 会被 A-8 denied 视图与 blocked 聚合误判为越权（见 audit-authz-snapshot.spec.md）。
+          const authz = result.success
+            ? await this.authorizationExplainer.getAuthorizationReasons(
+                toolName,
+                userId,
+                false,
+                await this.toolGate.riskLevelFor(toolName),
+              )
+            : undefined;
+          await this.auditService.log(
+            buildToolCallAudit({
+              userId,
+              conversationId,
+              provider: providerName,
+              toolName,
+              argsJson,
+              bridge,
+              result,
+              authorization: authz ? buildAllowSnapshot(toolName, authz) : undefined,
+              parentActionId: agentRunId,
+            }),
+          );
+        }
+        return result;
+      } catch (err) {
+        // 拒绝路径同样留痕（与主链路 deny 分支同形）：只堵授权旁路而不留证，等于把越权尝试藏进
+        // 「工具执行失败」这句话里。
+        if (shouldAudit) {
+          const denied = err instanceof AuthorizationDeniedError;
+          await this.auditService.log(
+            buildToolCallAudit({
+              userId,
+              conversationId,
+              provider: providerName,
+              toolName,
+              argsJson,
+              bridge,
+              errorMessage: denied ? err.message : `Failed to execute tool "${toolName}"`,
+              authorization: denied ? JSON.stringify(err.reasons) : undefined,
+              deniedBy: denied ? err.reasons.map((c) => c.name) : undefined,
+              parentActionId: agentRunId,
+            }),
+          );
+        }
+        throw err;
+      }
+    };
+  }
+
+  /**
+   * §22.19 AU-2: a sub-agent proposing a tool outside its own set used to leave no trace at all —
+   * the orchestrator's guard returns before the executor is ever reached. This row is that trace.
+   *
+   * §22.19 AU-2：子代理提议调用它工具集之外的工具时，此前**完全不留痕**——编排器的守卫在触到执行器
+   * 之前就返回了。这一行就是那道痕迹。
+   */
+  private async _logAgentToolDenial(
+    conversationId: string,
+    providerName: string,
+    agentRunId: string,
+    denial: { toolName: string; argsJson: string; userId: string; reason: string },
+  ): Promise<void> {
+    if (!(await this._shouldAudit('tool'))) return;
+    await this.auditService.log(
+      buildToolCallAudit({
+        userId: denial.userId,
+        conversationId,
+        provider: providerName,
+        toolName: denial.toolName,
+        argsJson: denial.argsJson,
+        bridge: this.toolExecution.isProxyTool(denial.toolName),
+        errorMessage: denial.reason,
+        parentActionId: agentRunId,
+      }),
+    );
+  }
+
+  /**
+   * 委托一轮：分解 → 子代理顺序执行 → LLM 汇总 → 反思。
+   *
+   * 抽出来是为了**两条端点共用**。此前意图路由只存在于非流式 `chatImpl`，流式端点整段不分类 ⇒
+   * 一句话能不能触发委托取决于客户端走了哪条端点，于是两个前端各自揣了一份**服务端技能触发词的
+   * 副本**当绕行（Flutter 的 `_shouldDelegate`、控制台的 `shouldDelegate`）。既然路由进了流式端点，
+   * 那份副本两端一并删除 —— 触发词此后只此一处（`skills-registry.ts`）。
+   *
+   * 委托本身不流式（子代理是顺序的、每步一次 LLM），结果成形后由调用方一次性下发。
+   *
+   * §22.19 AU-2：一轮一个 `agentRunId`，该轮的工具行与对话级行共用它。
+   */
+  private async _runDelegation(params: {
+    userId: string;
+    conversationId: string;
+    request: ChatRequest;
+    provider: LlmProvider;
+    providerName: string;
+  }): Promise<{
+    /** 委托产出的最终回答（`delegated=false` 时为空串） */
+    content: string;
+    /** 分解 + 子代理多轮循环 + 汇总 + 反思的全部用量 */
+    usage?: LlmUsage;
+    /** `buildMessages`（含上下文压缩）那笔前置开销，由调用方并入整轮口径 */
+    preflightUsage?: LlmUsage;
+    agentRunId: string;
+    /** `false` = 分解失败或全部任务无效，**回退方式由调用方定**（非流式回退工具循环；流式接着走流） */
+    delegated: boolean;
+  }> {
+    const built = await this.buildMessages(
+      params.conversationId,
+      params.request.images,
+      params.request.systemPrompt,
+    );
+    const messages = built.messages;
+    const agentRunId = randomUUID();
+
+    const delegateResult = await this.subAgentOrchestrator.run({
+      messages,
+      userRequest: params.request.message,
+      provider: params.provider,
+      toolRegistry: this.toolRegistry,
+      userId: params.userId,
+      model: params.request.model ?? this.config.defaultModel,
+      // NC-3 只读门控：子代理经同一治理层执行（R5/策略/角色/adminOnly + 写工具拒绝）
+      readOnlyExecutor: this._agentStepExecutor(params.conversationId, params.providerName, agentRunId),
+      // §22.19 AU-2：子代理尝试调它工具集之外的工具时，那条越界信号也要留痕（此前静默）
+      onDenied: (denial) =>
+        this._logAgentToolDenial(params.conversationId, params.providerName, agentRunId, denial),
+    });
+
+    if (delegateResult.stepResults.length === 0) {
+      return {
+        content: '',
+        usage: delegateResult.usage,
+        preflightUsage: built.usage,
+        agentRunId,
+        delegated: false,
+      };
+    }
+
+    // 用 LLM 汇总子代理结果
+    const summary = await params.provider.generate({
+      messages: [
+        ...messages.slice(0, 1), // system prompt
+        { role: 'user', content: params.request.message },
+        {
+          role: 'assistant',
+          content: `以下是各子代理的执行结果：\n${delegateResult.content}\n请综合这些信息回答用户。`,
+        },
+      ],
+      model: params.request.model ?? this.config.defaultModel,
+    });
+
+    // Reflection：自我改进
+    const reflection = await this.reflectionAgent.reflect(
+      [...messages.slice(0, 1), { role: 'user', content: params.request.message }],
+      summary.content,
+      params.provider,
+      params.request.model ?? this.config.defaultModel,
+    );
+
+    // 整轮 = 任务分解 + 各子代理多轮循环 + 汇总 + 反思（此前只记了汇总那一次）
+    const usage = addLlmUsage(addLlmUsage(delegateResult.usage, summary.usage), reflection.usage);
+    return {
+      content: reflection.content,
+      usage,
+      preflightUsage: built.usage,
+      agentRunId,
+      delegated: true,
+    };
+  }
+
+  // ── 呈现/摘要（确认卡文案 / 影响预览 / 撤销档 / 结果截断）已拆至 ToolPresentationService（阶段 3 第八刀）──
+
+  // ── 工具对外面（清单 / 指纹 / MCP 出口 / 集成诊断）已拆至 ToolExposureService（阶段 3 第九刀）──
+
+  /**
+   * 非流式对话：发送消息，处理工具调用，返回完整回复
+   */
+  async chat(
+    userId: string,
+    request: ChatRequest,
+    /**
+     * Response language for executable refusal guidance. Optional so internal callers (eval,
+     * headless, trust sandbox) keep their current signature; the HTTP entry passes the request's
+     * Accept-Language. Defaults to English per the repo's English-first rule.
+     *
+     * 可执行拒绝指引的响应语言。可选，使评测 / headless / 信任沙盘等内部调用方保持原签名；
+     * HTTP 入口传入请求的 Accept-Language。按本仓「英文在前」的口径默认英文。
+     */
+    lang: DenialLanguage = 'en',
+  ): Promise<ChatResponse> {
+    const reserved = await this.enforceDailyLimit(userId);
+    try {
+      return await withSpan('ai.chat', async () => {
+        return this.chatImpl(userId, request, lang);
+      }, {
+        'ai.user_id': userId,
+        'ai.provider': request.provider,
+        'ai.model': request.model,
+      });
+    } catch (err) {
+      if (reserved) await this.usageQuota.releaseDailyUsage(userId).catch(() => {});
+      throw err;
+    }
+  }
+
+  /** N-6 统一内容安全：读 Settings 动态配置 + 命中审计 + 抛 AI_CONTENT_BLOCKED（缺省降级静态 check） */
+  private async _checkContentSafety(message: string, userId: string): Promise<void> {
+    const safety = this.contentSafety
+      ? await this.contentSafety.check(message, { userId })
+      : checkContentSafety(message);
+    if (safety.blocked) {
+      throw BusinessException.of('AI_CONTENT_BLOCKED', `内容安全检查未通过（${safety.reason}）`);
+    }
+  }
+
+  /**
+   * 即时确认窗口（秒）—— **单源**。run 聚合与逐条确认两处原本各读一次 Settings，
+   * 任一处口径变了窗口就会不一致；取不到（未注入 Settings）时退回 60s（与拆分前逐字一致）。
+   *
+   * The confirmation window in seconds, read in one place. The run aggregation and the per-tool
+   * confirmation path each used to read the setting for themselves.
+   */
+  private async _confirmationTtlSeconds(): Promise<number> {
+    if (!this.settingsService) return 60;
+    return Number(await this.settingsService.getWithDefault(SETTING_KEYS.CONFIRMATION_TTL, 60));
+  }
+
+  /**
+   * 解析本轮会话：给定 id 但会话已不存在（如服务重启清空内存）时自动新建；其余错误（越权等）**照抛不吞**。
+   * 无 id 时直接新建。
+   *
+   * Resolve the turn's conversation — the given id when it still exists, otherwise a fresh one.
+   * Only a missing conversation triggers the create; any other failure (e.g. forbidden) is rethrown.
+   */
+  private async _resolveConversation(
+    userId: string,
+    request: ChatRequest,
+    providerName: string,
+  ): Promise<string> {
+    const create = () =>
+      this.conversationService.createConversation(
+        userId,
+        providerName,
+        request.model ?? this.config.defaultModel,
+      );
+    if (!request.conversationId) return (await create()).id;
+    try {
+      await this.conversationService.getConversation(
+        request.conversationId,
+        userId,
+        this._abilityFor(userId),
+      );
+      return request.conversationId;
+    } catch (e) {
+      // CR-27：仅「会话不存在」时自动新建；越权（Forbidden）等错误放行，不吞
+      if (!(e instanceof NotFoundException)) throw e;
+      return (await create()).id;
+    }
+  }
+
+  /**
+   * 聚合本轮可并入 run 的「即时确认写工具」（docs/run-level-approval.spec.md §2）。
+   *
+   * 返回 `null` = 不构成 run（可聚合成员不足 2 条），调用方走逐条确认路径。
+   * **任何解析 / 注册异常都只是让该工具退出聚合**（留给逐条路径如实报错）—— 绝不因预扫描中断整条 SSE 流。
+   * R5、R4（异步审批）、已信任、无摘要、门控未过的成员一律不并入，各自走原路径。
+   *
+   * Collect the write tool calls that may be aggregated into a single run-level approval; `null` when
+   * fewer than two qualify. Every parse/registry failure just drops that tool from the aggregation.
+   */
+  /**
+   * HS-6「本轮不再询问」的**作用域键**（ACT-3）：批准哪一次，就免确认哪一次。
+   *
+   * 此前免确认只按 `toolName` 记忆（`Set<string>` 的名字集合），于是用户勾一次「不再询问」，
+   * 就把「批准 `create_task(customer=A)`」放大成「本轮整个 `create_task` 都放行」——Agent 之后
+   * 换客户 B、甚至换成语义完全不同的参数，仍旧免确认直接写。这与本仓公开写在治理链设计里的原则
+   * 「confirmation artifact 绑定**精确 args**」直接冲突。
+   *
+   * 键 = 工具名 + 规范化参数 + 目的地。参数用 `sortKeys` 归一（与副作用幂等键同一口径），
+   * 免得同一逻辑调用的两种写法算出两个键、把免确认意外作废。
+   *
+   * **审批要求的策略版本维度不在这里**：那属于执行点复查（roadmap §2.1.16 ACT-7），在本键里再实现
+   * 一遍就是同一保护两处实现（Code Economy §15.7）。
+   */
+  /**
+   * HS-6 作用域键：`工具 ⟂ 参数 ⟂ 目的地`。
+   *
+   * **CONF-1「有界变动」**：工具声明了界限的字段（治理策略 `boundedFields`）在键里写**界限**而不是**值**
+   * ——于是界限内的取值变动落进**同一个键**，「本轮不再询问」照旧放行；越界由执行点
+   * （`assertWithinDeclaredScope`）先拒，根本到不了这里。
+   *
+   * **未声明界限的工具，键的格式一字不变**（结构化 `{k, bound}` 形式只在该工具确有界限字段时才用），
+   * 故这一改对绝大多数工具是零行为变化。结构化条目也让「界限」与「真值」不可能互撞成同一个键
+   * ——否则一个取值恰好等于界限标记的参数就能骗过作用域。
+   */
+  private async _trustScopeKey(toolName: string, args: Record<string, unknown>): Promise<string> {
+    const destination = this.toolGate.destinationOf(toolName);
+    const bounds = await this.toolGate.boundedFieldsOf(toolName);
+    if (!Object.keys(bounds).some((k) => k in args)) {
+      return `${toolName}\u0000${JSON.stringify(sortKeys(args))}\u0000${destination}`;
+    }
+    const sorted = sortKeys(args) as Record<string, unknown>;
+    const canonical = Object.keys(sorted).map((k) =>
+      k in bounds ? { k, bound: bounds[k].max } : { k, v: sorted[k] },
+    );
+    return `${toolName}\u0000${JSON.stringify(canonical)}\u0000${destination}`;
+  }
+
+  private async _collectRunCandidates(
+    userId: string,
+    toolCalls: Array<{ index: number; name: string; args: string }>,
+    trustedScopes: Set<string>,
+  ): Promise<{
+    aggregable: Array<{ idx: number; name: string; parsed: Record<string, unknown>; summary: PresentationText; risk: string; audience: string }>;
+    runRisk: string;
+    ttlSeconds: number;
+  } | null> {
+    const ttlSeconds = await this._confirmationTtlSeconds();
+    const cands: Array<{
+      idx: number;
+      name: string;
+      parsed: Record<string, unknown>;
+      summary: PresentationText | null;
+      risk: string;
+      audience: string;
+    }> = [];
+    for (const tc of toolCalls) {
+      // 未注册工具（LLM 幻觉名 / 外部 mcp_* 工具，ExternalToolProvider 不入 ToolRegistry）会让
+      // _requiresConfirmation/_requiresApproval 经 ToolRegistry.getTool 抛 `Tool "x" not found`；
+      // 须与循环内逐条路径同样容错——否则异常逸出 chatStream 会中断整条 SSE 流（而非降级为该工具失败）
+      try {
+        if (!(await this.toolGate.requiresConfirmation(tc.name))) continue; // 读工具
+        if (await this.toolGate.requiresApproval(tc.name)) continue; // R4 异步审批不混入
+      } catch {
+        continue; // 注册/解析异常的工具留给逐条路径如实报错，不中断流
+      }
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = JSON.parse(tc.args);
+      } catch {
+        continue; // 解析失败留循环原样报错
+      }
+      // HS-6 免确认（ACT-3）：按**作用域键**判，故须先解析出参数才谈得上「这一次是否被批准过」
+      if (trustedScopes.has(await this._trustScopeKey(tc.name, parsed))) continue;
+      let risk = 'R3';
+      try {
+        risk = this.toolRegistry?.riskLevel(tc.name) ?? 'R3';
+      } catch {
+        /* registry 未含该工具 → 默认 R3 */
+      }
+      if (risk === 'R5') continue; // R5 留循环内逐条 block
+      // 评审 H2 修复：HS-2 门控在聚合前预检——禁用/角色白名单/未验证/策略禁用的成员不并入 run，
+      // 避免「run 先获授权、成员执行时才拒」的无效授权序（与逐条断言同 gate）
+      try {
+        await this.toolGate.assertToolAllowed(tc.name, userId);
+      } catch {
+        continue; // 留逐条路径由断言如实报错，不并入 run
+      }
+      cands.push({
+        idx: tc.index,
+        name: tc.name,
+        parsed,
+        summary: this.presentation.writeSummary(tc.name, parsed),
+        risk,
+        // AUTHZ-1：run 成员各自的目的地，在**签发时**取；批准后执行那一刻再解析一次并比对
+        //（run 的批准窗口同样可达 TTL，期间目的地可被改指）。
+        audience: this.toolGate.destinationOf(tc.name),
+      });
+    }
+    // 无具体摘要（writeSummary null）的动作降级单条即时确认，不并入 run（spec §3.3 诚实边界）
+    const aggregable = cands.filter((c): c is typeof c & { summary: PresentationText } => c.summary !== null);
+    if (aggregable.length < 2) return null;
+    // runRisk = 批内最高风险级（R3 run 成员通常恒 R3，max 保持通用）
+    // 键序取自权威表（R0→R5 升序声明）——本地硬编码副本会在新增/改名风险级时静默漂移，使 runRisk 取错
+    const RISK_ORDER = Object.keys(RISK_STRATEGY);
+    const runRisk = aggregable.reduce(
+      (max, c) => (RISK_ORDER.indexOf(c.risk) > RISK_ORDER.indexOf(max) ? c.risk : max),
+      'R0',
+    );
+    return { aggregable, runRisk, ttlSeconds };
+  }
+
+  /** chat 实际实现（被 chat 的业务 span 包装；拆分便于单独加 span 而不影响外部调用方） */
+  private async chatImpl(
+    userId: string,
+    request: ChatRequest,
+    lang: DenialLanguage = 'en',
+  ): Promise<ChatResponse> {
+    // N-6 AI-23 内容安全：敏感词/越狱/注入 → 拒绝（读 Settings 动态配置 + 命中审计）
+    await this._checkContentSafety(request.message, userId);
+    const { providerName, provider } = this.llmRouter.resolve(request.provider);
+
+    const conversationId = await this._resolveConversation(userId, request, providerName);
+
+    // Append user message
+    await this.conversationService.appendMessage(conversationId, {
+      role: 'user',
+      content: request.message,
+    });
+
+    // 意图路由（Router Agent）：分类用户意图
+    // Skill 短路：技能命中（且非写/导航请求）→ 直接委托子代理，零 LLM 成本
+    // ⚠ 这张表**故意**比 `WRITE_ACTION_VERBS` 少一个 `安排`：这里只问「要不要让开技能短路」，
+    // 而 `安排本周 / 周安排 / 周计划` 正是 `week-plan` 技能该接的活——加进去会把它短路掉。
+    const actionVerbs = ['创建', '新增', '添加', '删除', '编辑', '修改', '取消'];
+    const isActionRequest = actionVerbs.some((v) => request.message.includes(v));
+    const matchedSkill = !isActionRequest
+      ? this.subAgentOrchestrator.matchSkill(request.message)
+      : null;
+    const hasNav = !request.adminMode && this.detectNavigation(request.message) !== null;
+    // 分类命中关键词时不走 LLM（无用量）；走 LLM 时那次调用同样消耗 token，记下来并入整轮口径。
+    // 同一累加器也承载「上下文压缩」那笔前置开销（见各分支的 buildMessages 调用）。
+    let preflightUsage: LlmUsage | undefined;
+    let intent: Intent;
+    if (matchedSkill && !hasNav) {
+      intent = 'delegate';
+    } else {
+      const routed = await this.routerAgent.classify(
+        request.message,
+        provider,
+        request.model ?? this.config.defaultModel,
+      );
+      intent = routed.intent;
+      preflightUsage = routed.usage;
+    }
+
+    let finalContent: string;
+    let usage: LlmUsage | undefined;
+    let navigateTo: string | undefined;
+    let toolCalls: string[] | undefined;
+    // §22.19 AU-2: one handle per delegate/plan turn, shared by that turn's tool rows and its
+    // conversation-level row. Undefined for intents that run no agent steps.
+    //
+    // §22.19 AU-2：每次 delegate / plan 轮次一个句柄，该轮的工具行与对话级行共用它；
+    // 不跑 agent 步骤的意图不分配（保持 undefined）。
+    let agentRunId: string | undefined;
+
+    // 各分支只知道自己的那一段开销；分类与压缩这些前置开销在此统一并入后再记账
+    const turnTotal = (): LlmUsage | undefined => addLlmUsage(usage, preflightUsage);
+
+    if (intent === 'navigate') {
+      // 导航请求 — 关键词确定性识别（不做 LLM 判断），但**执行**经同一治理层（工具门控 + 工具行审计）
+      const navResult = await this._runDeterministicNavigation(
+        userId,
+        conversationId,
+        providerName,
+        request,
+      );
+      if (navResult) {
+        await this.conversationService.appendMessage(conversationId, {
+          role: 'assistant',
+          content: navResult.reply,
+        });
+        return {
+          conversationId,
+          reply: navResult.reply,
+          provider: providerName,
+          model: request.model ?? this.config.defaultModel,
+          navigateTo: navResult.route,
+        };
+      }
+    }
+
+    if (intent === 'knowledge') {
+      // 知识库问答 — RAG 检索增强
+      const built = await this.buildMessages(conversationId, request.images, request.systemPrompt);
+      preflightUsage = addLlmUsage(preflightUsage, built.usage);
+      const messages = built.messages;
+      const ragResult = await this.ragAgent.answer(
+        messages,
+        request.message,
+        provider,
+        request.model ?? this.config.defaultModel,
+        { userId, conversationId },
+      );
+
+      await this.conversationService.appendMessage(conversationId, {
+        role: 'assistant',
+        content: ragResult.content,
+      });
+
+      // 知识库问答同样消耗 LLM token：不记则与被修的流式同类，成本统计静默漏计
+      usage = ragResult.usage;
+      const knowledgeTotal = turnTotal();
+
+      // 审计日志（HS-9 粒度门控：conversation 级仅 all 时记录）
+      if (await this._shouldAudit('conversation')) {
+      // audit-fire-and-forget: 对话级元数据（非执行路径），不 await —— 理由见 roadmap §2.1.16 ACT-4 的边界
+        this.auditService.log({
+          userId,
+          conversationId,
+          action: 'knowledge',
+          provider: providerName,
+          model: request.model ?? this.config.defaultModel,
+          promptTokens: knowledgeTotal?.promptTokens,
+          completionTokens: knowledgeTotal?.completionTokens,
+        });
+      }
+      return {
+        conversationId,
+        reply: ragResult.content,
+        provider: providerName,
+        model: request.model ?? this.config.defaultModel,
+        usage: knowledgeTotal,
+      };
+    }
+
+    if (intent === 'delegate') {
+      // 子代理委托：分解 → 执行 → 汇总 → 反思。与流式端点共用同一条路径（见 _runDelegation）——
+      // 委托能力因此不再取决于客户端走哪条端点。
+      const delegation = await this._runDelegation({ userId, conversationId, request, provider, providerName });
+      agentRunId = delegation.agentRunId;
+      preflightUsage = addLlmUsage(preflightUsage, delegation.preflightUsage);
+      usage = delegation.usage;
+
+      if (delegation.delegated) {
+        finalContent = delegation.content;
+      } else {
+        // 委托失败（分解/全部任务无效）→ 回退标准工具循环
+        const fallbackResult = await this.runToolLoop({
+          provider,
+          providerName,
+          conversationId,
+          userId,
+          lang,
+          model: request.model ?? this.config.defaultModel,
+          initialToolDefs: await this.toolExposure.buildToolDefs(),
+          fallbackProviders: this.llmRouter.fallbackChain(providerName),
+          systemPrompt: request.systemPrompt,
+          images: request.images,
+        });
+        finalContent = fallbackResult.finalContent;
+        usage = fallbackResult.usage;
+        navigateTo = fallbackResult.navigateTo;
+        toolCalls = fallbackResult.toolCalls;
+      }
+    } else if (intent === 'analyze' || intent === 'plan') {
+      // Plan-and-Execute：多步推理
+      const built = await this.buildMessages(conversationId, request.images, request.systemPrompt);
+      preflightUsage = addLlmUsage(preflightUsage, built.usage);
+      const messages = built.messages;
+      agentRunId = randomUUID();
+      const planResult = await this.planExecuteAgent.planAndExecute(
+        messages,
+        provider,
+        this.toolRegistry,
+        userId,
+        request.model ?? this.config.defaultModel,
+        // NC-3 只读门控：plan 步骤经同一治理层执行，防 LLM 计划的写/禁用工具被直调
+        this._agentStepExecutor(conversationId, providerName, agentRunId),
+      );
+
+      if (planResult.stepResults.length > 0) {
+        // 用 LLM 汇总步骤结果
+        const summary = await provider.generate({
+          messages: [
+            ...messages.slice(0, 1), // system prompt
+            { role: 'user', content: request.message },
+            {
+              role: 'assistant',
+              content: `以下是数据查询结果：\n${planResult.content}\n请根据这些信息回答用户。`,
+            },
+          ],
+          model: request.model ?? this.config.defaultModel,
+        });
+        finalContent = summary.content;
+
+        // Reflection：自我改进
+        const reflection = await this.reflectionAgent.reflect(
+          [
+            ...messages.slice(0, 1),
+            { role: 'user', content: request.message },
+          ],
+          finalContent,
+          provider,
+          request.model ?? this.config.defaultModel,
+        );
+        finalContent = reflection.content;
+
+        // 整轮 = 规划 + 汇总 + 反思（此前只记了汇总那一次）
+        usage = addLlmUsage(planResult.usage, summary.usage);
+        usage = addLlmUsage(usage, reflection.usage);
+      } else {
+        // Plan failed, fallback to normal tool loop
+        const fallbackResult = await this.runToolLoop({
+          provider,
+          providerName,
+          conversationId,
+          userId,
+          lang,
+          model: request.model ?? this.config.defaultModel,
+          initialToolDefs: await this.toolExposure.buildToolDefs(),
+          fallbackProviders: this.llmRouter.fallbackChain(providerName),
+          systemPrompt: request.systemPrompt,
+          images: request.images,
+        });
+        finalContent = fallbackResult.finalContent;
+        usage = fallbackResult.usage;
+        navigateTo = fallbackResult.navigateTo;
+        toolCalls = fallbackResult.toolCalls;
+      }
+    } else {
+      // 默认：标准 Tool Loop
+      const toolResult = await this.runToolLoop({
+        provider,
+        providerName,
+        conversationId,
+        userId,
+        lang,
+        model: request.model ?? this.config.defaultModel,
+        initialToolDefs: await this.toolExposure.buildToolDefs(),
+        fallbackProviders: this.llmRouter.fallbackChain(providerName),
+        systemPrompt: request.systemPrompt,
+        images: request.images,
+      });
+      finalContent = toolResult.finalContent;
+      usage = toolResult.usage;
+      navigateTo = toolResult.navigateTo;
+      toolCalls = toolResult.toolCalls;
+    }
+
+    // Append assistant reply
+    await this.conversationService.appendMessage(conversationId, {
+      role: 'assistant',
+      content: finalContent,
+    });
+
+    // fire-and-forget：规则式抽取用户记忆，不阻塞对话
+    void this.memoryService
+      .extractFromTurn(userId, request.message, conversationId)
+      .catch(() => {});
+
+    const total = turnTotal();
+
+    // 审计日志（HS-9 粒度门控：conversation 级仅 all 时记录）
+    if (await this._shouldAudit('conversation')) {
+      // audit-fire-and-forget: 对话级元数据（非执行路径），不 await —— 理由见 roadmap §2.1.16 ACT-4 的边界
+      this.auditService.log({
+        userId,
+        conversationId,
+        action: intent === 'delegate' ? 'delegate' : intent === 'plan' ? 'plan' : intent === 'analyze' ? 'analyze' : 'chat',
+        provider: providerName,
+        model: request.model ?? this.config.defaultModel,
+        promptTokens: total?.promptTokens,
+        completionTokens: total?.completionTokens,
+        // §22.19 AU-2：本轮的工具行共用这个句柄，对话级行也带上它——整轮一次查询可取回
+        ...(agentRunId ? { parentActionId: agentRunId } : {}),
+      });
+    }
+    return {
+      conversationId,
+      reply: finalContent,
+      provider: providerName,
+      model: request.model ?? this.config.defaultModel,
+      usage: total,
+      navigateTo,
+      toolCalls,
+    };
+  }
+
+  /**
+   * 流式对话：逐块返回文本和工具调用事件
+   */
+  async *chatStream(
+    userId: string,
+    request: ChatRequest,
+    /** Same as `chat`: localization for executable refusal guidance; English when the caller has no request. */
+    lang: DenialLanguage = 'en',
+  ): AsyncIterable<StreamChunk> {
+    // RG-2.1：流式路径限额超限 → 转为 error chunk（不抛给迭代器）
+    let reserved = false;
+    try {
+      reserved = await this.enforceDailyLimit(userId);
+    } catch (err) {
+      yield { type: 'error', error: (err as Error).message };
+      return;
+    }
+    // 流式 span：外层手动 start/end，避免 async generator 语义问题
+    const span = tracer.startSpan('ai.chatStream', {
+      attributes: {
+        'ai.user_id': userId,
+        'ai.provider': request.provider,
+        'ai.model': request.model,
+      },
+    });
+    try {
+      yield* this.chatStreamImpl(userId, request, lang);
+      span.end();
+    } catch (err) {
+      // 对话失败释放预留槽（成功保留 = 计入当日用量）
+      if (reserved) await this.usageQuota.releaseDailyUsage(userId).catch(() => {});
+      span.recordException(err as Error);
+      span.setStatus({ code: SpanStatusCode.ERROR });
+      span.end();
+      throw err;
+    }
+  }
+
+  private async *chatStreamImpl(
+    userId: string,
+    request: ChatRequest,
+    lang: DenialLanguage = 'en',
+  ): AsyncIterable<StreamChunk> {
+    // N-6 AI-23 内容安全：敏感词/越狱/注入 → 拒绝（读 Settings 动态配置 + 命中审计）
+    await this._checkContentSafety(request.message, userId);
+    // HS-6：本轮内被用户信任的写工具（确认时勾选「不再询问」后加入）。
+    // 作用域 = 本次 chatStreamImpl 调用，随请求结束即失效——不跨轮次，也不是整个会话。
+    const trustedScopes = new Set<string>();
+    const { providerName, provider } = this.llmRouter.resolve(request.provider);
+    // CR-28：流式 Fallback 链（首个 chunk 前失败自动切下一个 provider）
+    const streamFallbackChain = this.llmRouter.fallbackChain(providerName);
+
+    const conversationId = await this._resolveConversation(userId, request, providerName);
+
+    // Append user message
+    await this.conversationService.appendMessage(conversationId, {
+      role: 'user',
+      content: request.message,
+    });
+
+    // 导航意图预检测 — 与 chat 同一条受治理路径（工具门控 + 工具行审计），不再直接返回 route 绕过循环
+    const navResult = await this._runDeterministicNavigation(
+      userId,
+      conversationId,
+      providerName,
+      request,
+    );
+    if (navResult) {
+      await this.conversationService.appendMessage(conversationId, {
+        role: 'assistant',
+        content: navResult.reply,
+      });
+      // 导航事件先于文本下发：流式客户端据此渲染「跳转」入口（与非流式 chat 的 navigateTo 对齐）
+      yield { type: 'navigate', route: navResult.route };
+      yield { type: 'text', content: navResult.reply };
+      yield { type: 'done', conversationId };
+      return;
+    }
+
+    // 技能短路：与非流式端点**同一判据、同一份触发词**（`skills-registry.ts`），确定性、零 LLM。
+    //
+    // 这段此前只存在于非流式端点，于是「一句话能不能委托」取决于客户端走了哪条端点 —— 两个前端
+    // 各自揣了一份触发词副本当绕行（谁漏掉一个词，谁就静默失去委托能力）。路由收进 Runtime 之后，
+    // 那两份副本一并删除：触发词只此一处，客户端不再猜（Runtime over Prompt）。
+    //
+    // 委托本身不流式（子代理顺序执行、每步一次 LLM），故结果成形后一次性下发；子代理的工具过程
+    // 不进 SSE 过程事件（与非流式委托一致），它们仍逐条落在审计里（`_agentStepExecutor`）。
+    const matchedSkill = this.subAgentOrchestrator.matchSkill(request.message);
+    if (matchedSkill) {
+      const delegation = await this._runDelegation({
+        userId,
+        conversationId,
+        request,
+        provider,
+        providerName,
+      });
+      if (delegation.delegated) {
+        await this.conversationService.appendMessage(conversationId, {
+          role: 'assistant',
+          content: delegation.content,
+        });
+        // HS-9 粒度门控：conversation 级仅 all 时记录。行形状与非流式端点的 delegate 行同源，
+        // 且带本轮句柄（§22.19 AU-2）—— 两条端点写出的行因此可按同一口径读。
+        if (await this._shouldAudit('conversation')) {
+          // 整轮口径 = 上下文压缩（`buildMessages`）+ 分解 + 子代理多轮 + 汇总 + 反思 —— 与非流式
+          // 那条 delegate 行同口径（`turnTotal()`）。只记 delegation.usage 会漏掉压缩那笔。
+          const turn = addLlmUsage(delegation.preflightUsage, delegation.usage);
+          // audit-fire-and-forget: 对话级元数据（非执行路径），不 await —— 理由见 roadmap §2.1.16 ACT-4 的边界
+          this.auditService.log({
+            userId,
+            conversationId,
+            action: 'delegate',
+            provider: providerName,
+            model: request.model ?? this.config.defaultModel,
+            promptTokens: turn?.promptTokens,
+            completionTokens: turn?.completionTokens,
+            parentActionId: delegation.agentRunId,
+          });
+        }
+        yield { type: 'text', content: delegation.content };
+        yield { type: 'done', conversationId };
+        return;
+      }
+      // 分解失败或全部任务无效 ⇒ 不把一句话变成失败：继续走常规流式工具循环
+    }
+
+    const builtMessages = await this.buildMessages(conversationId, request.images, request.systemPrompt);
+    let messages = builtMessages.messages;
+    const model = request.model ?? this.config.defaultModel;
+
+    // 整轮对话的 token 用量：上下文压缩 + 工具轮次每次 LLM 调用各带一份 usage，累加才是这轮的真实开销
+    // （审计的 chat 行每轮对话只写一次，故必须在此聚合，不能只取最后一轮）
+    let turnUsage: LlmUsage | undefined = builtMessages.usage;
+
+    for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+      const tools = await this.toolExposure.buildToolDefs();
+      const stream = this.llmRouter.streamWithProviderFallback({
+        chain: streamFallbackChain,
+        messages,
+        tools: tools.length > 0 ? tools : undefined,
+        model,
+      });
+
+      // 本轮 chunk 归并（阶段 3 第十一刀提出）：文本逐块转发、工具调用按 index 拼装、用量累加
+      const acc = new StreamAccumulator();
+      for await (const chunk of stream) {
+        const forward = acc.apply(chunk);
+        if (forward) yield forward;
+      }
+      // 本轮用量并入整轮（一轮对话可能有多次 LLM 调用）
+      turnUsage = addLlmUsage(turnUsage, acc.usage);
+
+      if (acc.streamError) {
+        // 流式失败（yield error 不抛 → 外层 chatStream catch 不触发）：显式释放 daily-limit 预留槽，
+        // 防零 token 失败对话计入当日用量、耗尽限额后误拦（对齐非流式 chat 失败释放语义）
+        await this.usageQuota.releaseDailyUsage(userId).catch(() => {});
+        await this.conversationService.appendMessage(conversationId, {
+          role: 'assistant',
+          content: `Error: ${acc.streamError}`,
+        });
+        yield { type: 'done', conversationId };
+        return;
+      }
+
+      if (!acc.hasToolCalls && acc.toolCalls().length === 0) {
+        // Pure text response — done
+        await this.conversationService.appendMessage(conversationId, {
+          role: 'assistant',
+          content: acc.fullText,
+        });
+        // CR-2：流式主完成审计——否则不进 ai_audit_logs，每日限额可被流式绕过
+        // HS-9 粒度门控：conversation 级仅 all 时记录
+        if (await this._shouldAudit('conversation')) {
+      // audit-fire-and-forget: 对话级元数据（非执行路径），不 await —— 理由见 roadmap §2.1.16 ACT-4 的边界
+          this.auditService.log({
+            userId,
+            conversationId,
+            action: 'chat',
+            provider: providerName,
+            model,
+            promptTokens: turnUsage?.promptTokens,
+            completionTokens: turnUsage?.completionTokens,
+          });
+        }
+        // fire-and-forget：规则式抽取用户记忆，不阻塞对话
+        void this.memoryService
+          .extractFromTurn(userId, request.message, conversationId)
+          .catch(() => {});
+        yield { type: 'done', conversationId };
+        return;
+      }
+
+      // 先 push 带 tool_calls 的 assistant 消息（API 要求：tool 消息必须跟在带 tool_calls 的 assistant 消息之后）
+      const toolCallsArray = acc.toolCalls().map((tc) => ({
+        id: tc.id,
+        name: tc.name,
+        arguments: tc.args,
+        index: tc.index,
+        }));
+
+      if (toolCallsArray.length > 0) {
+        messages.push({
+          role: 'assistant',
+          content: acc.fullText || '',
+          tool_calls: toolCallsArray,
+          ...(acc.reasoningText ? { reasoning_content: acc.reasoningText } : {}),
+        });
+      }
+
+      // KB-5 run-level approval：预扫描本轮需即时确认写工具，≥2 且均有具体摘要 → 聚成一个 run 一次授权
+      // （docs/run-level-approval.spec.md §2：R5/R4/trusted/无摘要均不并入，各自走原路径；run 决策先于逐条 decision）
+      let runState: { idxSet: Set<number>; outcome: 'approve' | 'decline' | 'timeout'; runId: string; audiences: Map<number, string> } | undefined;
+      {
+        // 聚合交给 `_collectRunCandidates`（分析段）；这里只留「创建 run → 下发确认 → 等决策」的编排。
+        // The aggregation is now `_collectRunCandidates`; this block keeps only the orchestration.
+        const collected = await this._collectRunCandidates(userId, acc.toolCalls(), trustedScopes);
+        if (collected) {
+          const { aggregable, runRisk, ttlSeconds } = collected;
+          const { token, decision } = await this.confirmationStore.createRun(
+            userId,
+            aggregable.map((c) => ({
+              toolName: c.name,
+              args: c.parsed,
+              summary: c.summary,
+              riskLevel: c.risk,
+            })),
+            runRisk,
+            ttlSeconds * 1000,
+            conversationId,
+          );
+          const runImpact = this.presentation.writeImpact(aggregable.map((c) => c.name));
+          yield {
+            type: 'confirmation_request',
+            confirmation: {
+              token,
+              mode: 'run',
+              ...(runImpact ? { impact: runImpact } : {}),
+              run: {
+                runId: token,
+                riskLevel: runRisk,
+                items: aggregable.map((c) => {
+                  const revokeClass = this.presentation.revokeClass(c.name);
+                  return {
+                    toolName: c.name,
+                    summary: c.summary!,
+                    riskLevel: c.risk,
+                    // §22.17 ④ v1.1：档位解析不到（外部 / 未注册名）则省略，不补默认
+                    ...(revokeClass ? { revokeClass } : {}),
+                  };
+                }),
+              },
+            },
+          };
+          const { outcome } = await decision;
+          const approved = outcome === 'approve';
+          // 保留完整 outcome（含 'timeout'）——成员逐条回放时不得把 run 超时塌缩成用户 decline（spec §2.4 沿用超时语义）
+          runState = {
+            idxSet: new Set(aggregable.map((c) => c.idx)),
+            outcome,
+            runId: token,
+            // AUTHZ-1：成员各自的目的地（签发时取值）——run 行本身不记 audience（成员在本次请求内执行），
+            // 故目的地绑定在这里按成员携带到执行点。
+            audiences: new Map(aggregable.map((c) => [c.idx, c.audience])),
+          };
+          // run 级整体决策关卡先于逐条 decision（spec §2.3）
+          yield {
+            type: 'confirmation_decision',
+            confirmationDecision: { mode: 'run', runId: token, decision: outcome, approved },
+          };
+          if (await this._shouldAudit('tool')) {
+            await this.auditService.log({
+              userId,
+              conversationId,
+              action: 'tool_confirmation',
+              detail: `run(${token}) ${aggregable.length} items → ${outcome}`,
+              // C-3：run 级裁决**覆盖多个工具** ⇒ 不写 tool（那一列答的是「本行属于哪一个工具」）
+              outcome: confirmationOutcome(outcome),
+              isError: !approved,
+              errorMessage: outcome === 'timeout' ? 'User did not respond in time' : outcome === 'decline' ? 'User declined the operation' : undefined,
+            });
+          }
+        }
+      }
+
+      // Execute accumulated tool calls
+      for (const tc of acc.toolCalls()) {
+        let started = false;
+        let pendingApproval = false; // R4 高影响动作（已提交审批）——通用 tool_call 审计不算失败
+        // 确认以「没有执行」收场：有人拒绝，或窗口到期无人裁决。两者都**不是失败** —— 一次都没跑。
+        // The confirmation ended without an execution: a person declined it, or the window closed with
+        // no decision. Neither is a failure — nothing ran.
+        let unconfirmed: 'declined' | 'timeout' | undefined;
+        try {
+          const parsed = JSON.parse(tc.args);
+          // HS-2 工具权限门控（featureFlag / requireVerifiedEmail）— 先于确认流程
+          await this.toolGate.assertToolAllowed(tc.name, userId);
+          const isWrite = await this.toolGate.requiresConfirmation(tc.name);
+          started = true;
+          // 工具过程可视化：执行前发 tool_start，前端渲染"执行中"卡片
+          // ADT（P0-14）：isWrite 让前端标注读/写，写操作需确认、可撤销
+          // W5-⑦ Explainable Authz：携带 riskLevel + authorization（为何允许/为何需确认）
+          const authz = await this.authorizationExplainer.getAuthorizationReasons(
+            tc.name,
+            userId,
+            isWrite,
+            await this.toolGate.riskLevelFor(tc.name),
+          );
+          yield {
+            type: 'tool_start',
+            toolStart: {
+              name: tc.name,
+              summary: isWrite
+                ? this.presentation.writeSummaryOrGeneric(tc.name, parsed)
+                : this.presentation.readSummary(tc.name),
+              arguments: parsed,
+              isWrite,
+              riskLevel: authz.riskLevel,
+              authorization: authz,
+            },
+          };
+
+          let result: ToolResult;
+          if (isWrite) {
+            // HS-6：本轮已信任**这一次调用**（作用域键含规范化参数 + 目的地）→ 免确认直接执行
+            //（统一段会 push 消息 + 审计）。换参数即换键 ⇒ 回到下面的确认路径。
+            if (trustedScopes.has(await this._trustScopeKey(tc.name, parsed))) {
+              result = await this.toolExecution.executeWrite(tc.name, parsed, userId, conversationId);
+            } else if (await this.toolGate.requiresApproval(tc.name)) {
+              // R4 双人审批：高影响动作需第二人（approver）审批——创建持久化审批请求，不阻塞 operator 对话
+              // §internal.15(4)：审批档由策略档位（mode=approval）或声明风险级 R4 决定——管理员可在策略中心把 R3 工具升档为审批
+              // CONF-3：文案只生成一次——同一份既下发给客户端，也参与行上的渲染哈希。
+              const approvalSummary = this.presentation.writeSummaryOrGeneric(tc.name, parsed);
+              const approval = await this.r4Approval.createR4ApprovalRequest(
+                userId,
+                tc.name,
+                parsed,
+                conversationId,
+                this.toolGate.destinationOf(tc.name),
+                approvalSummary,
+              );
+              const approvalImpact = this.presentation.writeImpact([tc.name]);
+              const approvalRevokeClass = this.presentation.revokeClass(tc.name);
+              yield {
+                type: 'confirmation_request',
+                confirmation: {
+                  token: approval.token,
+                  toolName: tc.name,
+                  summary: approvalSummary,
+                  arguments: parsed,
+                  mode: 'approval',
+                  ...(approvalImpact ? { impact: approvalImpact } : {}),
+                  ...(approvalRevokeClass ? { revokeClass: approvalRevokeClass } : {}),
+                  authorization: await this.authorizationExplainer.getAuthorizationReasons(
+                    tc.name,
+                    userId,
+                    true,
+                    await this.toolGate.riskLevelFor(tc.name),
+                  ),
+                },
+              };
+              result = { success: false, error: '已提交人工审批，等待审批人决策（R4 高影响动作）' };
+              pendingApproval = true;
+              if (await this._shouldAudit('tool')) {
+                await this.auditService.log({
+                  userId,
+                  conversationId,
+                  action: 'tool_confirmation',
+                  detail: `${tc.name}(${JSON.stringify(parsed)}) → pending_approval`,
+              outcome: 'pending',
+              tool: tc.name,
+                });
+              }
+            } else {
+              // 写操作：先发 confirmation_request，等待用户确认后才执行
+              // KB-5：本工具若是已聚合成 run 的成员（idx ∈ runState.idxSet）→ run 已一次授权/拒绝，
+              // 不再重复发单条 confirmation_request、不再 await——直接用 run 结果进入下方 approve/decline 公共逻辑
+              // （spec §2.5：approve 整批逐条执行、decline 整批跳过；run 级 decision 关卡已由预扫描先行发出）
+              let outcome: 'approve' | 'decline' | 'timeout';
+              let trustTool: boolean | undefined;
+              // AUTHZ-1：本条 artifact 被批准写往的目的地。run 成员取签发时记下的那份，
+              // 单条取签发时的解析结果——两者都要在**执行点**再解析一次并比对。
+              let confirmationAudience: string | undefined;
+              // REV-7：这次执行**依据的那次授权**的 token。run 成员的授权就是 run 本身（token = runId，
+              // 见 run-level-approval.spec §2.3），单条确认的是它自己那张 token —— 两条路径因此都指得回
+              // 那次决定，占位行的 `authorization_ref` 也就答得出「这次写在不在它授权的窗口内」。
+              let confirmationToken: string | undefined;
+              if (runState?.idxSet.has(tc.index)) {
+                outcome = runState.outcome; // approve / decline / timeout（超时如实回放，不塌缩）
+                confirmationAudience = runState.audiences.get(tc.index);
+                confirmationToken = runState.runId;
+              } else {
+                const ttlSeconds = await this._confirmationTtlSeconds();
+                confirmationAudience = this.toolGate.destinationOf(tc.name);
+                // CONF-3：文案只生成一次——同一份既随 confirmation_request 下发，也参与行上的渲染哈希。
+                const singleSummary = this.presentation.writeSummaryOrGeneric(tc.name, parsed);
+                const { token, decision } = await this.confirmationStore.create(
+                  userId,
+                  tc.name,
+                  parsed,
+                  ttlSeconds * 1000,
+                  conversationId,
+                  confirmationAudience,
+                  singleSummary,
+                );
+                confirmationToken = token;
+                const singleImpact = this.presentation.writeImpact([tc.name]);
+                const singleRevokeClass = this.presentation.revokeClass(tc.name);
+                yield {
+                  type: 'confirmation_request',
+                  confirmation: {
+                    token,
+                    toolName: tc.name,
+                    summary: singleSummary,
+                    arguments: parsed,
+                    // §22.17 ④ 影响预览：确认前告知将动到几个动作、哪类对象
+                    ...(singleImpact ? { impact: singleImpact } : {}),
+                    // §22.17 ④ 影响预览 v1.1：撤销口径——批准前告知这批动作事后能不能撤回
+                    ...(singleRevokeClass ? { revokeClass: singleRevokeClass } : {}),
+                    // W5-⑦ Explainable Authz：让用户理解「为何此操作需确认」（风险级/策略/检查清单）
+                    authorization: await this.authorizationExplainer.getAuthorizationReasons(
+                      tc.name,
+                      userId,
+                      true,
+                      await this.toolGate.riskLevelFor(tc.name),
+                    ),
+                  },
+                };
+                ({ outcome, trustTool } = await decision);
+              }
+              // HS-6：用户勾选「不再询问」→ 后续免确认（仅本轮，且**仅这一次调用**，见 _trustScopeKey）
+            if (trustTool && outcome === 'approve') {
+              trustedScopes.add(await this._trustScopeKey(tc.name, parsed));
+            }
+            // HS-7 确认决策审计：让管理台时间线能展示「AI 请求写操作 → 用户确认/拒绝」
+            // HS-9 粒度门控：tool 级在 off 时不记录
+            //
+            // ACT-4：**必须 await**。这一行是执行路径上的决策记录，与紧随其后的副作用登记是同一件事的
+            // 两半；fire-and-forget 会让「effect 已提交、审计未写」在进程崩在中间时可达 —— 业务动作
+            // 发生了、治理账上没有，正好击中本产品要回答的那个问题。对话/知识类元数据行不在此列（可维持异步）。
+            if (await this._shouldAudit('tool')) {
+              await this.auditService.log({
+                userId,
+                conversationId,
+                action: 'tool_confirmation',
+                detail: `${tc.name}(${JSON.stringify(parsed)}) → ${outcome}${trustTool ? ' (trusted)' : ''}`,
+                outcome: confirmationOutcome(outcome),
+                tool: tc.name,
+                isError: outcome !== 'approve',
+                errorMessage: outcome === 'timeout' ? 'User did not respond in time' : outcome === 'decline' ? 'User declined the operation' : undefined,
+              });
+            }
+            if (outcome === 'approve') {
+              // §4 G1：run 成员执行的副作用挂 runId（供 run 级批量撤销精确圈定）
+              const execRunId = runState?.idxSet.has(tc.index) ? runState.runId : undefined;
+              result = await this.toolExecution.executeWrite(
+                tc.name,
+                parsed,
+                userId,
+                conversationId,
+                execRunId,
+                {
+                  ...(confirmationAudience ? { audience: confirmationAudience } : {}),
+                  // REV-7：把这次决定的 token 落进占位行（见上面 `confirmationToken` 的来源）。
+                  authorizationRef: confirmationToken,
+                },
+              );
+              yield {
+                type: 'confirmation_decision',
+                confirmationDecision: {
+                  toolName: tc.name,
+                  decision: 'approve',
+                  approved: true,
+                  success: result.success,
+                  resultId: (result.data as any)?.id,
+                  error: result.error,
+                },
+              };
+              yield {
+                type: 'tool_end',
+                toolEnd: {
+                  name: tc.name,
+                  success: result.success,
+                  summary: this.presentation.resultSummary(tc.name, result),
+                  error: result.error,
+                },
+              };
+            } else {
+              // 没跑就是没跑：把「没有执行」这一事实交给审计行的词表，而不是让它冒充「失败」。
+              // Nothing ran, so say so: hand the "never executed" fact to the row's vocabulary instead
+              // of letting it pass for a failure.
+              unconfirmed = outcome === 'timeout' ? 'timeout' : 'declined';
+              result = {
+                success: false,
+                error:
+                  outcome === 'timeout'
+                    ? 'User did not respond in time'
+                    : 'User declined the operation',
+              };
+              // Trust-grade errors：超时也带「为什么 + 怎么解决」，与 403 / 策略拒绝共用
+              // `explanation` 形状。decline 是用户明确选择，不附指引。
+              //
+              // A timeout carries the same `explanation` shape as a 403 / policy refusal. A decline is
+              // an explicit user choice, so it gets no guidance.
+              const timeoutExplanation =
+                outcome === 'timeout'
+                  ? buildDenialExplanation(
+                      'confirmation_timeout',
+                      {
+                        tool: tc.name,
+                        ttlSeconds: await this._confirmationTtlSeconds(),
+                        offlineTtlHours: Math.max(
+                          1,
+                          Math.round((await this.confirmationStore.offlineTtlMs()) / 3_600_000),
+                        ),
+                      },
+                      lang,
+                    )
+                  : undefined;
+              yield {
+                type: 'confirmation_decision',
+                confirmationDecision: { toolName: tc.name, decision: outcome, approved: false },
+              };
+              yield {
+                type: 'tool_end',
+                toolEnd: {
+                  name: tc.name,
+                  success: false,
+                  summary:
+                    outcome === 'timeout'
+                      ? { key: 'ai.present.result.timeout', fallback: 'Timed out without a decision' }
+                      : { key: 'ai.present.result.cancelled', fallback: 'Cancelled' },
+                  ...(timeoutExplanation ? { explanation: timeoutExplanation } : {}),
+                },
+              };
+            }
+            }
+          } else {
+            result = await this.toolExecution.executeRead(tc.name, parsed, userId);
+            yield {
+              type: 'tool_end',
+              toolEnd: {
+                name: tc.name,
+                success: result.success,
+                summary: this.presentation.resultSummary(tc.name, result),
+                error: result.error,
+              },
+            };
+          }
+          messages.push({
+            role: 'tool',
+            content: this.presentation.truncateToolResult(result),
+            tool_call_id: tc.id,
+          });
+          // CR-2：流式工具执行审计（对齐非流式 runToolLoop）——行形状见 buildToolCallAudit
+          // HS-9 粒度门控：tool 级在 off 时不记录
+          // ACT-4：**必须 await**（理由同上一条决策审计）——这一行与副作用登记同为执行路径的一半，
+          // 不可 fire-and-forget，否则「工具已执行、审计未写」在崩溃窗口下可达。
+          if (await this._shouldAudit('tool')) {
+            const auditRow = await this.auditService.log(
+              buildToolCallAudit({
+                userId,
+                conversationId,
+                provider: providerName,
+                toolName: tc.name,
+                argsJson: tc.args,
+                bridge: this.toolExecution.isProxyTool(tc.name),
+                result,
+                // R4 待批不算失败（与下一分支的 errorMessage 同源）
+                pendingApproval,
+                // 「没有执行」的两种收场各有一个词：有人拒绝写 `declined`，窗口到期无人裁决写
+                // `not_executed`（契约 v1.15.0 才有的值）—— 见 tool-call-audit 的 `unconfirmed`。
+                // The two ways a call ends without running each have a word: a decline writes
+                // `declined`, a window that closed with no decision writes `not_executed` (a value the
+                // contract only gained in v1.15.0) — see `unconfirmed` in tool-call-audit.
+                unconfirmed,
+                // §internal.16 A-5 事件时点放行授权依据快照：**这道门放行了它**的行都写 —— 执行成功的、
+                // 被扣下等人的、以及**没发生的**（拒绝/超时）。这三种行回答的是同一个问题：「凭什么允许
+                // 它走到这一步」。只有被门拒绝的行不写（它们带的是 deny reasons），A-8 亦已按**形状**
+                // 判别（数组 = 拒绝理由 / 对象 = 放行快照），见 docs/audit-authz-snapshot.spec.md §5.6。
+                // §internal.17③ Policy Evidence：快照携带授权时点策略内容指纹（policy.revision），供「决策可复现」校验
+                authorization:
+                  result.success || pendingApproval || unconfirmed
+                    ? buildAllowSnapshot(tc.name, authz)
+                    : undefined,
+              }),
+            );
+            // ACT-5（消费者①）：**执行过**的这一支才挂链 —— 未执行的（deny / 待批）没有占位行可挂。
+            // 证据根据此把 effect 配到**它自己**那条触发行（ACT-2 的精确支路）。
+            if (result.success) {
+              await this.toolEffectsService?.attachAuditRow(
+                { userId, conversationId, toolName: tc.name, argsJson: tc.args },
+                auditRow.id,
+              );
+            }
+          }
+        } catch (err) {
+          // 已发出 tool_start 则补发失败的 tool_end，避免前端悬空"执行中"卡片。
+          // Trust-grade errors：**授权拒绝即使发生在 tool_start 之前**（策略 / R5 在门控段就拒）
+          // 也要发一条 tool_end —— 否则响应体里只有模型转述，客户端拿不到「为什么 + 怎么解决」。
+          //
+          // Close a dangling "executing" card when tool_start was emitted. Trust-grade errors also emit
+          // a tool_end when the refusal happened **before** tool_start (policy / R5 are decided in the
+          // gate): otherwise the response body carries only the model's paraphrase, and a client cannot
+          // read the why + next step.
+          const denied =
+            err instanceof AuthorizationDeniedError
+              ? { reason: err.message, checks: err.reasons }
+              : undefined;
+          const explanation =
+            err instanceof AuthorizationDeniedError && err.denial
+              ? buildDenialExplanation(err.denial.kind, err.denial.params, lang)
+              : undefined;
+          if (started || denied) {
+            yield {
+              type: 'tool_end',
+              toolEnd: {
+                name: tc.name,
+                success: false,
+                summary: denied
+                  ? { key: 'ai.present.result.denied', fallback: 'Blocked by policy' }
+                  : { key: 'ai.present.result.error', fallback: 'The tool failed' },
+                error: denied ? denied.reason : 'Tool execution failed',
+                authorizationDenied: denied,
+                // The shared 403 shape: why + how to solve, machine-readable + localized.
+                ...(explanation ? { explanation } : {}),
+              },
+            };
+          }
+          // If the tool call couldn't be fully reconstructed or executed,
+          // add an error result
+          const deniedMsg =
+            err instanceof AuthorizationDeniedError
+              ? err.message
+              : 'Tool execution failed';
+          messages.push({
+            role: 'tool',
+            content: JSON.stringify({ success: false, error: deniedMsg }),
+            tool_call_id: tc.id,
+          });
+          // CR-2：流式工具执行失败审计（T5 跨入口一致：deny 与两路成功分支同标 bridge）
+          // HS-9 粒度门控：tool 级在 off 时不记录；W5-⑦ Explainable Authz：拒绝时记录真实原因
+          if (await this._shouldAudit('tool')) {
+            await this.auditService.log(
+              buildToolCallAudit({
+                userId,
+                conversationId,
+                provider: providerName,
+                toolName: tc.name,
+                argsJson: tc.args,
+                bridge: this.toolExecution.isProxyTool(tc.name),
+                errorMessage: deniedMsg,
+                authorization: err instanceof AuthorizationDeniedError ? JSON.stringify(err.reasons) : undefined,
+                deniedBy: err instanceof AuthorizationDeniedError ? err.reasons.map((c) => c.name) : undefined,
+              }),
+            );
+          }
+        }
+      }
+
+      // If we have text but no tool calls, add it as an assistant message
+      if (!acc.hasToolCalls && acc.fullText) {
+        messages.push({ role: 'assistant', content: acc.fullText });
+      }
+
+      // Continue to next round
+    }
+
+    // Exceeded max tool rounds
+    await this.conversationService.appendMessage(conversationId, {
+      role: 'assistant',
+      content: 'I apologize, but I was unable to complete the requested operation within the allowed number of steps.',
+    });
+    // CR-2：流式超轮次也记审计（isError），避免漏计数
+    // HS-9 粒度门控：conversation 级仅 all 时记录
+    if (await this._shouldAudit('conversation')) {
+      // audit-fire-and-forget: 对话级元数据（非执行路径），不 await —— 理由见 roadmap §2.1.16 ACT-4 的边界
+      this.auditService.log({
+        userId,
+        conversationId,
+        action: 'chat',
+        provider: providerName,
+        model,
+        promptTokens: turnUsage?.promptTokens,
+        completionTokens: turnUsage?.completionTokens,
+        isError: true,
+        errorMessage: 'Exceeded max tool rounds',
+      });
+    }
+    void this.memoryService
+      .extractFromTurn(userId, request.message, conversationId)
+      .catch(() => {});
+    // CR-29：流式超限的道歉文案此前只入库不 yield，客户端只见 done；补 text 事件
+    yield {
+      type: 'text',
+      content:
+        'I apologize, but I was unable to complete the requested operation within the allowed number of steps.',
+    };
+    yield { type: 'done', conversationId };
+  }
+
+  /**
+   * 获取带 Fallback 的 Provider
+   */
+  /**
+   * 工具调用循环（非流式）
+   */
+  private async runToolLoop(params: {
+    provider: LlmProvider;
+    providerName: string;
+    conversationId: string;
+    userId: string;
+    model: string;
+    initialToolDefs: any[];
+    fallbackProviders: string[];
+    images?: string[];
+    systemPrompt?: string;
+    /** Response language for executable refusal guidance (see `chat`). */
+    lang?: DenialLanguage;
+  }): Promise<{ finalContent: string; usage?: { promptTokens: number; completionTokens: number }; navigateTo?: string; toolCalls?: string[] }> {
+    const builtMessages = await this.buildMessages(params.conversationId, params.images, params.systemPrompt);
+    let messages = builtMessages.messages;
+    let currentProvider = params.provider;
+    let currentProviderName = params.providerName;
+    // 压缩那笔前置开销随之起算；工具各轮在此之上累加
+    let usage: LlmUsage | undefined = builtMessages.usage;
+    let navigateTo: string | undefined;
+    const toolCalls: string[] = [];
+
+    for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+      const tools = params.initialToolDefs;
+
+      let result: GenerateResult;
+      try {
+        result = await currentProvider.generate({
+          messages,
+          tools: tools.length > 0 ? tools : undefined,
+          model: params.model,
+        });
+      } catch (err) {
+        console.error(
+          `[AiService] Provider "${currentProviderName}" failed:`, // codeql[js/tainted-format-string] 固定前缀模板，消息作参数不被解释为格式串
+          (err as Error).message,
+        );
+        // Try fallback
+        const fallbackResult = await this.llmRouter.tryFallback(
+          params.fallbackProviders,
+          params.model,
+          { messages, tools: tools.length > 0 ? tools : undefined },
+        );
+        if (!fallbackResult) {
+          // NC-2：全 provider 失败 → 可执行码（CR-5 细节只进日志）
+          console.warn(`[AiService] All providers failed after ${round + 1} attempts: ${(err as Error).message}`);
+          throw BusinessException.of('LLM_UNAVAILABLE');
+        }
+        result = fallbackResult.result;
+        // CR-28：后续轮次用「实际成功」的 provider，而非回退链首（可能也是失败的）
+        currentProvider = this.llmRouter.provider(fallbackResult.providerName);
+        currentProviderName = fallbackResult.providerName;
+      }
+
+      // 整轮对话口径：多轮工具调用时每轮都是一次真实 LLM 调用，只留最后一轮会漏掉前面的开销
+      usage = addLlmUsage(usage, result.usage);
+
+      if (!result.toolCalls || result.toolCalls.length === 0) {
+        // No more tool calls — done
+        messages.push({ role: 'assistant', content: result.content });
+        return { finalContent: result.content, usage, navigateTo, toolCalls };
+      }
+
+      // Execute tool calls
+      const assistantMsg: ChatMessage = {
+        role: 'assistant',
+        content: result.content || '',
+      };
+      if (result.toolCalls.length > 0) {
+        assistantMsg.tool_calls = result.toolCalls;
+      }
+      messages.push(assistantMsg);
+
+      for (const tc of result.toolCalls) {
+        toolCalls.push(tc.name);
+        try {
+          const args = JSON.parse(tc.arguments);
+          // HS-2 工具权限门控（featureFlag / requireVerifiedEmail）
+          await this.toolGate.assertToolAllowed(tc.name, params.userId);
+          // 非流式路径无确认通道：写操作不自动执行，返回提示让 LLM 引导用户走流式
+          const resolvedResult = (await this.toolGate.requiresConfirmation(tc.name))
+            ? {
+                success: false,
+                error:
+                  'Write operations require confirmation; please use streaming chat.',
+              }
+            : await this.toolExecution.executeRead(tc.name, args, params.userId);
+
+          // 检测导航请求 — 工具返回 navigateTo 时记录
+          if (resolvedResult.success && resolvedResult.data && (resolvedResult.data as any).navigateTo) {
+            navigateTo = (resolvedResult.data as any).navigateTo;
+          }
+
+          // 审计日志：工具调用（HS-9 粒度门控：tool 级在 off 时不记录）
+          if (await this._shouldAudit('tool')) {
+            // §internal.16 A-5 事件时点放行授权依据快照：对齐流式路径（对象格式 parseChecks 不误判为拒绝）。
+            // 本路径没有「被扣下等人」这一档（写工具直接拒、返回「请用流式」），故只写成功执行的行；
+            // 失败行带非空 authorization 会被 A-8 denied 视图与 blocked 聚合误判为越权/阻断
+            const authz = resolvedResult.success
+              ? await this.authorizationExplainer.getAuthorizationReasons(
+                  tc.name,
+                  params.userId,
+                  await this.toolGate.requiresConfirmation(tc.name),
+                  await this.toolGate.riskLevelFor(tc.name),
+                )
+              : null;
+            const auditRow = await this.auditService.log(
+              buildToolCallAudit({
+                userId: params.userId,
+                conversationId: params.conversationId,
+                provider: currentProviderName,
+                toolName: tc.name,
+                argsJson: tc.arguments,
+                bridge: this.toolExecution.isProxyTool(tc.name),
+                result: resolvedResult,
+                authorization: authz ? buildAllowSnapshot(tc.name, authz) : undefined,
+              }),
+            );
+            // ACT-5（消费者①）：执行过的这一支才挂链（同流式路径）—— 证据根配到 effect 自己的触发行。
+            if (resolvedResult.success) {
+              await this.toolEffectsService?.attachAuditRow(
+                {
+                  userId: params.userId,
+                  conversationId: params.conversationId,
+                  toolName: tc.name,
+                  argsJson: tc.arguments,
+                },
+                auditRow.id,
+              );
+            }
+          }
+
+          messages.push({
+            role: 'tool',
+            content: this.presentation.truncateToolResult(resolvedResult),
+            tool_call_id: tc.id,
+          });
+        } catch (err) {
+          // W5-⑦：非流式路径也透传结构化拒绝原因（此前只流式透传），让模型看到「为何阻止」。
+          // Trust-grade errors：同一份 `explanation` 也交给模型，使最终回答能说出「为什么 + 怎么解决」。
+          //
+          // W5-⑦: the non-stream path passes structured deny reasons to the model. Trust-grade errors
+          // also hand it the shared `explanation`, so the final reply can state why + the next step.
+          const denied = err instanceof AuthorizationDeniedError;
+          const deniedMsg = denied ? err.message : `Failed to execute tool "${tc.name}"`;
+          const explanation =
+            denied && err.denial
+              ? buildDenialExplanation(err.denial.kind, err.denial.params, params.lang ?? 'en')
+              : undefined;
+          messages.push({
+            role: 'tool',
+            content: JSON.stringify({
+              success: false,
+              error: deniedMsg,
+              ...(denied ? { reasons: err.reasons } : {}),
+              ...(explanation ? { explanation } : {}),
+            }),
+            tool_call_id: tc.id,
+          });
+          // W5-⑦ Explainable Authz 落库：拒绝路径补审计 + reasons（决策轨迹展示「为何阻止」）
+          // T5 跨入口一致：B 路径 proxy 工具 deny 也标 bridge（与流式 deny、两路成功分支同形）
+          if (await this._shouldAudit('tool')) {
+            await this.auditService.log(
+              buildToolCallAudit({
+                userId: params.userId,
+                conversationId: params.conversationId,
+                provider: currentProviderName,
+                toolName: tc.name,
+                argsJson: tc.arguments,
+                bridge: this.toolExecution.isProxyTool(tc.name),
+                errorMessage: deniedMsg,
+                authorization: denied ? JSON.stringify(err.reasons) : undefined,
+                deniedBy: denied ? err.reasons.map((c) => c.name) : undefined,
+              }),
+            );
+          }
+        }
+      }
+
+      // Continue loop for next round
+    }
+
+    throw new Error(
+      `Exceeded maximum tool call rounds (${MAX_TOOL_ROUNDS})`,
+    );
+  }
+
+  /**
+   * Fallback：按顺序尝试备用 Provider
+   */
+  /**
+   * 构建发送给 LLM 的消息列表
+   * @param images 当前请求待附加的图片 URL（AI-12 多模态，仅本次请求，不落库）
+   * @param overrideSystemPrompt System AI Assistant 专用：覆盖默认 system prompt（缺省走 Settings/默认）
+   */
+  private async buildMessages(
+    conversationId: string,
+    images?: string[],
+    overrideSystemPrompt?: string,
+  ): Promise<{ messages: ChatMessage[]; usage?: LlmUsage }> {
+    const conv = await this.conversationService.peekConversation(conversationId);
+    // 上下文压缩：超阈值时把旧轮次折叠进摘要，回放「摘要 + 最近窗口」
+    // 压缩本身要花一次 LLM 调用 → 用量随消息一起交回，由调用方并入本轮口径
+    const compaction = this.compactor
+      ? await this.compactor.ensureCompacted(conv)
+      : { conversation: conv };
+    const effectiveConv = compaction.conversation;
+
+    // AI-17 提示词管理：Settings 里 ai_system_prompt 覆盖默认（热生效，管理台可编辑）
+    // 管理员系统助手用固定 ADMIN_SYSTEM_PROMPT（绕过 ai_system_prompt，by design）
+    const systemPrompt =
+      overrideSystemPrompt ??
+      (this.settingsService
+        ? String(await this.settingsService.getWithDefault('ai_system_prompt', this.config.systemPrompt))
+        : this.config.systemPrompt);
+
+    const messages: ChatMessage[] = [
+      { role: 'system', content: systemPrompt },
+    ];
+
+    // 注入用户长期记忆（第二条 system 消息，作为参考上下文）
+    // HS-8：记忆内容注入前掩码敏感字段 + 系统边界标注 + 丢弃疑似注入条
+    const memories = await this.memoryService.getForUser(effectiveConv.userId, 8);
+    const sanitizedMemories = memories
+      .map((m) => {
+        const clean = sanitizeMemoryEntry(m.content);
+        return clean ? { ...m, content: clean } : null;
+      })
+      .filter((m): m is NonNullable<typeof m> => m !== null);
+    if (sanitizedMemories.length > 0) {
+      messages.push({
+        role: 'system',
+        content:
+          markSystemBoundary('memory', sanitizedMemories.map((m) => `- ${m.content}`).join('\n')),
+      });
+      // fire-and-forget：记录使用时间以提升相关度排序
+      void this.memoryService
+        .markUsed(
+          effectiveConv.userId,
+          sanitizedMemories.map((m) => m.content),
+        )
+        .catch(() => {});
+    }
+
+    // 对话前文摘要（第三条 system 消息）
+    // HS-8：摘要也走掩码 + 边界标注
+    if (effectiveConv.summary) {
+      messages.push({
+        role: 'system',
+        content: markSystemBoundary(
+          'summary',
+          sanitizeExternalContent(effectiveConv.summary),
+        ),
+      });
+    }
+
+    for (const msg of effectiveConv.messages) {
+      const chatMsg: ChatMessage = {
+        role: msg.role as ChatMessage['role'],
+        content: msg.content,
+      };
+      if (msg.toolCallId) {
+        chatMsg.tool_call_id = msg.toolCallId;
+      }
+      messages.push(chatMsg);
+    }
+
+    // AI-12 多模态：把本次请求待附加的图片挂到最后一条 user 消息（不落库）
+    if (images && images.length > 0) {
+      for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i].role === 'user') {
+          messages[i].images = images;
+          break;
+        }
+      }
+    }
+
+    return { messages, usage: compaction.usage };
+  }
+
+  /**
+   * 导航意图检测（确定性，零 LLM）
+   *
+   * 关键词命中即认定导航请求，在调用 LLM 之前拦截。**本方法只做识别**：返回页面键，
+   * route 与文案由 `PAGE_ROUTES`（`tools/navigate-page.tool.ts`）派生——该表是页面路由的唯一真源，
+   * 本方法不再自持一份硬编码路由副本（两份表曾各自漂移，且高频路径走的正是没被对账的那份）。
+   * 实际跳转必须经 `_runDeterministicNavigation` 走同一治理层执行，**不得**直接返回 route 绕过工具循环。
+   */
+  private detectNavigation(
+    message: string,
+  ): { page: string; route: string; reply: string } | null {
+    const trimmed = message.trim();
+    if (!trimmed) return null;
+
+    // 写操作动词：命中则视为操作请求（交给 LLM 走工具/确认流程），不做页面跳转。
+    // 避免「帮我创建事件」「去安排日程」这类含页面关键词但意图是写操作的请求被劫持。
+    const isActionRequest = WRITE_ACTION_VERBS.some((v) => trimmed.includes(v));
+    if (isActionRequest) return null;
+
+    // 导航触发词：只要消息包含这些词之一就认为有导航意图。
+    // 「帮我」是辅助动词而非导航动词，去掉以避免「帮我创建事件」被误判。
+    const navVerbs = ['打开', '去', '跳转到', '转到', '前往', '进入', '到'];
+    const hasNavIntent = navVerbs.some((v) => trimmed.includes(v));
+    if (!hasNavIntent) return null;
+
+    // 词 → 页面键表与 PAGE_ROUTES 同源（`tools/navigate-page.tool.ts`），按优先顺序匹配
+    for (const page of NAV_KEYWORDS) {
+      if (!page.keywords.some((k) => trimmed.includes(k))) continue;
+      const target = PAGE_ROUTES[page.page];
+      if (!target) continue; // 页表缺该键 → 跳过（守卫测试应在 CI 拦下，而非在此抛错）
+      return {
+        page: page.page,
+        route: target.route,
+        reply: `已为您跳转到${target.description}。`,
+      };
+    }
+
+    return null;
+  }
+
+  /**
+   * 确定性导航：关键词命中 → 经**同一治理层**执行 `navigate_page`（工具门控 + 只读强制 + 工具行审计）。
+   *
+   * 此前这条路径在 chat / chatStream 里直接返回 route，**绕过工具循环** ⇒ 该动作在审计与权限上
+   * 等于不存在，却在用户界面上真的发生了（治理暗门）。现复用 `_agentStepExecutor`——与 plan / 子代理
+   * 步骤同一个受治理执行器：唯一的确定性差异（关键词命中即触发、不等 LLM）保留，但不再跳过治理。
+   *
+   * route 与文案取自 `PAGE_ROUTES`（唯一真源），不依赖工具返回值——工具读的是同一张表。
+   *
+   * @returns 命中并放行时返回 `{ route, reply }`；未命中、adminMode、或执行被拒时返回 `null`（由调用方决定去向）
+   */
+  private async _runDeterministicNavigation(
+    userId: string,
+    conversationId: string,
+    providerName: string,
+    request: ChatRequest,
+  ): Promise<{ route: string; reply: string } | null> {
+    if (request.adminMode) return null;
+    const hit = this.detectNavigation(request.message);
+    if (!hit) return null;
+    // 一"轮次"一个句柄（§22.19 AU-2）：该次导航的工具行挂在此句柄下，可随会话查询取回
+    const agentRunId = randomUUID();
+    const exec = this._agentStepExecutor(conversationId, providerName, agentRunId);
+    await exec('navigate_page', { page: hit.page }, userId);
+    return { route: hit.route, reply: hit.reply };
+  }
+}

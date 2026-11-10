@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "module": "checkins",
+  "generator": "keelbase",
+  "generatorVersion": "1.3.0",
+  "protocol": "1.1",
+  "source": "spec:specs/checkins.json",
+  "generatedAt": "2026-11-03T10:32:09.517Z"
+}

@@ -1,0 +1,412 @@
+// SPDX-License-Identifier: Apache-2.0
+
+/**
+ * 工具门控（从 `AiService` 拆出的第一个领域，健康清单 §3 阶段 3「主战场」）。
+ *
+ * 回答的是同一个问题：**这个工具在此时、由这个主体，能不能跑**——
+ * 门控（R5 阻断 / 策略开关 / 角色白名单 / 特性开关 / adminOnly / 邮箱验证）与
+ * 档位判定（是否需确认、是否走 R4 双人审批、风险级）。
+ *
+ * 拆它的顺序理由是**依赖**：执行域与 R4 审批域都要调它，它在依赖链最下游。
+ *
+ * **行为与拆分前逐字一致**——搬迁不改逻辑（阶段 3 纪律：行为不变，测试作护栏）。
+ */
+import { Injectable, Optional } from '@nestjs/common';
+import { ToolRegistry } from './tool-registry';
+import { ExternalToolRegistry } from './external-tool-registry';
+import { GovernancePolicyService } from '../../governance-shared/services/governance-policy.service';
+import { FeatureFlagsService } from '../../feature-flags/feature-flags.service';
+import { UsersService } from '../../users/users.service';
+import {
+  AiTool,
+  AuthorizationCheck,
+  AuthorizationDeniedError,
+  ToolRiskLevel,
+} from '../interfaces/tool.interface';
+import { resolveToolDestination } from './tool-destination';
+import { BusinessException } from '../../common/errors/business.exception';
+import type { DenialCause } from '../../common/errors/denial-guidance';
+import { UserRole } from '../../common/entities/user.entity';
+import { MetricsService } from '../../metrics/metrics.service';
+import { isFixtureUser } from '../constants/fixture-identity';
+// ACT-7：执行点重算审批要求时要读**凭据本身**（确认行），故这里取确认存储
+import { ConfirmationStore } from '../confirmation/confirmation.store';
+
+@Injectable()
+export class ToolGateService {
+  constructor(
+    private readonly toolRegistry: ToolRegistry,
+    private readonly externalTools: ExternalToolRegistry,
+    @Optional() private readonly governancePolicy?: GovernancePolicyService,
+    @Optional() private readonly featureFlagsService?: FeatureFlagsService,
+    @Optional() private readonly usersService?: UsersService,
+    /**
+     * REV-15：拒绝计数（`tool_gate_refusals_total`）。**@Optional** —— 单测/降级装配可省，
+     * 省则计数静默跳过（抛出的语义不受影响：计数是证据，不是门控本身）。
+     */
+    @Optional() private readonly metrics?: MetricsService,
+    /**
+     * ACT-7：执行点重算审批要求时读凭据（确认行是否由**第二个人**批准）。**@Optional** —— 但缺失时
+     * 该判据**fail-closed**（要求审批的工具一律拒），不是静默放行：这里挡的是授权，不是一条保护：
+     * 读不到凭据就当没有凭据。
+     */
+    @Optional() private readonly confirmationStore?: ConfirmationStore,
+  ) {}
+
+  /**
+   * REV-15：拒绝的**唯一出口** —— 计数与抛出在同一处，所以「同一闸门、同一计数器」是**结构保证**的，
+   * 不靠每个分支各自记得加一行。新加一条门控若绕开它，就直接少了证据（且审查时一眼可见）。
+   */
+  private _refuse(
+    userId: string,
+    check: AuthorizationCheck,
+    message: string,
+    denial?: DenialCause,
+  ): never {
+    this._countRefusal(userId, check.name);
+    throw new AuthorizationDeniedError(message, [check], denial);
+  }
+
+  /**
+   * 记一次拒绝。`source` 由**夹具身份单源**判读（`ai/constants/fixture-identity.ts`）——
+   * 不在本文件里另写一份前缀，否则「评测在用夹具身份而计数器记成生产」这类漂移无人察觉。
+   */
+  private _countRefusal(userId: string, reason: string): void {
+    this.metrics?.toolGateRefusalsTotal.inc({
+      reason,
+      source: isFixtureUser(userId) ? 'fixture' : 'production',
+    });
+  }
+
+  /**
+   * HS-2 + HS-9 工具执行前权限门控：按工具声明 + 治理策略检查调用资格。
+   * - HS-9 策略开关：工具被策略禁用时拒绝
+   * - HS-9 角色白名单：allowedRoles 非空时仅列内角色可调（headless 系统账号由 API Key 鉴权，跳过）
+   * - featureFlag：对应特性开关关闭时拒绝（对齐 HTTP 层 @FeatureFlag）
+   * - requireVerifiedEmail：写操作需已验证邮箱（对齐 EmailVerificationGuard，admin/headless 视为已验证）
+   * 无 permissions 声明的工具视为允许（数据隔离已由 execute 的 userId 保证）。
+   */
+  async assertToolAllowed(
+    toolName: string,
+    userId: string,
+  ): Promise<void> {
+    let tool: AiTool | undefined;
+    try {
+      tool = this.toolRegistry.getTool(toolName);
+    } catch {
+      // 工具未注册：让后续 execute 抛「not found」，这里不拦截
+    }
+
+    // W5 风险模型：R5（不可逆/外部动作）→ 阻断，不进入确认/执行（评审二 §7）
+    if (tool && this.toolRegistry.riskLevel(toolName) === 'R5') {
+      this._refuse(
+        userId,
+        { name: 'risk_policy', ok: false, note: `风险级 R5（不可逆/外部动作）→ 阻断` },
+        `Tool "${toolName}" is blocked (risk level R5)`,
+        { kind: 'risk_r5', params: { tool: toolName } },
+      );
+    }
+
+    // HS-9 治理策略：工具开关 + 角色白名单
+    if (this.governancePolicy) {
+      const enabled = await this.governancePolicy.isToolEnabled(toolName);
+      if (!enabled) {
+        this._refuse(
+          userId,
+          { name: 'tool_enabled', ok: false, note: '治理策略禁用此工具' },
+          `Tool "${toolName}" is disabled by governance policy`,
+          { kind: 'tool_disabled', params: { tool: toolName } },
+        );
+      }
+      const allowedRoles = await this.governancePolicy.getAllowedRoles(toolName);
+      if (allowedRoles.length > 0 && userId !== '0') {
+        // A14：角色白名单每次工具调用实时查库取用户——角色降权对下一次工具调用立即生效；
+        // 治理策略本身经 SettingsService 缓存提供（写 settings 即失效重载），非持久缓存，
+        // 因此「策略降权不生效」的感知来自设置未落库，而非本层缓存。此处不做额外 TTL 缓存。
+        const user = this.usersService
+          ? await this.usersService.findOne(Number(userId))
+          : null;
+        if (!user || !user.role || !allowedRoles.includes(user.role)) {
+          this._refuse(
+            userId,
+            {
+              name: 'role_allowed',
+              ok: false,
+              note: `需要角色 [${allowedRoles.join(', ')}]${user ? `，当前 ${user.role ?? '无角色'}` : ''}`,
+            },
+            `Tool "${toolName}" is restricted to roles: ${allowedRoles.join(', ')}`,
+            {
+              kind: 'role_denied',
+              params: {
+                tool: toolName,
+                allowedRoles: allowedRoles.join(', '),
+                currentRole: user?.role ?? 'none',
+              },
+            },
+          );
+        }
+      }
+    }
+
+    const perms = tool?.permissions;
+    if (!perms) return;
+
+    if (
+      perms.featureFlag &&
+      this.featureFlagsService &&
+      !this.featureFlagsService.isEnabled(perms.featureFlag as never)
+    ) {
+      this._refuse(
+        userId,
+        { name: 'feature_flag', ok: false, note: `特性开关 ${perms.featureFlag} 关闭` },
+        `Tool "${toolName}" is disabled (feature flag "${perms.featureFlag}" off)`,
+        {
+          kind: 'feature_disabled',
+          params: { tool: toolName, featureFlag: perms.featureFlag },
+        },
+      );
+    }
+
+    // System AI Assistant：adminOnly 工具仅管理员（或系统账号 '0'——eval/兼容）可调用。
+    // 管理端助手已改为真实管理员身份，故按角色放行（与角色白名单一致实时查库）。
+    if (perms.adminOnly && userId !== '0') {
+      const user = this.usersService
+        ? await this.usersService.findOne(Number(userId))
+        : null;
+      if (!user || user.role !== UserRole.ADMIN) {
+        this._refuse(
+          userId,
+          { name: 'admin_only', ok: false, note: '仅管理员/系统账号可用' },
+          `Tool "${toolName}" is admin-only`,
+          { kind: 'admin_only', params: { tool: toolName } },
+        );
+      }
+    }
+
+    // The privileged sentinel (userId '0', the system account) is produced by trusted in-process callers
+    // only — today that is the eval fixture's admin-assistant category — so it is not re-checked here.
+    // No request-side identity may be mapped to '0' (docs/authorization-architecture.md §3 L1).
+    //
+    // 特权哨兵（userId '0'，系统账号）只由受信进程内入口产生 —— 今天是评测夹具的 admin-assistant
+    // 类目 —— 故此处不重复拦截。请求侧身份不得映射为 '0'（docs/authorization-architecture.md §3 L1）。
+    if (userId === '0') return;
+
+    if (perms.requireVerifiedEmail && this.usersService) {
+      const user = await this.usersService.findOne(Number(userId));
+      // Consistent with EmailVerificationGuard: admin counts as verified (the system account '0' already
+      // returned above).
+      //
+      // 与 EmailVerificationGuard 一致：admin 视为已验证（系统账号 '0' 已在上面返回）。
+      if (user && user.role !== UserRole.ADMIN && !user.emailVerified) {
+        // 与上面各条**同闸门同计数器**：这里抛的是 BusinessException（错误码路径），但拒绝就是拒绝，
+        // 不能因为抛出类型不同就不计入——否则「门在守」的证据会缺一块。
+        this._countRefusal(userId, 'email_verified');
+        throw new BusinessException('EMAIL_NOT_VERIFIED');
+      }
+    }
+  }
+
+  /**
+   * 工具目的地（AUTHZ-1 单一源）：写落到哪个系统。外部 MCP → `mcp:<server>`；声明了 `audience` 的
+   * 工具（B 路径 proxy）→ 该 audience；其余 → `local`。
+   *
+   * 未注册的工具名（LLM 幻觉名 / 外部工具）不抛错——外部工具本就不在本地注册表；两者都按名解析目的地。
+   */
+  destinationOf(toolName: string): string {
+    let tool: AiTool | undefined;
+    try {
+      tool = this.toolRegistry.getTool(toolName);
+    } catch {
+      tool = undefined;
+    }
+    return resolveToolDestination(toolName, tool);
+  }
+
+  /**
+   * AUTHZ-2：治理策略声明的**可写字段域**与 **destination 白名单**，按**这一次的实际请求**校验。
+   *
+   * 与「确认绑定精确 args」的关系是**并存**而非取代：精确绑定答「是不是这组参数」（事后不可放宽，
+   * 但只能整组接受或整组拒绝），本域答「这类参数可不可以写」——「可以改 status、不可以改 owner」
+   * 只有当参数域存在时才表达得出来。
+   *
+   * 两域都**非空即上限**（空 = 未声明 = 不约束），与 `allowedRoles` 同一约定；越域一律拒，不做截断。
+   * 声明来源是治理策略（与 `allowedRoles` 同处），**不是**工具的 `parameters`——后者是给 LLM 读的提示，
+   * 不做授权判定，且完全不覆盖 destination。
+   */
+  async assertWithinDeclaredScope(
+    toolName: string,
+    args: Record<string, unknown>,
+    userId: string,
+  ): Promise<void> {
+    if (!this.governancePolicy) return;
+    const policy = await this.governancePolicy.getToolPolicy(toolName);
+
+    const allowedDestinations = policy.allowedDestinations;
+    if (allowedDestinations.length > 0) {
+      const destination = this.destinationOf(toolName);
+      if (!allowedDestinations.includes(destination)) {
+        this._refuse(
+          userId,
+          {
+            name: 'destination_allowed',
+            ok: false,
+            note: `目的地 ${destination} 不在白名单 [${allowedDestinations.join(', ')}]`,
+          },
+          `Tool "${toolName}" is not allowed to write to destination "${destination}" (allowed: ${allowedDestinations.join(', ')})`,
+          {
+            kind: 'destination_denied',
+            params: {
+              tool: toolName,
+              destination,
+              allowedDestinations: allowedDestinations.join(', '),
+            },
+          },
+        );
+      }
+    }
+
+    const writableFields = policy.writableFields;
+    if (writableFields.length > 0) {
+      const outOfDomain = Object.keys(args ?? {}).filter((k) => !writableFields.includes(k));
+      if (outOfDomain.length > 0) {
+        this._refuse(
+          userId,
+          {
+            name: 'field_domain',
+            ok: false,
+            note: `字段 ${outOfDomain.join(', ')} 不在可写域 [${writableFields.join(', ')}]`,
+          },
+          `Tool "${toolName}" received arguments outside its writable field domain: ${outOfDomain.join(', ')}`,
+          {
+            kind: 'field_out_of_domain',
+            params: {
+              tool: toolName,
+              outOfDomain: outOfDomain.join(', '),
+              writableFields: writableFields.join(', '),
+            },
+          },
+        );
+      }
+    }
+
+    // CONF-1 有界变动：声明了界限的字段，取值必须落在界限内（数值上界）。
+    // **非数值一律拒**（fail-closed）：声明了数值上界却拿到一个比不了的取值 —— 无法证明它在界限内，
+    // 就不放行（与「身份缺失一律 DENY」同一取向，而不是默默当成「不适用」）。
+    for (const [field, bound] of Object.entries(policy.boundedFields ?? {})) {
+      if (!args || !(field in args)) continue;
+      const value = args[field];
+      const withinBound = typeof value === 'number' && Number.isFinite(value) && value <= bound.max;
+      if (!withinBound) {
+        this._refuse(
+          userId,
+          {
+            name: 'field_bound',
+            ok: false,
+            note: `${field} 超出声明界限（须为 ≤ ${bound.max} 的有限数）`,
+          },
+          `Tool "${toolName}" received ${field} outside its declared bound (<= ${bound.max})`,
+          {
+            kind: 'field_out_of_bound',
+            params: { tool: toolName, field, max: bound.max },
+          },
+        );
+      }
+    }
+  }
+
+  /**
+   * CONF-1：本工具声明的字段界限（**单一源** = `getToolPolicy`；无治理策略/未声明时为空对象）。
+   * 信任作用域键（`AiService._trustScopeKey`）据此把「值」换成「界限」，使界限内的取值变动共用一个键。
+   */
+  async boundedFieldsOf(toolName: string): Promise<Record<string, { max: number }>> {
+    if (!this.governancePolicy) return {};
+    const policy = await this.governancePolicy.getToolPolicy(toolName);
+    return policy.boundedFields ?? {};
+  }
+
+  /**
+   * HS-9 确认规则：治理策略可覆盖工具定义的 requiresConfirmation。
+   * HS-10：外部 MCP 工具由 ExternalToolProvider 判定（readOnly 免确认，非只读默认需确认，策略可覆盖）。
+   * 未注入 GovernancePolicyService（单测/降级）时沿用工具定义默认。
+   */
+  async requiresConfirmation(name: string): Promise<boolean> {
+    if (this.externalTools.isExternal(name)) {
+      return this.externalTools.requiresConfirmation(name);
+    }
+    const fallback = this.toolRegistry.requiresConfirmation(name);
+    if (!this.governancePolicy) return fallback;
+    return this.governancePolicy.requiresConfirmation(name, fallback);
+  }
+
+  /**
+   * §internal.15(4) R4 审批档判定：策略覆盖档位（mode=approval）或声明风险级 R4 都走双人审批。
+   * 未注入 GovernancePolicyService（单测/降级）时回落声明风险级 R4。
+   */
+  async requiresApproval(name: string): Promise<boolean> {
+    const riskLevel = await this.riskLevelFor(name);
+    if (!this.governancePolicy) return riskLevel === 'R4';
+    return this.governancePolicy.requiresApproval(name, riskLevel);
+  }
+
+  /**
+   * ACT-7：执行点**重算审批要求** —— 等待窗口内策略可以把一个 R3 工具升成 R4。
+   *
+   * 审批要求的判据（`requiresApproval`）此前**只在决策前**算过一次（`ai.service` 两处），而 artifact
+   * 一签下来就带着它**当时**的档位语义。于是这窗口里策略升档时，「操作者本人点的确认」会被当成
+   * 「已获审批」放行一个 R4 动作 —— 而 R4 的全部意义是**第二个人**点头。这与执行点其它复查同一条理由
+   * （策略实时生效，kill-switch 必须对在途审批有效）；本方法把缺的那一维补上。
+   *
+   * **判据是凭据本身，不是调用方声明的布尔**：载入确认行，要求它已批准**且**记着审批人 ——
+   * 「凭据要能在运行时被校验，不是谁说是就是」是本仓公开的规矩。**只在执行点可判**：发起时那个窗口
+   * 还不存在，所以决策前没有第二处可放。
+   *
+   * **边界**：只挡「要求变严」这一向。策略**放宽**（R4→R3）时手上那张审批是更强的凭据，不构成拒绝理由
+   * —— 那会是一次功能倒退，不是安全。
+   */
+  async assertApprovalRequirementHolds(
+    toolName: string,
+    userId: string,
+    authorizationRef?: string,
+  ): Promise<void> {
+    if (!(await this.requiresApproval(toolName))) return;
+    // 未装配确认存储 ⇒ 判不了 ⇒ **fail-closed**。这里挡的是**授权**而不是一条保护：读不到凭据就当没有凭据
+    //（口径同派发认领的 fail-closed —— 拿不到可判定的结果一律不放行）。
+    const approved =
+      this.confirmationStore && authorizationRef
+        ? await this.confirmationStore.isSecondPersonApproval(authorizationRef)
+        : false;
+    if (approved) return;
+    this._refuse(
+      userId,
+      {
+        name: 'approval_missing',
+        ok: false,
+        note: '该工具此刻要求人工审批，而本次执行持有的凭据不是一位审批人的批准（策略可能在等待窗口内升档）',
+      },
+      `Tool "${toolName}" requires human approval, and this execution does not hold one`,
+      { kind: 'approval_missing', params: { tool: toolName } },
+    );
+  }
+
+  /**
+   * 工具风险级（治理解析用）：**本地注册表为准；取不到时对外部工具容错**。
+   *
+   * 外部工具（`mcp_*`）只由 `ExternalToolProvider` 解析、**不在本地注册表**，而 `ToolRegistry.riskLevel`
+   * 对未注册名**抛错**（`Tool "x" not found`）。此前 `requiresApproval` 与本文件各处解释器调用都裸调它，
+   * 于是外部工具在对话里**无论读写都在 tool_start 前抛错**、以「执行失败」收尾（2026-09-17 实测：外部读工具
+   * 连 `tool_start` 都发不出），「外部工具过同一治理层（含确认）」的文档承诺实际未生效。
+   *
+   * 外部工具按其**确认判定**派生档位（与 `resolveRiskLevel` 同口径：确认写→R3、读→R1），与预扫描
+   * `?? 'R3'` 同精神。**未注册且非外部（LLM 幻觉名）仍抛**——不给幻觉名发确认卡，保持既有行为。
+   */
+  async riskLevelFor(toolName: string): Promise<ToolRiskLevel> {
+    try {
+      return this.toolRegistry.riskLevel(toolName);
+    } catch (err) {
+      if (this.externalTools.isExternal(toolName)) {
+        return (await this.requiresConfirmation(toolName)) ? 'R3' : 'R1';
+      }
+      throw err;
+    }
+  }
+}

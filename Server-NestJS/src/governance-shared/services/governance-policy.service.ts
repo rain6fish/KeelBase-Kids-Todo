@@ -1,0 +1,424 @@
+// SPDX-License-Identifier: Apache-2.0
+
+/**
+ * Local governance policy: a single row in `ai_governance_policy` plus a revision history, applied
+ * live by the AI path and read by the standalone governance runtime. It used to live in
+ * `src/ai/governance-bridge/`, the business-system side of the governance seam; S4-H4 C Step 3
+ * moved it here because both sides instantiate the same class, and this module is now its only
+ * provider.
+ *
+ * 本地治理策略：`ai_governance_policy` 里的一行，外加修订历史；AI 路径实时执行它，独立治理运行时也
+ * 读它。它原先住在 `src/ai/governance-bridge/`（治理接缝的业务系统一侧）；S4-H4 C 第三步把它搬到
+ * 这里，因为两侧实例化的是同一个类，而本模块现在是它唯一的提供者。
+ */
+
+import { createHash } from 'node:crypto';
+import { Injectable, NotFoundException } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
+import { AiGovernancePolicy } from '../entities/ai-governance-policy.entity';
+import { AiGovernancePolicyHistory } from '../entities/ai-governance-policy-history.entity';
+import { getPolicyPreset, getPolicyPresets, type PolicyPreset } from './governance-policy-presets';
+import type { ToolRiskLevel } from '../../ai/interfaces/tool.interface';
+
+/**
+ * §internal.15(4) 治理策略可视化编辑 — 门控档位（Gate Mode）：
+ * 把「是否需确认」从布尔升级为三档——auto（自动执行）/ confirm（R3 本人即时确认）/
+ * approval（R4 双人审批）。策略覆盖以 mode 写入，运行时 R4 审批判定改读策略档位。
+ * R5（阻断）不可经政策放宽；legacy requiresConfirmation 布尔覆盖仍兼容解析。
+ */
+export type ToolGateMode = 'auto' | 'confirm' | 'approval';
+
+/** 策略中的单工具覆盖（全部可选——前端 diff 保存：只写与默认不同的项） */
+export interface ToolPolicyOverride {
+  enabled?: boolean;
+  /** legacy HS-9 布尔确认覆盖（§internal.15(4) 起新保存改用 mode；本键保留以兼容解析旧数据/预设） */
+  requiresConfirmation?: boolean;
+  allowedRoles?: string[];
+  /** 门控档位覆盖（优先级最高；R5 恒阻断，不可放宽） */
+  mode?: ToolGateMode;
+  /**
+   * 可写字段域（AUTHZ-2）：本工具这一次写**允许出现的参数名**。非空即上限——域外参数一律拒。
+   * 与「确认绑定精确 args」并存：精确绑定答「是不是这组参数」，本域答「这类参数可不可以写」。
+   * 它**不是** `parameters` 里的 enum——那些是给 LLM 读的提示，不做授权判定，也不覆盖 destination。
+   */
+  writableFields?: string[];
+  /** destination 白名单（AUTHZ-2）：本工具**允许写到哪些目的地**（值域同委托 token 的 `aud`，见 `tools/tool-destination.ts`）。非空即上限——域外目的地一律拒。 */
+  allowedDestinations?: string[];
+  /**
+   * **声明界限**（CONF-1 的「有界变动」）：本工具的某些字段**允许在界限内取值变动**，而不必逐值重新确认。
+   *
+   * 形状 = **数值上界**（`{ max: number }`）：字段值须是有限数且 `≤ max`，否则执行点拒（`field_bound`）。
+   * **非数值一律拒**（fail-closed）：声明了数值上界，却拿到一个比不了的取值 —— 无法证明它在界限内，
+   * 就不放行（「身份缺失一律 DENY」的同一条取向）。
+   *
+   * 与「确认绑精确 args」是**且**的关系，它放宽的只是**信任作用域键**（`_trustScopeKey`）：界限内的
+   * 取值变动落进**同一个键**，「本轮不再询问」照旧生效；越界由执行点拒，到不了那一步。
+   * 落点与 AUTHZ-2 同一裁决：**工具元数据，不进协议**。
+   */
+  boundedFields?: Record<string, { max: number }>;
+}
+
+/** 合并默认后的生效工具策略（getToolPolicy / 便捷方法返回） */
+export interface ToolPolicy {
+  enabled: boolean;
+  requiresConfirmation: boolean;
+  /** R4 审批档（双人审批）：true 表示需审批人，而非本人即时确认 */
+  requiresApproval: boolean;
+  allowedRoles: string[];
+  /** 生效门控档位：auto | confirm | approval */
+  mode: ToolGateMode;
+  /** AUTHZ-2：可写字段域（空 = 未声明，不约束） */
+  writableFields: string[];
+  /** AUTHZ-2：destination 白名单（空 = 未声明，不约束） */
+  allowedDestinations: string[];
+  /** CONF-1：声明界限（空 = 未声明，逐值确认） */
+  boundedFields: Record<string, { max: number }>;
+}
+
+export interface GovernancePolicy {
+  tools: Record<string, Partial<ToolPolicyOverride>>;
+  audit: { granularity: 'all' | 'write' | 'off' };
+  /** §internal.16 A-5 授权链图：策略生效时间（无历史版本，取当前行 updatedAt；无策略行时 null） */
+  updatedAt?: Date | null;
+  /** §internal.17③ Policy Evidence：策略内容指纹，同内容恒同号、任何变更必变号（做「版本」用，无需迁移/历史表） */
+  revision?: string;
+}
+
+/**
+ * CONF-1 **声明界限的单一口径**：只有「有限数」才算一个界限，其余一律剔除。
+ *
+ * 三处消费方共用它 —— 指纹（`normalizePolicy`）、生效策略（`getToolPolicy`）、授权依据快照
+ * （`authorization-explainer`）。**必须单源**：口径若分叉，就会出现「指纹认为没这条界限、执行点却
+ * 拿它去拒」这种读不回来的状态。剔除而不是拒绝，是因为一个配错的界限（比如 `max: "x"`）若当作
+ * 「比不了就拒」，会把整把工具锁死 —— 那是把配置笔误升级成故障。
+ */
+export function sanitizeBoundedFields(
+  raw: unknown,
+): Record<string, { max: number }> {
+  if (!raw || typeof raw !== 'object') return {};
+  const out: Record<string, { max: number }> = {};
+  for (const field of Object.keys(raw as Record<string, unknown>).sort()) {
+    const bound = (raw as Record<string, { max?: unknown }>)[field];
+    if (bound && typeof bound.max === 'number' && Number.isFinite(bound.max)) {
+      out[field] = { max: bound.max };
+    }
+  }
+  return out;
+}
+
+/** 规范化策略（排序 key、剔除非法维度）→ 保证「同内容 → 同指纹」。 */
+function normalizePolicy(value: Partial<GovernancePolicy> | null | undefined): GovernancePolicy {
+  const tools: Record<string, Partial<ToolPolicy>> = {};
+  for (const [name, cfg] of Object.entries(value?.tools ?? {})) {
+    if (!cfg || typeof cfg !== 'object') continue;
+    const entry: Partial<ToolPolicy> = {};
+    if (typeof cfg.enabled === 'boolean') entry.enabled = cfg.enabled;
+    if (typeof cfg.requiresConfirmation === 'boolean') entry.requiresConfirmation = cfg.requiresConfirmation;
+    if (cfg.mode === 'auto' || cfg.mode === 'confirm' || cfg.mode === 'approval') entry.mode = cfg.mode;
+    if (Array.isArray(cfg.allowedRoles)) entry.allowedRoles = [...cfg.allowedRoles].sort();
+    // AUTHZ-2 声明面入规范化：它参与授权判定，故必须进内容指纹——否则「收紧字段域」不产生新 revision，
+    // 决策可复现会把两版不同约束读成同一版。
+    if (Array.isArray(cfg.writableFields)) entry.writableFields = [...cfg.writableFields].sort();
+    if (Array.isArray(cfg.allowedDestinations)) {
+      entry.allowedDestinations = [...cfg.allowedDestinations].sort();
+    }
+    // CONF-1 声明界限同样入规范化：它放宽的是**信任作用域**，故「收紧/放宽界限」必须产生新 revision
+    // ——否则两版不同界限会被决策可复现读成同一版（与 writableFields 同一条理由）。
+    const bounded = sanitizeBoundedFields(cfg.boundedFields);
+    if (Object.keys(bounded).length > 0) entry.boundedFields = bounded;
+    if (Object.keys(entry).length > 0) tools[name] = entry;
+  }
+  const sortedTools: Record<string, Partial<ToolPolicy>> = {};
+  for (const name of Object.keys(tools).sort()) sortedTools[name] = tools[name];
+  const granularity = value?.audit?.granularity;
+  return {
+    tools: sortedTools,
+    audit: { granularity: granularity === 'write' || granularity === 'off' ? granularity : 'all' },
+  };
+}
+
+function parsePolicyValue(raw: string): GovernancePolicy {
+  try {
+    return normalizePolicy(JSON.parse(raw) as Partial<GovernancePolicy>);
+  } catch {
+    return normalizePolicy({});
+  }
+}
+
+/** §internal.17③ 策略内容指纹：sha256(规范化 JSON) 前 12 hex。null/坏串 → 空策略指纹。 */
+export function policyRevisionOf(value: Partial<GovernancePolicy> | string | null | undefined): string {
+  const policy = typeof value === 'string' ? parsePolicyValue(value) : normalizePolicy(value);
+  return createHash('sha256').update(JSON.stringify(policy)).digest('hex').slice(0, 12);
+}
+
+/**
+ * §internal.15(4) 生效门控档位（纯函数：策略服务与工具清单共用同一规则）：
+ * 显式 mode 覆盖 > legacy requiresConfirmation 布尔 > 按声明风险级推导。
+ *   R5 → blocked（恒阻断，政策不可放宽）
+ *   R4 → approval / R3 → confirm / R0-R2 → auto
+ *   legacy requiresConfirmation=false 视为降级到 auto（既有语义）；true 视为 confirm。
+ */
+export function effectiveGateMode(
+  override: Partial<ToolPolicyOverride> | undefined,
+  riskLevel: ToolRiskLevel,
+): ToolGateMode | 'blocked' {
+  if (riskLevel === 'R5') return 'blocked';
+  const o = override ?? {};
+  if (o.mode === 'auto' || o.mode === 'confirm' || o.mode === 'approval') return o.mode;
+  if (o.requiresConfirmation === false) return 'auto';
+  if (riskLevel === 'R4') return 'approval';
+  if (o.requiresConfirmation === true || riskLevel === 'R3') return 'confirm';
+  return 'auto';
+}
+
+/**
+ * HS-9 治理策略层：工具权限 / 确认规则 / 审计粒度从代码硬编码升级为数据驱动。
+ * 策略存于自有表 ai_governance_policy（D2-1d，单行 id=1，value JSON）——从 Settings 迁出，
+ * 治理台独立持有策略，不依赖业务 settings 表（独立治理库前提）。
+ * 管理台可写实时生效（PUT /api/v1/ai/governance/policy），无需发版。
+ *
+ * 策略形状：
+ * {
+ *   "tools": {
+ *     "create_event": { "enabled": false },
+ *     "create_todo": { "requiresConfirmation": false },      // legacy 布尔（兼容）
+ *     "create_customer": { "mode": "approval" },             // §internal.15(4) 门控档位：auto|confirm|approval
+ *     "web_search": { "allowedRoles": ["admin"] },
+ *     "update_ticket": { "writableFields": ["status", "priority"] },   // AUTHZ-2 可写字段域（域外即拒）
+ *     "create_invoice": { "allowedDestinations": ["legacy-erp"] }      // AUTHZ-2 destination 白名单
+ *   },
+ *   "audit": { "granularity": "all" | "write" | "off" }
+ * }
+ * 未配置的工具沿用工具定义默认值（含按声明风险级推导的门控档位）；未配置的维度沿用默认。
+ */
+@Injectable()
+export class GovernancePolicyService {
+  constructor(
+    @InjectRepository(AiGovernancePolicy)
+    private readonly policyRepo: Repository<AiGovernancePolicy>,
+    @InjectRepository(AiGovernancePolicyHistory)
+    private readonly historyRepo: Repository<AiGovernancePolicyHistory>,
+  ) {}
+
+  async getPolicy(): Promise<GovernancePolicy> {
+    const row = await this.policyRepo.findOne({ where: { id: 1 } });
+    if (!row) return { tools: {}, audit: { granularity: 'all' }, updatedAt: null, revision: policyRevisionOf(undefined) };
+    try {
+      const parsed = JSON.parse(row.value) as Record<string, unknown>;
+      const tools = (parsed?.tools ?? {}) as Record<string, Partial<ToolPolicyOverride>>;
+      const granularity =
+        (parsed?.audit as { granularity?: string } | undefined)?.granularity ?? 'all';
+      return {
+        tools,
+        audit: { granularity: granularity === 'write' || granularity === 'off' ? granularity : 'all' },
+        updatedAt: row.updatedAt ?? null,
+        revision: policyRevisionOf(row.value),
+      };
+    } catch {
+      return { tools: {}, audit: { granularity: 'all' }, updatedAt: row.updatedAt ?? null, revision: policyRevisionOf(row.value) };
+    }
+  }
+
+  /** 写策略（upsert 单行 id=1），管理台策略中心调用，实时生效。P-③：同步落历史快照行。 */
+  async setPolicy(value: GovernancePolicy): Promise<GovernancePolicy> {
+    const normalized = normalizePolicy(value);
+    const valueStr = JSON.stringify(normalized);
+    const entity = await this.policyRepo.save({ id: 1, value: valueStr });
+    const revision = policyRevisionOf(entity.value);
+    const appliedAt = new Date();
+    await this.historyRepo.save(
+      this.historyRepo.create({ revision, value: entity.value, appliedAt }),
+    );
+    return {
+      ...normalized,
+      updatedAt: entity.updatedAt ?? appliedAt,
+      revision,
+    };
+  }
+
+  /** P-③：历史快照列表（倒序，含规范化 value 供「当时策略」展示/比对人读——policy-history spec §5 value 摘要）。 */
+  async getPolicyRevisionHistory(limit = 50): Promise<Array<{ id: number; revision: string; value: string; appliedAt: Date }>> {
+    const rows = await this.historyRepo.find({ order: { id: 'DESC' }, take: Math.min(Math.max(limit, 1), 200) });
+    return rows.map((r) => ({ id: r.id, revision: r.revision, value: r.value, appliedAt: r.appliedAt }));
+  }
+
+  /** P-③：按 revision 取当时策略快照（同 revision 多行取最新；未命中 → null）。 */
+  async getPolicySnapshotByRevision(revision: string): Promise<{ revision: string; policy: GovernancePolicy; appliedAt: Date | null } | null> {
+    const row = await this.historyRepo.findOne({ where: { revision }, order: { id: 'DESC' } });
+    if (!row) return null;
+    return { revision: row.revision, policy: parsePolicyValue(row.value), appliedAt: row.appliedAt ?? null };
+  }
+
+  /** 工具策略：默认值来自工具定义/调用方，策略表同名键覆盖；含门控档位（mode）解析。 */
+  async getToolPolicy(
+    name: string,
+    defaults: { enabled?: boolean; requiresConfirmation?: boolean } = {},
+  ): Promise<ToolPolicy> {
+    const policy = await this.getPolicy();
+    const override = policy.tools?.[name] ?? {};
+    let mode: ToolGateMode;
+    if (override.mode === 'auto' || override.mode === 'confirm' || override.mode === 'approval') {
+      mode = override.mode;
+    } else if (override.requiresConfirmation !== undefined) {
+      mode = override.requiresConfirmation ? 'confirm' : 'auto';
+    } else {
+      mode = defaults.requiresConfirmation ? 'confirm' : 'auto';
+    }
+    return {
+      enabled: override.enabled ?? defaults.enabled ?? true,
+      requiresConfirmation: mode !== 'auto',
+      requiresApproval: mode === 'approval',
+      allowedRoles: override.allowedRoles ?? [],
+      mode,
+      writableFields: override.writableFields ?? [],
+      allowedDestinations: override.allowedDestinations ?? [],
+      boundedFields: sanitizeBoundedFields(override.boundedFields),
+    };
+  }
+
+  async isToolEnabled(name: string, defaultEnabled = true): Promise<boolean> {
+    return (await this.getToolPolicy(name, { enabled: defaultEnabled })).enabled;
+  }
+
+  async requiresConfirmation(name: string, defaultRequires: boolean): Promise<boolean> {
+    return (
+      await this.getToolPolicy(name, { requiresConfirmation: defaultRequires })
+    ).requiresConfirmation;
+  }
+
+  async getAllowedRoles(name: string): Promise<string[]> {
+    return (await this.getToolPolicy(name)).allowedRoles;
+  }
+
+  /**
+   * §internal.15(4) 生效门控档位：策略覆盖（mode > legacy requiresConfirmation）> 声明风险级推导。
+   * R5 恒返回 'blocked'——不可经政策放宽（R5 阻断在工具门控层先于确认执行）。
+   */
+  async resolveGateMode(
+    name: string,
+    riskLevel: ToolRiskLevel,
+  ): Promise<ToolGateMode | 'blocked'> {
+    const policy = await this.getPolicy();
+    return effectiveGateMode(policy.tools?.[name], riskLevel);
+  }
+
+  /** §internal.15(4) R4 审批档判定：策略把工具升档/设为 approval，或声明风险级即 R4。 */
+  async requiresApproval(name: string, riskLevel: ToolRiskLevel): Promise<boolean> {
+    return (await this.resolveGateMode(name, riskLevel)) === 'approval';
+  }
+
+  async getAuditGranularity(): Promise<'all' | 'write' | 'off'> {
+    return (await this.getPolicy()).audit.granularity;
+  }
+
+  /** §internal.15 策略模板库：返回三档预设（金融/政务/通用），供管理台一键导入。 */
+  getPresets(): PolicyPreset[] {
+    return getPolicyPresets();
+  }
+
+  /** §internal.15 策略模板库：一键应用预设（写 ai_governance_policy 实时生效）。 */
+  async applyPreset(id: string): Promise<GovernancePolicy> {
+    const preset = getPolicyPreset(id);
+    if (!preset) throw new NotFoundException(`策略预设不存在: ${id}`);
+    return this.setPolicy(preset.policy);
+  }
+
+  /** P-③（§internal.17 ① P-③，docs/policy-history-reproducible.spec.md）：跨版本回放。
+   *  历史优先——按 recorded.policyRevision 查 ai_governance_policy_history，「拿当时策略对象真重演」该工具放行判定
+   *  （tool_enabled；role_allowed 需当时用户角色、不在策略内 → 以 recorded checks 冻结结果为准，不夸大整条可重演）；
+   *  历史未命中回落「当前策略重放 + 漂移检出」（原 verifyReproducible 语义）。 */
+  async replayDecision(recorded: {
+    tool?: string;
+    checks?: Array<{ name: string; ok?: boolean }>;
+    policyRevision?: string;
+  }): Promise<{
+    mode: 'history' | 'current-fallback';
+    verifiable: boolean;
+    reproducible: boolean;
+    policyChanged: boolean;
+    toolDecisionChanged: boolean;
+    recordedRevision: string | null;
+    snapshotRevision?: string | null;
+    appliedAt?: Date | null;
+    currentRevision: string;
+    note: string;
+  }> {
+    if (!recorded?.policyRevision) {
+      return { mode: 'current-fallback', verifiable: false, reproducible: false, policyChanged: false, toolDecisionChanged: false, recordedRevision: null, currentRevision: policyRevisionOf(undefined), note: '快照无策略版本（历史记录），无法校验' };
+    }
+    const snapshot = await this.getPolicySnapshotByRevision(recorded.policyRevision);
+    const current = await this.getPolicy();
+    const currentRevision = current.revision ?? policyRevisionOf(undefined);
+    const policyChanged = recorded.policyRevision !== currentRevision;
+    let toolDecisionChanged = false;
+    const decisionEnabled = (cfg?: Partial<ToolPolicyOverride>): boolean => cfg?.enabled ?? true;
+    if (recorded.tool) {
+      const recordedEnabled = recorded.checks?.find((c) => c.name === 'tool_enabled')?.ok;
+      if (typeof recordedEnabled === 'boolean') {
+        const under =
+          snapshot && snapshot.policy ? decisionEnabled(snapshot.policy.tools?.[recorded.tool]) : (await this.getToolPolicy(recorded.tool)).enabled;
+        if (recordedEnabled !== under) toolDecisionChanged = true;
+      }
+    }
+    const reproducible = !toolDecisionChanged;
+    if (snapshot) {
+      return {
+        mode: 'history',
+        verifiable: true,
+        reproducible,
+        policyChanged,
+        toolDecisionChanged,
+        recordedRevision: recorded.policyRevision,
+        snapshotRevision: snapshot.revision,
+        appliedAt: snapshot.appliedAt,
+        currentRevision,
+        note: policyChanged
+          ? toolDecisionChanged
+            ? `历史版重演不符：当时策略 ${snapshot.revision} 下该工具放行判定与记录不一致（现策略 ${currentRevision}）`
+            : `历史版重演一致：当时策略 ${snapshot.revision} 下该工具仍放行（现策略已变 ${currentRevision}）`
+          : `历史版重演一致（策略未变 ${snapshot.revision}）`,
+      };
+    }
+    return {
+      mode: 'current-fallback',
+      verifiable: true,
+      reproducible,
+      policyChanged,
+      toolDecisionChanged,
+      recordedRevision: recorded.policyRevision,
+      currentRevision,
+      note: policyChanged
+        ? toolDecisionChanged
+          ? `策略已漂移（${recorded.policyRevision} → ${currentRevision}）且该工具放行判定已变，不可复现`
+          : `策略已漂移（${recorded.policyRevision} → ${currentRevision}），但该工具放行判定未受影响，仍可复现`
+        : '策略未变，该放行按记录版本可复现',
+    };
+  }
+
+  /** §internal.17③ 决策可复现（向后兼容视图，历史优先）：返回原 verifyReproducible 形状。 */
+  async verifyReproducible(recorded: {
+    tool?: string;
+    checks?: Array<{ name: string; ok?: boolean }>;
+    policyRevision?: string;
+  }): Promise<{
+    verifiable: boolean;
+    reproducible: boolean;
+    policyChanged: boolean;
+    toolDecisionChanged: boolean;
+    recordedRevision: string | null;
+    currentRevision: string;
+    note: string;
+  }> {
+    const r = await this.replayDecision(recorded);
+    return {
+      verifiable: r.verifiable,
+      reproducible: r.reproducible,
+      policyChanged: r.policyChanged,
+      toolDecisionChanged: r.toolDecisionChanged,
+      recordedRevision: r.recordedRevision,
+      currentRevision: r.currentRevision,
+      note: r.note,
+    };
+  }
+}

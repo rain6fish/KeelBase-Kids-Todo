@@ -1,0 +1,16 @@
+{
+  "module": "badges",
+  "label": "徽章",
+  "searchable": true,
+  "fields": [
+    { "name": "name", "type": "string", "label": "徽章名称", "required": true },
+    { "name": "description", "type": "text", "label": "描述" },
+    { "name": "badgeType", "type": "enum", "label": "徽章类型", "enum": ["streak_3", "streak_7", "streak_30", "streak_100", "points_50", "points_200", "points_500", "perfect_day", "perfect_week"] },
+    { "name": "threshold", "type": "int", "label": "达成阈值" },
+    { "name": "iconUrl", "type": "string", "label": "图标地址" }
+  ],
+  "aiTools": {
+    "query": true,
+    "create": { "riskLevel": "R3", "requiresConfirmation": true }
+  }
+}

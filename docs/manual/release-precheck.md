@@ -1,0 +1,155 @@
+# 发布前标准程序（Release Precheck）
+
+> 2026-08-21 确立（用户要求，作为 Release Gate 前置标准程序）。每次版本发布前必须执行，通过后才进入发布。
+
+## 标准程序（三步，顺序执行）
+
+### ① 代码审核（三方 + Code Economy，四层）
+
+**四层独立审核 → 整合结果 → 落地改进**：
+
+1. **阿里 code review（OpenCodeReview / `ocr` CLI，v1.13.1）**：**默认只审本次发布区间的 diff**——
+   - **默认（省 token 档）**：`npm run review:ocr -- --from <prev-release> --to <release-branch>`
+     - 固定 `--effort low`（1 轮；OCR 默认 `medium` 是 2 轮）、`--max-tokens 120000`、`--max-tokens-budget 120000000`；
+     - 默认排除 JSON / lock / SCSS / i18n / specs / provenance 等低价值文件；
+     - 跑完打印「组 / 文件 / 评论 / token / 估算成本」，摘要写入 `artifacts/ocr/`；退出码 `0=完整`、`2=有文件失败`、`1=整体失败`；
+     - 有失败文件时用 `--resume <session-id>` 只补跑，不全量重来；
+     - `--max-tools` 不要调：模板默认已是 50，小于默认不生效；
+     - **基线**（2026-10-18，`v1.1.0..HEAD`，默认 `medium`）：407 文件 / 70 组 / 4,560 次调用 / 267.4M 输入 + 3.62M 输出 / 45m26s / ≈29.9 元。本档目标 **90–120M 输入 / 10–13 元**。
+   - **全量**：`ocr scan`（全文件审查）**须单独说明**（谁要 · 为什么 · 预计成本）—— 2026-10-18 实测：一次全量扫 5 个仓 = **4438 次请求 / 42.54 元一小时**，而大多数文件自上次发版以来没动过（`P1-15`）。确需全量时用 `--path` 限定本次动过的目录，并带 `--max-tokens-budget`；`scan` 没有 `--effort`，省 token 靠 `--no-plan` / `--no-dedup` / `--no-summary` 与范围控制。
+   - 或 Claude Code 会话内 `/open-code-review:delegate-review`（OCR 选文件/规则 + 宿主审查，免 key）
+2. **Claude Code 自带 code review**：对同一 diff 跑 Claude 的多维代码审查（正确性 / 安全 / 性能 / 简化 / 测试覆盖）。
+3. **code-review skill（mattpocock，2026-08-28 安装）**：对同一区间跑双轴评审——Standards（是否符合仓库编码规范）与 Spec（是否符合源 issue/spec 要求），两轴并行子代理，结果并排报告。触发方式：`/code-review <commit|branch|tag|merge-base>`。
+4. **AI Code Economy Review（`/ai-code-economy-review` skill）**：对同一区间跑 Code Economy 审查（第四层，**不重复**前三层职责）——只检查 Necessity / Reuse / Simplicity / Proportionality / Deletion / Maintainability，重点发现 unnecessary code、reuse opportunity、AI-generated duplication、unnecessary abstraction、speculative engineering、wrapper、dead code、excessive complexity、disproportionate code expansion、deletion opportunity。判断原则：LOC 是信号非质量分（结合 Requirement/Implementation Complexity 判断 Proportionality）；KeelBase 的 Security/Governance/Audit/Transaction/Domain/Plugin/Protocol/External integration 边界 abstraction 不因「单一实现」判垃圾，需具体证据；Finding 必须区分 FACT/SUSPECTED + 给出 Severity/Category/File/Line/Evidence/Reason/Recommendation/Confidence；推荐动作按 `DELETE > REUSE > SIMPLIFY > CONSOLIDATE > REFACTOR > ADD`；默认 review-only 不改码。输出 Verdict：PASS / WARN / REFACTOR / REJECT。
+5. **整合**：合并四层意见，去重、分级（阻塞 / 建议 / 风格），阻塞项必须修复；建议项择优落地；改进提交回 main。
+
+> **四层固定（2026-08-31 定案）**：Code Review 只保留这四层——`OpenCodeReview → Claude Review → mattpocock Standards+Spec → AI Code Economy → Consolidated Decision`。**不继续增加第五/第六层 Review**（四层已足够重；Code Economy 是横向判断层，不是第五个垂直检查器）。
+
+#### 四层速查对照（避免混淆）
+
+| 层 | 工具 | 常见误记 / 别名 | 说明 |
+|---|---|---|---|
+| 1 | OpenCodeReview（阿里 `ocr` CLI） | 「三方代码规范/质量 Review」 | 对发布区间 diff 审查；delegate 模式免 key |
+| 2 | Claude 自带 code review | —（常被遗漏） | 正确性 / 安全 / 性能 / 简化 / 测试覆盖多维审查 |
+| 3 | code-review skill（mattpocock） | 误拆成「规范 Review + Spec Review 两层」 | **一层的双轴**：Standards（仓库编码规范）‖ Spec（源 issue/spec 符合性），两轴并行子代理并排报告 |
+| 4 | AI Code Economy Review | 常被误记为「Fowler Code Smells / 结构性 Review」 | 横向判断层：Necessity / Reuse / Simplicity / Proportionality / Deletion / Maintainability；结构性坏味道（死代码/过度抽象/复杂膨胀）归此层判断，**无单列 Fowler 层** |
+
+> **对照要点**：① Standards 与 Spec 是第 3 层**同一层的两个轴**，不是两层；② 没有单列的「Fowler Code Smells」层——坏味道判断归 Code Economy 层（Code Economy 是横向判断层，非第五个垂直检查器）；③ 第 1、2 层（OCR + Claude 自带）最常被遗漏，别只记 mattpocock + Code Economy 两层。
+
+### ② 全量测试
+
+| 套件 | 命令 | 门槛 |
+|------|------|------|
+| 后端单测 + 覆盖率 | `cd Server-NestJS && npm run test:cov` | statements≥86 / branches≥72 / functions≥81 / lines≥86 + 安全模块分档门控（statements≥85） |
+| 后端 e2e | `npm run test:e2e` | suite 全过 |
+| 前端 vitest（Web-Admin-Vue） | `cd Web-Admin-Vue && npm test` | statements≥32 / branches≥75 / functions≥54 / lines≥32 |
+| Flutter 测试 | `cd Front-Flutter && flutter test --coverage` | 行覆盖 ≥45% |
+| 生成器/CLI | `node --test scripts/keelbase-init.test.mjs` + `node --test scripts/keelbase-plugin.test.mjs` | 全过 |
+| Gate 1 Golden Application | `./scripts/verify-golden-application.sh` | 9 项 PASS（AI CRM 一次跑通闭环 + Build + Provenance）|
+| 文档-端点一致性 | `node scripts/verify-endpoint-docs.mjs` | 声明端点（CLAUDE.md §9）全在代码中，0 条缺失 |
+| Release Gate | `./scripts/release-gate.sh` | 确定性 Gate 全 PASS |
+
+### ③ 提高测试覆盖率
+
+- 全量跑 `test:cov` / `flutter test --coverage` / vitest 覆盖率后，对比上一版：
+- **覆盖降级或未达标 → 必须补测试提升**（新增模块/文件的最低覆盖缺口优先）
+- 目标：发布时后端 statements ≥ 门槛且不低于上一版；安全模块分档门控通过
+
+### ④ 版本 bump 与版本对账
+
+**两层版本，别混**（2026-09-22 松绑：清单版本与产品版本分开）：
+
+- **产品版本**（一个）= 根 `package.json` 的 `version`，**唯一真源**。它被两处**运行时权威**读取，
+  而两者读的是**两个不同清单**：
+  - `scripts/generator/manifest.mjs` 的 `generatorVersion()` → 写进生成物
+    `.keelbase/manifest.json` / `.keelbase-provenance.json`（来源身份）
+  - `Server-NestJS/src/app-version/app-version.config.ts` → `/app/version`、管理台「应用版本」行
+- **各端清单版本**（packaging）= 各 `package.json` / `pubspec.yaml` 自带，**可独立于产品号**。
+
+**发版只需 bump 这些**（= 发版线成员，须 == 产品版本）：
+
+| 清单 | 说明 |
+|------|------|
+| `package.json`（仓库根） | 产品版本真源 + 生成器来源身份读取源 |
+| `Server-NestJS/package.json` | 后端运行时版本（`/app/version`） |
+| 各 lockfile 根版本字段 | `version` + `packages[""].version`，跟随**其自身清单** |
+| 前端**显示**版本常量 | Flutter `app_constants.dart` 的 `appVersion`、Taro `settings/index.vue` 的 `appVersion` 跟随产品版本 |
+
+**不必再跟着 bump**：`Web-Admin-Vue` / `Front-Taro` / `Front-Flutter` 的清单版本（各自持版），
+以及 `Web-Admin-React`（预览版，未表态转正）。
+
+门禁：`node scripts/check-version-parity.mjs`（CI job `version-parity`）。除了成员与 lockfile，
+它还会**直检**两个运行时权威源仍在发版线成员内——防「权威源停更 → 生成物错版 + doctor 自比成假绿」
+（2026-09-16 事故的原形），以及前端显示版本常量掉队（原门禁的漏）。
+
+### ⑤ 文档同步（版本线 · 示例版本号 · 状态类）
+
+**触发**：分三档——
+- **每版都做**：**「示例 / 样本里的具体版本号」**（下表最后一行）—— 它钉的是产品版本，随每次发版变化。
+- **每版都做（顺带，很便宜）**：**「状态类文档」**（自称活清单 / 声明了状态日期者，见下「状态类文档」）—— 其**状态日期距本次发布 ≥ 一个季度** 时逐条复核并更新。
+- **仅版本线变更时做**：本次发布**开启新版本线**（如 `1.0.x` → `1.1.x`）或**改变某条线的状态**（转为当前线 / 转为已冻结）时，对**整张表**。**纯 patch 发布（同一线内）只做上面两档。**
+
+把文档的表述对账到已发布实况：
+
+| 文档 | 需核对的表述 |
+|------|-------------|
+| `docs/versioning.md` | 「版本线」表（哪条是当前线、哪条已被取代）· Current / Superseded 小节 · 「应用协议」本次新增项的描述 |
+| `SECURITY.md` | 「受支持的版本」段（当前发布线、是否维护 LTS 分支） |
+| 其它引用版本线的文档 | 如 `docs/protocol-trust-proof-card.spec.md` 的代码基线 pin |
+| 示例 / 样本里的具体版本号 | 如 `docs/module-protocol.md` 的示例 manifest（`generatorVersion` / `protocol`）——**每版都要对** |
+
+> **2026-10-09 教训**：v1.1.0（2026-10-05）发布后，`docs/versioning.md` 仍把 `1.0.x` 列为当前线、`1.1.x` 标为待触发，`SECURITY.md` 仍写 pre-1.0。本条即为此补。
+> **2026-10-10 补**：`docs/module-protocol.md` 的示例 manifest 曾停在 `generatorVersion 0.9.1` / `protocol 1.0` ⇒ 增「示例 / 样本里的具体版本号」一行（**每版**都要对，不受线变更触发限制）。
+
+#### 状态类文档（自称「活清单」/ 带状态日期）
+
+这类**最容易烂**：只靠人自觉维护，**停摆几个月也没人报警**。2026-10-10 实测 —— `docs/enterprise-readiness.md` 停摆两月，逐条复核后**四处更正里三处是「早已具备却记成待办 / 押后 / 失败」**（前端 RBAC · K8s 蓝绿 · weapp 构建）。
+
+**规则**：凡**声明了状态日期**或自称**活清单 / 随版本更新**的文档 —— **状态日期距本次发布 ≥ 一个季度** ⇒ 逐条复核并更新（**非 ✅ / 待办行必核，已 ✅ 行抽查证据**），复核后**更新状态日期**；**新增此类文档时在下面登记**。
+
+| 状态类文档 | 状态标记位置（发版时看一眼） |
+|---|---|
+| `docs/enterprise-readiness.md` | 顶部「状态日期：…」 |
+| `docs/manual/codebase-health-audit.md` | 顶部「首次全库体检：…」+ §5「待办（未做项）」 |
+
+## 执行记录
+
+每次发布前执行后，在 CHANGELOG/发布记录记一笔：
+
+```text
+Release Precheck（<日期>）：
+- 四层 code review：阿里 X 条 + Claude 自带 Y 条 + code-review skill Z 条 + Code Economy K 条 → 修复 W 条阻塞项
+- OCR 成本：X 组 / Y 文件 / Z token / ¥N（session <id>，effort low）
+- 全量测试：后端单测/e2e/前端/Flutter/生成器 全过（覆盖率 backend xx% / flutter xx%）
+- 覆盖率：较上版 +x.x% / 达标
+- 文档同步：版本线文档（versioning.md / SECURITY.md）已同步（仅开新线 / 改线状态时）· 状态类文档已复核（仅其状态日期 ≥ 1 个季度时；未到期记「无需」）
+```
+
+**Code Economy 观察记录**（v0.1 Observation，2026-08-31 起）：
+
+```text
+Release（<版本/日期>）：
+
+Code Economy:
+- Findings: N（High X / Medium Y / Low Z）
+- 动作分布：Delete D / Reuse R / Simplify S / Consolidate C
+- Critical: 0（必须为 0，否则阻塞发布）
+
+Code Expansion Signal:
+- AI generated: +X LOC
+- Review deleted: -Y LOC
+- Net: +Z LOC
+- 观察：若长期「generated +1000 / deleted -20」→ AI 已干净；若「generated +1500 / deleted -500」→ 本层价值高（未来可形成 AI Code Waste Ratio，暂不做）
+
+三维评估（观察期重点）：
+- False Positive：是否误杀合理架构？（尤其 Audit/Governance/Security/Protocol 边界）
+- False Negative：是否漏掉明显 AI Slop？
+- Actionability：发现的问题最终是否真的 删除/复用/简化/合并？
+
+连续积累 5～10 个 Release 后，据此决定是否升 v0.2（自动修复 / Score 等）。当前**冻结功能，只观察**。
+```
+
+## 相关
+
+- [release-gate.md](release-gate.md) — Release Gate 五维判定
+- `scripts/release-gate.sh` — 统一验证入口

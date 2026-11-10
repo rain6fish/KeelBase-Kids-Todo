@@ -1,0 +1,251 @@
+// SPDX-License-Identifier: Apache-2.0
+
+import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { mount, flushPromises } from '@vue/test-utils'
+import { createI18n } from 'vue-i18n'
+import zh from '@/i18n/zh'
+import en from '@/i18n/en'
+
+const { conversationsMock, traceMock, revokeMock, myEffectsMock, useRouteMock } = vi.hoisted(() => ({
+  conversationsMock: vi.fn(),
+  traceMock: vi.fn(),
+  revokeMock: vi.fn(),
+  myEffectsMock: vi.fn(),
+  useRouteMock: vi.fn(),
+}))
+
+vi.mock('@/api/aiTrace', () => ({
+  aiTraceApi: {
+    conversations: conversationsMock,
+    trace: traceMock,
+    revokeEffect: revokeMock,
+    myEffects: myEffectsMock,
+  },
+}))
+vi.mock('@/stores/snackbar', () => ({
+  useSnackbarStore: () => ({ success: vi.fn(), error: vi.fn() }),
+}))
+vi.mock('vue-router', () => ({
+  useRouter: () => ({ push: vi.fn() }),
+  useRoute: () => useRouteMock(),
+}))
+
+import ElementPlus from 'element-plus'
+import AiTraceView from '../AiTraceView.vue'
+import type { TraceEffect, TraceStep } from '@/types/workbench'
+
+const conv = {
+  id: 'conv-1',
+  provider: 'deepseek',
+  model: 'deepseek-v4-flash',
+  summary: null,
+  createdAt: '2026-08-25T10:00:00Z',
+  lastActivityAt: '2026-08-25T10:00:00Z',
+  messages: [{ role: 'user', content: '查一下客户', timestamp: '2026-08-25T10:00:00Z' }],
+}
+
+const steps: TraceStep[] = [
+  { id: 'msg-0', type: 'input', time: '2026-08-25T10:00:00Z', content: '查一下客户' },
+  {
+    id: 'tool-1',
+    type: 'tool_call',
+    time: '2026-08-25T10:00:01Z',
+    toolName: 'query_customers',
+    args: '{}',
+    success: true,
+    agentId: 'research-agent',
+    callerAgentId: 'orchestrator',
+  },
+  { id: 'conf-2', type: 'confirmation', time: '2026-08-25T10:00:02Z', toolName: 'create_followup_task', args: '{}', outcome: 'approve' },
+  {
+    id: 'effect-3',
+    type: 'effect',
+    time: '2026-08-25T10:00:03Z',
+    toolName: 'create_followup_task',
+    effect: { effectId: 1, resultType: 'crm_task', resultId: 42, targetTitle: '跟进', revocable: true },
+  },
+]
+
+/** A copy of `steps` whose effect carries (or omits) the server's own `status` reading. */
+function traceStepsWithEffectStatus(status?: TraceEffect['status']): TraceStep[] {
+  return steps.map((s) =>
+    s.id === 'effect-3' && s.effect
+      ? { ...s, effect: { ...s.effect, ...(status ? { status } : {}) } }
+      : s,
+  )
+}
+
+function mountView() {
+  const i18n = createI18n({ legacy: false, locale: 'zh', messages: { zh, en } })
+  return mount(AiTraceView, {
+    global: {
+      plugins: [i18n, ElementPlus],
+      stubs: { PageHeader: true, StatusChip: true, AppIcon: true },
+    },
+  })
+}
+
+beforeEach(() => {
+  vi.clearAllMocks()
+  useRouteMock.mockReturnValue({ query: {} })
+})
+
+describe('AiTraceView', () => {
+  it('加载对话列表（el-select 提供选项）', async () => {
+    conversationsMock.mockResolvedValue([conv])
+
+    const wrapper = mountView()
+    await flushPromises()
+
+    expect(conversationsMock).toHaveBeenCalledTimes(1)
+    // 对话标题来自首条 user 消息；el-select 折叠态不渲染选项文本，只显示 placeholder
+    expect(wrapper.text()).toContain('选择对话')
+  })
+
+  it('选中对话 → 渲染 trace 步骤来源标签（人/AI/系统）+ 子 agent 归责', async () => {
+    conversationsMock.mockResolvedValue([conv])
+    traceMock.mockResolvedValue({ conversation: conv, steps })
+
+    const wrapper = mountView()
+    await flushPromises()
+
+    const select = wrapper.findComponent({ name: 'ElSelect' })
+    await select.vm.$emit('update:modelValue', 'conv-1')
+    await flushPromises()
+
+    expect(traceMock).toHaveBeenCalledWith('conv-1')
+    const tags = wrapper.findAll('.el-tag').map((t) => t.text().trim())
+    // input → 人；tool_call → AI + research-agent；confirmation → 人；effect → 系统
+    expect(tags).toContain('人')
+    expect(tags).toContain('AI')
+    expect(tags).toContain('系统')
+    expect(wrapper.text()).toContain('research-agent')
+  })
+
+  it('深链 ?conv=<id> → 自动定位并加载该会话轨迹', async () => {
+    conversationsMock.mockResolvedValue([conv])
+    traceMock.mockResolvedValue({ conversation: conv, steps })
+    useRouteMock.mockReturnValue({ query: { conv: 'conv-1' } })
+
+    const wrapper = mountView()
+    await flushPromises()
+
+    expect(traceMock).toHaveBeenCalledWith('conv-1')
+    // 不需要手动选中即可渲染步骤（工具调用步骤渲染子 agent 归责）
+    expect(wrapper.text()).toContain('research-agent')
+  })
+
+  it('trace 失败 → 渲染错误提示', async () => {
+    conversationsMock.mockResolvedValue([conv])
+    traceMock.mockRejectedValue(new Error('boom'))
+
+    const wrapper = mountView()
+    await flushPromises()
+
+    const select = wrapper.findComponent({ name: 'ElSelect' })
+    await select.vm.$emit('update:modelValue', 'conv-1')
+    await flushPromises()
+
+    // trace 失败 → traceError 显示 err.message
+    expect(wrapper.text()).toContain('boom')
+  })
+
+  it('切到决策轨迹图 → 节点/边来自服务端步骤；副作用状态直接取 trace 的 effect.status', async () => {
+    conversationsMock.mockResolvedValue([conv])
+    traceMock.mockResolvedValue({ conversation: conv, steps: traceStepsWithEffectStatus('revoked') })
+
+    const wrapper = mountView()
+    await flushPromises()
+
+    const select = wrapper.findComponent({ name: 'ElSelect' })
+    await select.vm.$emit('update:modelValue', 'conv-1')
+    await flushPromises()
+
+    const group = wrapper.findComponent({ name: 'ElRadioGroup' })
+    await group.vm.$emit('update:modelValue', 'graph')
+    await flushPromises()
+
+    expect(wrapper.findAll('.trace-node')).toHaveLength(4)
+    expect(wrapper.findAll('.graph-edge')).toHaveLength(3)
+    // Trace is the single source — the old join against /ai/my/tool-effects (first 100 rows) is gone.
+    expect(myEffectsMock).not.toHaveBeenCalled()
+    expect(wrapper.find('.trace-node[data-step-id="effect-3"]').text()).toContain('已撤销')
+
+    await wrapper.find('.trace-node[data-step-id="tool-1"]').trigger('click')
+    await flushPromises()
+
+    const detail = wrapper.find('[data-testid="trace-step-detail"]')
+    expect(detail.exists()).toBe(true)
+    expect(detail.text()).toContain('该步读数')
+    expect(detail.text()).toContain('research-agent')
+  })
+
+  it('撤销前 executed / 撤销后再取 trace revoked → 同一节点从「已执行」变为「已撤销」', async () => {
+    conversationsMock.mockResolvedValue([conv])
+    traceMock
+      .mockResolvedValueOnce({ conversation: conv, steps: traceStepsWithEffectStatus('executed') })
+      .mockResolvedValueOnce({ conversation: conv, steps: traceStepsWithEffectStatus('revoked') })
+    revokeMock.mockResolvedValue({ revoked: true, effectId: 1 })
+
+    const wrapper = mountView()
+    await flushPromises()
+
+    const select = wrapper.findComponent({ name: 'ElSelect' })
+    await select.vm.$emit('update:modelValue', 'conv-1')
+    await flushPromises()
+
+    const group = wrapper.findComponent({ name: 'ElRadioGroup' })
+    await group.vm.$emit('update:modelValue', 'graph')
+    await flushPromises()
+
+    expect(wrapper.find('.trace-node[data-step-id="effect-3"]').text()).toContain('已执行')
+
+    await wrapper.find('.trace-node[data-step-id="effect-3"] .node-revoke').trigger('click')
+    await flushPromises()
+
+    expect(traceMock).toHaveBeenCalledTimes(2)
+    expect(wrapper.find('.trace-node[data-step-id="effect-3"]').text()).toContain('已撤销')
+  })
+
+  it('trace 不带 status（旧服务端）→ 不标注撤销态：不知道 ≠ 未撤销', async () => {
+    conversationsMock.mockResolvedValue([conv])
+    traceMock.mockResolvedValue({ conversation: conv, steps })
+
+    const wrapper = mountView()
+    await flushPromises()
+
+    const select = wrapper.findComponent({ name: 'ElSelect' })
+    await select.vm.$emit('update:modelValue', 'conv-1')
+    await flushPromises()
+
+    const group = wrapper.findComponent({ name: 'ElRadioGroup' })
+    await group.vm.$emit('update:modelValue', 'graph')
+    await flushPromises()
+
+    const text = wrapper.find('.trace-node[data-step-id="effect-3"]').text()
+    expect(text).not.toContain('已执行')
+    expect(text).not.toContain('已撤销')
+  })
+
+  it('图上可撤副作用 → 点撤销调用服务端撤销接口', async () => {
+    conversationsMock.mockResolvedValue([conv])
+    traceMock.mockResolvedValue({ conversation: conv, steps })
+
+    const wrapper = mountView()
+    await flushPromises()
+
+    const select = wrapper.findComponent({ name: 'ElSelect' })
+    await select.vm.$emit('update:modelValue', 'conv-1')
+    await flushPromises()
+
+    const group = wrapper.findComponent({ name: 'ElRadioGroup' })
+    await group.vm.$emit('update:modelValue', 'graph')
+    await flushPromises()
+
+    revokeMock.mockResolvedValue({ revoked: true, effectId: 1 })
+    await wrapper.find('.trace-node[data-step-id="effect-3"] .node-revoke').trigger('click')
+    await flushPromises()
+
+    expect(revokeMock).toHaveBeenCalledWith(1)
+  })
+})

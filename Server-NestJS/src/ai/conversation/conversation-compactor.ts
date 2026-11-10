@@ -1,0 +1,149 @@
+// SPDX-License-Identifier: Apache-2.0
+
+/**
+ * 对话压缩器 — ConversationCompactor
+ *
+ * 长对话上下文压缩：把最旧的轮次压缩成一段中文摘要持久化到
+ * ai_conversations.summary，之后 buildMessages 回放「摘要 + 最近窗口」。
+ *
+ * 同步压缩（穿越阈值的回合付一次 LLM 调用），失败优雅降级（全量回放）。
+ * plain class，由 AiService 的 useFactory 手动组合（同 RouterAgent 模式）。
+ */
+
+import { LlmProviderFactory } from '../providers/provider-factory';
+import { LlmProvider } from '../interfaces/llm-provider.interface';
+// import type：AiServiceConfig 是 interface，本文件也只在类型位置用它（构造参数）。写成值 import 会在
+// 源码层面留一条 compactor → ai.service 的边（而 compactor 本就被 ai.service 依赖）。TS 默认会擦除这类
+// 纯类型 import，运行期本无此边；显式标 type 是让意图可见，并在将来开启 verbatimModuleSyntax 时不让
+// 这条边重新长出来。（codebase-health-audit §5 阶段 2 残余 · 环 1）
+import type { AiServiceConfig } from '../ai.service';
+import { ConversationService, ConversationData } from './conversation.service';
+import { LlmUsage } from '../llm-usage';
+
+/** 一次压缩的结果：压完的对话 + 本次摘要调用消耗的用量（未实际调用时缺省） */
+export interface CompactionResult {
+  conversation: ConversationData;
+  usage?: LlmUsage;
+}
+
+const COMPACT_THRESHOLD = 40;
+const KEEP_RECENT = 12;
+const MAX_SUMMARIZE_PER_MSG = 500;
+const SUMMARY_MAX_TOKENS = 512;
+const SUMMARY_TEMPERATURE = 0.3;
+
+const SUMMARY_SYSTEM_PROMPT = `你是对话压缩助手。把下面这段对话压缩成一段中文摘要，不超过 300 字。
+必须保留：用户的偏好、已做的决定、进行中的任务与待办、关键事实与数据。
+不要编造，不要给建议。只输出摘要正文。`;
+
+export class ConversationCompactor {
+  /** 并发保护：同一对话的压缩只跑一次 LLM 调用 */
+  private readonly inflight = new Map<string, Promise<CompactionResult>>();
+
+  constructor(
+    private readonly providerFactory: LlmProviderFactory,
+    private readonly config: AiServiceConfig,
+    private readonly conversationService: ConversationService,
+  ) {}
+
+  /**
+   * 确保对话已压缩。消息数 ≤ 阈值时不处理；
+   * 超过阈值（无论是否已有摘要）触发折叠式重压缩。
+   */
+  async ensureCompacted(conv: ConversationData): Promise<CompactionResult> {
+    if (conv.messages.length <= COMPACT_THRESHOLD) return { conversation: conv };
+
+    const existing = this.inflight.get(conv.id);
+    if (existing) {
+      // 压缩已由另一个并发请求触发：那笔 token 记在发起方，此处不重复计
+      await existing;
+      return { conversation: await this.conversationService.peekConversation(conv.id) };
+    }
+
+    const task = this.doCompact(conv).finally(() => this.inflight.delete(conv.id));
+    this.inflight.set(conv.id, task);
+    return task;
+  }
+
+  private async doCompact(conv: ConversationData): Promise<CompactionResult> {
+    let usage: LlmUsage | undefined;
+    try {
+      // 最近窗口 + 边界 tool 溢出守卫
+      let keepStart = Math.max(0, conv.messages.length - KEEP_RECENT);
+      while (keepStart > 0 && conv.messages[keepStart].role === 'tool') keepStart--;
+
+      const toSummarize = conv.messages.slice(0, keepStart);
+      if (toSummarize.length < 4) return { conversation: conv }; // 太短不值得一次 LLM 调用
+
+      const keep = conv.messages.slice(keepStart);
+      const provider = this.resolveProvider(conv.provider);
+      const summarized = await this.summarize(
+        provider,
+        conv.model,
+        conv.summary,
+        toSummarize,
+      );
+      usage = summarized.usage;
+      if (!summarized.summary) throw new Error('Empty summary from LLM');
+
+      const raw = await this.conversationService.getMessagesForCompaction(conv.id);
+      const deleteIds = raw.slice(0, toSummarize.length).map((m) => m.id);
+      await this.conversationService.applyCompaction(conv.id, summarized.summary, deleteIds);
+
+      return { conversation: { ...conv, summary: summarized.summary, messages: keep }, usage };
+    } catch (err) {
+      console.error(
+        `[ConversationCompactor] compaction failed for ${conv.id}:`,
+        (err as Error).message,
+      );
+      // 降级：全量回放，下轮重试；但摘要调用可能已经花掉 token（后续写库失败）→ 如实带回
+      return { conversation: conv, usage };
+    }
+  }
+
+  private resolveProvider(providerName: string): LlmProvider {
+    try {
+      return this.providerFactory.getProvider(providerName);
+    } catch {
+      return this.providerFactory.getProvider(this.config.defaultProvider);
+    }
+  }
+
+  private async summarize(
+    provider: LlmProvider,
+    model: string | undefined,
+    priorSummary: string | undefined,
+    toSummarize: Array<{ role: string; content: string }>,
+  ): Promise<{ summary: string; usage?: LlmUsage }> {
+    const turns = toSummarize
+      .filter((m) => (m.role === 'user' || m.role === 'assistant') && m.content.trim())
+      .map((m) => {
+        const text = m.content.slice(0, MAX_SUMMARIZE_PER_MSG);
+        return `${m.role === 'user' ? '用户' : '助手'}：${text}`;
+      })
+      .join('\n');
+
+    const messages: Array<{ role: 'system' | 'user'; content: string }> = [
+      { role: 'system', content: SUMMARY_SYSTEM_PROMPT },
+    ];
+    if (priorSummary) {
+      messages.push({
+        role: 'user',
+        content: `已有摘要：\n${priorSummary}\n\n以下为新增的较早对话（需要并入摘要）：\n${turns}`,
+      });
+    } else {
+      messages.push({ role: 'user', content: turns });
+    }
+
+    const result = await provider.generate({
+      messages,
+      model: model ?? this.config.defaultModel,
+      maxTokens: SUMMARY_MAX_TOKENS,
+      temperature: SUMMARY_TEMPERATURE,
+    });
+
+    const summary = (result.content ?? '').trim();
+    // 空摘要由调用方判失败：本次 generate 已消耗 token，先带出用量再判，不因抛错丢掉
+    return { summary, usage: result.usage };
+  }
+}

@@ -1,0 +1,64 @@
+// SPDX-License-Identifier: Apache-2.0
+
+/**
+ * 查询任务工具 — query_tasks（只读）
+ *
+ * 按 userId 限定数据范围（本人数据）；EASY-2 自动生成。
+ */
+
+import { AiTool, ToolDefinition, ToolParameter, ToolResult } from '../interfaces/tool.interface';
+
+interface TasksServiceLike {
+  findAll(userId: number, q?: string): Promise<any[]>;
+}
+
+export class QueryTasksTool implements AiTool {
+  readonly name = 'query_tasks';
+  readonly description = '查询任务列表（本人数据）。用户问"有哪些任务"时使用。';
+  readonly parameters: ToolParameter[] = [
+    { name: 'keyword', type: 'string', description: '关键字（可选）', required: false },
+  ];
+
+  constructor(private readonly tasksService: TasksServiceLike) {}
+
+  toToolDefinition(): ToolDefinition {
+    return {
+      type: 'function',
+      function: {
+        name: this.name,
+        description: this.description,
+        parameters: {
+          type: 'object',
+          properties: {
+            keyword: { type: 'string', description: '关键字（可选）' },
+          },
+        },
+      },
+    };
+  }
+
+  async execute(args: Record<string, unknown>, userId: string): Promise<ToolResult> {
+    try {
+      const keyword = typeof args.keyword === 'string' ? args.keyword : undefined;
+      const items = await this.tasksService.findAll(Number(userId), keyword);
+      const data = items.map((item) => {
+        const o: Record<string, unknown> = { id: item.id };
+        o.title = item.title;
+        o.description = item.description;
+        o.priority = item.priority;
+        o.status = item.status;
+        o.taskDate = item.taskDate;
+        o.estimatedMinutes = item.estimatedMinutes;
+        o.repeatRule = item.repeatRule;
+        o.approvalStatus = item.approvalStatus;
+        o.helpRequested = item.helpRequested;
+        o.helpRequestNote = item.helpRequestNote;
+        o.sortOrder = item.sortOrder;
+        return o;
+      });
+      return { success: true, data };
+    } catch (err) {
+      return { success: false, error: (err as Error).message };
+    }
+  }
+}

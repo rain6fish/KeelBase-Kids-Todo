@@ -1,0 +1,514 @@
+// SPDX-License-Identifier: Apache-2.0
+
+import 'package:flutter/cupertino.dart';
+import 'package:flutter/foundation.dart' show kDebugMode;
+import 'package:provider/provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'dart:async' show TimeoutException;
+import 'core/constants/app_constants.dart';
+
+import 'app.dart';
+import 'core/api/api_client.dart';
+import 'core/api/capabilities_provider.dart';
+import 'core/api/capabilities_repository.dart';
+import 'core/api/provenance_provider.dart';
+import 'core/api/provenance_repository.dart';
+import 'core/api/sse_client.dart';
+import 'core/api/ws_client.dart';
+import 'core/security/secure_storage_service.dart';
+import 'core/i18n/app_localizations.dart';
+import 'core/services/locale_provider.dart';
+import 'core/services/theme_provider.dart';
+import 'core/services/push_service.dart';
+import 'core/services/push_token_provider.dart';
+import 'features/auth/data/repositories/auth_repository.dart';
+import 'features/auth/presentation/providers/auth_provider.dart';
+import 'features/events/data/repositories/events_repository.dart';
+import 'features/events/presentation/providers/events_provider.dart';
+import 'features/splash/data/repositories/splash_repository.dart';
+import 'features/upload/data/repositories/upload_repository.dart';
+import 'features/notifications/data/repositories/notifications_repository.dart';
+import 'features/notifications/presentation/providers/notifications_provider.dart';
+import 'features/ai/presentation/providers/ai_chat_provider.dart';
+import 'features/ai/presentation/providers/conversation_provider.dart';
+import 'features/ai/data/repositories/ai_conversation_repository.dart';
+import 'features/sessions/data/repositories/session_repository.dart';
+import 'features/sessions/presentation/providers/session_provider.dart';
+import 'features/todos/data/repositories/todos_repository.dart';
+import 'features/sync/data/services/offline_sync_service.dart';
+import 'features/stats/data/repositories/stats_repository.dart';
+import 'features/stats/presentation/providers/stats_provider.dart';
+import 'features/badge_awards/data/repositories/badge_awards_repository.dart';
+import 'features/badge_awards/presentation/providers/badge_awards_provider.dart';
+
+import 'features/reward_redemptions/data/repositories/reward_redemptions_repository.dart';
+import 'features/reward_redemptions/presentation/providers/reward_redemptions_provider.dart';
+
+import 'features/task_notes/data/repositories/task_notes_repository.dart';
+import 'features/task_notes/presentation/providers/task_notes_provider.dart';
+
+import 'features/achievements/data/repositories/achievements_repository.dart';
+import 'features/achievements/presentation/providers/achievements_provider.dart';
+
+import 'features/checkins/data/repositories/checkins_repository.dart';
+import 'features/checkins/presentation/providers/checkins_provider.dart';
+
+import 'features/badges/data/repositories/badges_repository.dart';
+import 'features/badges/presentation/providers/badges_provider.dart';
+
+import 'features/daily_reviews/data/repositories/daily_reviews_repository.dart';
+import 'features/daily_reviews/presentation/providers/daily_reviews_provider.dart';
+
+import 'features/rewards/data/repositories/rewards_repository.dart';
+import 'features/rewards/presentation/providers/rewards_provider.dart';
+
+import 'features/families/data/repositories/families_repository.dart';
+import 'features/families/presentation/providers/families_provider.dart';
+
+import 'features/tasks/data/repositories/tasks_repository.dart';
+import 'features/tasks/presentation/providers/tasks_provider.dart';
+
+import 'features/leave_requests/data/repositories/leave_requests_repository.dart';
+import 'features/leave_requests/presentation/providers/leave_requests_provider.dart';
+
+import 'features/inventory_movements/data/repositories/inventory_movements_repository.dart';
+import 'features/inventory_movements/presentation/providers/inventory_movements_provider.dart';
+
+import 'features/asset_loans/data/repositories/asset_loans_repository.dart';
+import 'features/asset_loans/presentation/providers/asset_loans_provider.dart';
+
+import 'features/points_ledgers/data/repositories/points_ledgers_repository.dart';
+import 'features/points_ledgers/presentation/providers/points_ledgers_provider.dart';
+
+import 'features/point_records/data/repositories/point_records_repository.dart';
+import 'features/point_records/presentation/providers/point_records_provider.dart';
+
+import 'features/reports/data/repositories/reports_repository.dart';
+import 'features/reports/presentation/providers/reports_provider.dart';
+import 'features/followup_plans/data/repositories/followup_plans_repository.dart';
+import 'features/followup_plans/presentation/providers/followup_plans_provider.dart';
+
+import 'features/contracts/data/repositories/contracts_repository.dart';
+import 'features/contracts/presentation/providers/contracts_provider.dart';
+
+import 'features/suppliers/data/repositories/suppliers_repository.dart';
+import 'features/suppliers/presentation/providers/suppliers_provider.dart';
+
+import 'features/tags/data/repositories/tags_repository.dart';
+import 'features/tags/presentation/providers/tags_provider.dart';
+import 'features/flows/data/repositories/flows_repository.dart';
+import 'features/flows/presentation/providers/flows_provider.dart';
+
+import 'features/notes/data/repositories/notes_repository.dart';
+import 'features/notes/presentation/providers/notes_provider.dart';
+
+import 'features/books/data/repositories/books_repository.dart';
+import 'features/books/presentation/providers/books_provider.dart';
+import 'features/posts/data/repositories/posts_repository.dart';
+import 'features/posts/presentation/providers/posts_provider.dart';
+import 'features/crm/data/repositories/crm_repository.dart';
+import 'features/crm/presentation/providers/crm_provider.dart';
+import 'features/pm/data/repositories/pm_repository.dart';
+import 'features/pm/presentation/providers/pm_provider.dart';
+import 'features/approval/data/repositories/approval_repository.dart';
+import 'features/approval/presentation/providers/approval_provider.dart';
+import 'features/org/data/repositories/org_repository.dart';
+import 'features/org/presentation/providers/org_provider.dart';
+import 'features/points/data/repositories/points_repository.dart';
+import 'features/points/presentation/providers/points_provider.dart';
+
+import 'features/todos/presentation/providers/todos_provider.dart';
+import 'features/search/data/repositories/search_repository.dart';
+import 'features/search/presentation/providers/search_provider.dart';
+import 'features/upload/presentation/providers/upload_provider.dart';
+import 'features/version/data/repositories/version_repository.dart';
+import 'features/insights/data/repositories/insights_repository.dart';
+import 'features/insights/presentation/providers/insights_provider.dart';
+import 'features/announcements/presentation/providers/announcement_provider.dart';
+import 'features/onboarding/presentation/providers/onboarding_provider.dart';
+import 'core/services/app_cache.dart';
+import 'core/services/app_lock_provider.dart';
+import 'features/version/presentation/providers/version_check_provider.dart';
+import 'features/auth/data/services/oauth_service.dart';
+
+void main() async {
+  // Timeout fallback: if init takes >15s, show error UI
+  try {
+    await _initApp().timeout(const Duration(seconds: 15));
+  } on TimeoutException {
+    FlutterError.reportError(FlutterErrorDetails(
+      exception: Exception('App initialization timed out'),
+      stack: StackTrace.current,
+    ));
+    runApp(_ErrorApp('App initialization timed out. Please refresh.'));
+  } catch (e, stack) {
+    debugPrint('FATAL: App initialization failed: $e\n$stack');
+    // Re-throw so the browser console shows the full error
+    runApp(_ErrorApp('$e'));
+  }
+}
+
+Future<void> _initApp() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  // Core services
+  // 平台不支持本地存储时（如无 localStorage 的 Web）降级到内存态空实例，不阻断启动——
+  // setMockInitialValues 是 shared_preferences 提供的唯一兜底入口（生产仅此一处用途）。
+  late SharedPreferences prefs;
+  try {
+    prefs = await SharedPreferences.getInstance();
+  } catch (_) {
+    // ignore: invalid_use_of_visible_for_testing_member
+    SharedPreferences.setMockInitialValues({});
+    prefs = await SharedPreferences.getInstance();
+  }
+  // UX-2 Dev Menu 环境切换：只在 debug/profile 生效。
+  // release 包必须用编译期 API_BASE_URL——否则旧安装残留的 dev_base_url 会覆盖线上地址，
+  // 表现为「无网络连接」。
+  if (kDebugMode) {
+    final devBaseUrl = prefs.getString(AppConstants.keyDevBaseUrl);
+    if (devBaseUrl != null && devBaseUrl.isNotEmpty) {
+      AppConstants.activeBaseUrl = devBaseUrl;
+    }
+  }
+  final secureStorage = SecureStorageService();  // Falls back to in-memory on web
+  final apiClient = ApiClient(secureStorage);
+  final offlineSync = OfflineSyncService(apiClient, secureStorage);
+
+  // Initialize device ID for rate limiting
+  apiClient.deviceId = await secureStorage.getOrCreateDeviceId();
+
+  // Repositories
+  final authRepository = AuthRepository(apiClient);
+  final splashRepository = SplashRepository(apiClient);
+  final eventsRepository = EventsRepository(apiClient);
+  final uploadRepository = UploadRepository(apiClient);
+  final notificationsRepository = NotificationsRepository(apiClient);
+  final aiConversationRepository = AiConversationRepository(apiClient);
+  // MOD-4 capabilities：预设 + 功能开关（EASY-5 预设引导 / 导航隐藏共用）
+  final capabilitiesProvider =
+      CapabilitiesProvider(CapabilitiesRepository(apiClient));
+  // FE-1 provenance：运行时来源指纹（关于页展示）
+  final provenanceProvider =
+      ProvenanceProvider(ProvenanceRepository(apiClient));
+
+  // Auth failure handler — must be set before any API calls
+  AuthProvider? authProvider;
+  apiClient.onAuthFailure = () async {
+    authProvider?.logout();
+  };
+
+  // Initialize OAuth SDKs (WeChat / Alipay)
+  // Replace app IDs with your actual credentials from the respective platforms.
+  final oauthService = OAuthService();
+  try {
+    await oauthService.init(
+      weChatAppId: 'wx000000000000000',          // ← 替换为微信开放平台 AppID
+      weChatUniversalLink: null,                  // iOS Universal Link (可选)
+    );
+  } catch (_) {
+    // OAuth init is non-critical — app can still start
+  }
+
+  // SSE client for AI streaming（CR-17：401 时经 ApiClient 刷新后重连）
+  final sseClient = SseClient(
+    getAccessToken: () => apiClient.accessToken ?? '',
+    refreshToken: () => apiClient.refreshNow(),
+  );
+
+  // RG-6 WebSocket 双向通道（通知推送 + AI 流式）
+  final wsClient = WsClient(getAccessToken: () => apiClient.accessToken ?? '');
+
+  // Theme
+  final themeProvider = ThemeProvider(prefs);
+
+  // MOD-4：启动即拉取 capabilities（Public），供导航隐藏 + 预设引导
+  capabilitiesProvider.load();
+  // FE-1：启动即拉取 provenance（Public），供关于页来源指纹
+  provenanceProvider.load();
+
+  runApp(
+    MultiProvider(
+      providers: [
+        // Core services (accessible by all features)
+        Provider<SecureStorageService>.value(value: secureStorage),
+        Provider<SharedPreferences>.value(value: prefs),
+        Provider<ApiClient>.value(value: apiClient),
+        Provider<OfflineSyncService>.value(value: offlineSync),
+        Provider<SseClient>.value(value: sseClient),
+        Provider<WsClient>.value(value: wsClient),
+        Provider<AuthRepository>.value(value: authRepository),
+        ChangeNotifierProvider<CapabilitiesProvider>.value(
+          value: capabilitiesProvider,
+        ),
+        ChangeNotifierProvider<ProvenanceProvider>.value(
+          value: provenanceProvider,
+        ),
+
+        // GROWTH-1 推送：默认 Noop（未接厂商），真实 JPush/FCM 接入后替换实现
+        Provider<PushService>(
+          create: (_) => NoopPushService(),
+        ),
+        ProxyProvider2<ApiClient, PushService, PushTokenProvider>(
+          update: (_, api, push, _) => PushTokenProvider(api, push),
+        ),
+
+        // Events
+        Provider<EventsRepository>.value(value: eventsRepository),
+
+        // Theme
+        ChangeNotifierProvider<ThemeProvider>.value(value: themeProvider),
+
+        // Locale
+        ChangeNotifierProvider<LocaleProvider>(
+          create: (_) => LocaleProvider(prefs),
+        ),
+
+        // UX-4 应用锁（生物识别）
+        ChangeNotifierProvider<AppLockProvider>(
+          create: (_) => AppLockProvider(prefs),
+        ),
+
+        // Auth
+        ChangeNotifierProvider<AuthProvider>(
+          create: (_) {
+            final ap = AuthProvider(
+              authRepository: authRepository,
+              splashRepository: splashRepository,
+              apiClient: apiClient,
+              oauthService: oauthService,
+              cache: AppCache(prefs),
+            );
+            authProvider = ap;
+            return ap;
+          },
+        ),
+
+        // Events
+        ChangeNotifierProvider<EventsProvider>(
+          create: (_) => EventsProvider(eventsRepository),
+        ),
+
+        // Notifications (UX-1 缓存优先 + RG-6 WS 实时推送)
+        ChangeNotifierProvider<NotificationsProvider>(
+          create: (_) => NotificationsProvider(
+            notificationsRepository,
+            wsClient: wsClient,
+            sseClient: sseClient,
+            cache: AppCache(prefs),
+          ),
+        ),
+
+        // Upload
+        ChangeNotifierProvider<UploadProvider>(
+          create: (_) => UploadProvider(uploadRepository),
+        ),
+
+        // AI
+        ChangeNotifierProvider<AiChatProvider>(
+          create: (context) {
+            final l10n = context.l10n;
+            return AiChatProvider(
+              apiClient,
+              sseClient,
+              wsClient: wsClient,
+              errorWithDetail: (msg) => l10n.aiErrorWithDetail(msg),
+              errorRetry: () => l10n.aiError,
+              confirmFailed: () => l10n.aiConfirmFailed,
+            );
+          },
+        ),
+        ChangeNotifierProvider<ConversationProvider>(
+          create: (_) => ConversationProvider(aiConversationRepository),
+        ),
+
+        // Sessions
+        ChangeNotifierProvider<SessionProvider>(
+          create: (_) => SessionProvider(SessionRepository(apiClient)),
+        ),
+
+        // Search (PL-4.1 搜索历史 + AI 对话 Tab)
+        ChangeNotifierProvider<SearchProvider>(
+          create: (_) => SearchProvider(
+            SearchRepository(apiClient),
+            prefs: prefs,
+            conversationRepository: AiConversationRepository(apiClient),
+          ),
+        ),
+
+        // Todos (UX-1 缓存优先 + 乐观更新)
+        ChangeNotifierProvider<TodosProvider>(
+          create: (_) => TodosProvider(TodosRepository(apiClient), cache: AppCache(prefs)),
+        ),
+        // 徽章授予（EASY-2 生成）
+        ChangeNotifierProvider<BadgeAwardsProvider>(
+          create: (_) => BadgeAwardsProvider(BadgeAwardsRepository(apiClient), cache: AppCache(prefs)),
+        ),
+        // 兑换记录（EASY-2 生成）
+        ChangeNotifierProvider<RewardRedemptionsProvider>(
+          create: (_) => RewardRedemptionsProvider(RewardRedemptionsRepository(apiClient), cache: AppCache(prefs)),
+        ),
+        // 任务备注（EASY-2 生成）
+        ChangeNotifierProvider<TaskNotesProvider>(
+          create: (_) => TaskNotesProvider(TaskNotesRepository(apiClient), cache: AppCache(prefs)),
+        ),
+        // 成就（EASY-2 生成）
+        ChangeNotifierProvider<AchievementsProvider>(
+          create: (_) => AchievementsProvider(AchievementsRepository(apiClient), cache: AppCache(prefs)),
+        ),
+        // 打卡（EASY-2 生成）
+        ChangeNotifierProvider<CheckinsProvider>(
+          create: (_) => CheckinsProvider(CheckinsRepository(apiClient), cache: AppCache(prefs)),
+        ),
+        // 徽章（EASY-2 生成）
+        ChangeNotifierProvider<BadgesProvider>(
+          create: (_) => BadgesProvider(BadgesRepository(apiClient), cache: AppCache(prefs)),
+        ),
+        // 每日评价（EASY-2 生成）
+        ChangeNotifierProvider<DailyReviewsProvider>(
+          create: (_) => DailyReviewsProvider(DailyReviewsRepository(apiClient), cache: AppCache(prefs)),
+        ),
+        // 奖励（EASY-2 生成）
+        ChangeNotifierProvider<RewardsProvider>(
+          create: (_) => RewardsProvider(RewardsRepository(apiClient), cache: AppCache(prefs)),
+        ),
+        // 今日概览（家庭统计 + 个人连签）
+        ChangeNotifierProvider<StatsProvider>(
+          create: (_) => StatsProvider(StatsRepository(apiClient)),
+        ),
+        // 家庭（EASY-2 生成）
+        ChangeNotifierProvider<FamiliesProvider>(
+          create: (_) => FamiliesProvider(FamiliesRepository(apiClient), cache: AppCache(prefs)),
+        ),
+        // 任务（EASY-2 生成）
+        ChangeNotifierProvider<TasksProvider>(
+          create: (_) => TasksProvider(
+            TasksRepository(apiClient),
+            cache: AppCache(prefs),
+            sync: offlineSync,
+          ),
+        ),
+        // 请假申请（EASY-2 生成）
+        ChangeNotifierProvider<LeaveRequestsProvider>(
+          create: (_) => LeaveRequestsProvider(LeaveRequestsRepository(apiClient), cache: AppCache(prefs)),
+        ),
+        // 库存出入库（EASY-2 生成）
+        ChangeNotifierProvider<InventoryMovementsProvider>(
+          create: (_) => InventoryMovementsProvider(InventoryMovementsRepository(apiClient), cache: AppCache(prefs)),
+        ),
+        // 资产借用（EASY-2 生成）
+        ChangeNotifierProvider<AssetLoansProvider>(
+          create: (_) => AssetLoansProvider(AssetLoansRepository(apiClient), cache: AppCache(prefs)),
+        ),
+        // 积分台账（EASY-2 生成）
+        ChangeNotifierProvider<PointsLedgersProvider>(
+          create: (_) => PointsLedgersProvider(PointsLedgersRepository(apiClient), cache: AppCache(prefs)),
+        ),
+        // 积分流水（EASY-2 生成）
+        ChangeNotifierProvider<PointRecordsProvider>(
+          create: (_) => PointRecordsProvider(PointRecordsRepository(apiClient), cache: AppCache(prefs)),
+        ),
+        // 报告（EASY-2 生成）
+        ChangeNotifierProvider<ReportsProvider>(
+          create: (_) => ReportsProvider(ReportsRepository(apiClient), cache: AppCache(prefs)),
+        ),
+        // 跟进计划（EASY-2 生成）
+        ChangeNotifierProvider<FollowupPlansProvider>(
+          create: (_) => FollowupPlansProvider(FollowupPlansRepository(apiClient), cache: AppCache(prefs)),
+        ),
+        // 合同（EASY-2 生成）
+        ChangeNotifierProvider<ContractsProvider>(
+          create: (_) => ContractsProvider(ContractsRepository(apiClient), cache: AppCache(prefs)),
+        ),
+        // 供应商（EASY-2 生成）
+        ChangeNotifierProvider<SuppliersProvider>(
+          create: (_) => SuppliersProvider(SuppliersRepository(apiClient), cache: AppCache(prefs)),
+        ),
+
+        // FLOW-7 审批待办
+        ChangeNotifierProvider<FlowsProvider>(
+          create: (_) => FlowsProvider(FlowsRepository(apiClient)),
+        ),
+        // 标签（EASY-2 生成）
+        ChangeNotifierProvider<TagsProvider>(
+          create: (_) => TagsProvider(TagsRepository(apiClient), cache: AppCache(prefs)),
+        ),
+        // 笔记（EASY-2 生成）
+        ChangeNotifierProvider<NotesProvider>(
+          create: (_) => NotesProvider(NotesRepository(apiClient), cache: AppCache(prefs)),
+        ),
+        // 图书（EASY-2 生成）
+        ChangeNotifierProvider<BooksProvider>(
+          create: (_) => BooksProvider(BooksRepository(apiClient), cache: AppCache(prefs)),
+        ),
+        // 帖子（EASY-2 生成）
+        ChangeNotifierProvider<PostsProvider>(
+          create: (_) => PostsProvider(PostsRepository(apiClient), cache: AppCache(prefs)),
+        ),
+        // AI CRM 旗舰应用
+        ChangeNotifierProvider<CrmProvider>(
+          create: (_) => CrmProvider(CrmRepository(apiClient)),
+        ),
+        // AI Project Management 旗舰应用
+        ChangeNotifierProvider<PmProvider>(
+          create: (_) => PmProvider(PmRepository(apiClient)),
+        ),
+        // AI Approval 旗舰应用
+        ChangeNotifierProvider<ApprovalProvider>(
+          create: (_) => ApprovalProvider(ApprovalRepository(apiClient)),
+        ),
+
+        // 我的组织（ORG-7，只读通讯录）
+        ChangeNotifierProvider<OrgProvider>(
+          create: (_) => OrgProvider(OrgRepository(apiClient)),
+        ),
+
+        // 积分 / 签到（GROWTH-3）
+        ChangeNotifierProvider<PointsProvider>(
+          create: (_) => PointsProvider(PointsRepository(apiClient)),
+        ),
+
+        // Version check
+        ChangeNotifierProvider<VersionCheckProvider>(
+          create: (_) => VersionCheckProvider(VersionRepository(apiClient)),
+        ),
+
+        // Insights (UX-5)
+        ChangeNotifierProvider<InsightsProvider>(
+          create: (_) => InsightsProvider(InsightsRepository(apiClient)),
+        ),
+
+        // Announcements (UX-6)
+        ChangeNotifierProvider<AnnouncementProvider>(
+          create: (_) => AnnouncementProvider(notificationsRepository),
+        ),
+
+        // Onboarding (UX-8)
+        ChangeNotifierProvider<OnboardingProvider>(
+          create: (_) => OnboardingProvider(prefs),
+        ),
+      ],
+      child: const App(),
+    ),
+  );
+}
+
+/// Minimal error screen shown on initialization failure.
+class _ErrorApp extends StatelessWidget {
+  final String message;
+  const _ErrorApp(this.message);
+
+  @override
+  Widget build(BuildContext context) {
+    return CupertinoApp(
+      home: CupertinoPageScaffold(
+        child: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Text('Initialization Error\n\n$message\n\nPlease refresh the page.'),
+          ),
+        ),
+      ),
+    );
+  }
+}

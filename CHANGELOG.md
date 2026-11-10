@@ -1,0 +1,1138 @@
+# Changelog / 更新日志
+
+This file records all notable changes to KeelBase. The format follows [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/), and versioning follows [Semantic Versioning](https://semver.org/lang/zh-CN/).
+
+本文件记录 KeelBase 所有值得关注的变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
+
+## [1.3.0] - 2026-10-31
+
+**v1.3.0 — The Accountable Evidence Release: every write traceable, every reading named / 可核证据版：每一次写入追得回，每一个读数有名字**
+
+### Highlights
+
+- **The audit trail accounts for itself from both ends.** An audit row now declares the write claim
+  that produced it, a refused call gets its own counter instead of hiding among the executions, and
+  chain verification reports the denominator it counted against. `npm run measure:reachability` is the
+  reader for the other direction: it answers "which row types cannot be reached from an audit row?"
+  over a pinned window and row cap, printing the coverage caveat — the column was added without a
+  backfill — before the numbers.
+
+- **The explanation face names the authorization that actually ran.** When a released claim is taken
+  again, it now updates its authorization reference; "who approved this write" no longer points at the
+  attempt that failed before the one that succeeded.
+
+- **A call that never ran stops being called a failure.** The outcome vocabulary gains `not_executed`
+  for a `tool_call` whose confirmation window closed with no decision (contract **v1.15.0**, a new
+  vector beside the frozen one). A held MCP call parks a decidable artifact, a held row carries the
+  basis that put it on hold, and a call's arguments get their own column without entering the hash
+  payload.
+
+- **The readings are an instrument, not a habit.** Seven event classes are measured on one command
+  against a baseline pinned in the repository, and the nightly workflow runs that same command in CI —
+  alert only, no secret, no service, with a two-week observation window before anyone decides whether
+  it blocks.
+
+- **The audit reader's scope is declared rather than implied.** The reader takes rows through a field
+  whitelist and an organisation/period scope, the four aggregate surfaces narrow to the reader's
+  organisation, and the operations audit read face admits the audit reader and joins its navigation.
+
+- **Gates that cannot verify now fail closed.** The contract gate reddens when it cannot resolve the
+  submodule pin, the cross-repo gate compares schemas and not only vectors, entity columns are checked
+  against migrations and not only tables, and the semantic single-source guard sees uncommitted work.
+
+- **The contract moves to v1.15.0 and v1.16.0.** `not_executed` joins the outcome vocabulary, the
+  action report names the gate that refused, and chain verification brings its denominator; the
+  membership output that was not ready was parked rather than shipped, and the pin went back to the
+  released tag.
+
+### Also
+
+- The governance read and write plane moves into a shared module — seven entities, the audit write
+  plane, the read side, the side-effect revoker and the controllers — with an import ratchet and a
+  parity test over both DataSources.
+- Console: a first-run trust setup wizard; the AI execution trace rendered as a node/edge decision
+  graph with each effect's real status; the operations audit page joins the auditor's navigation and
+  states why a write was allowed.
+- Templates: an OA approval vertical (leave requests) and an inventory vertical
+  (purchase-sales-stock).
+- Cold run: step 0 is one idempotent command that fills every gate prerequisite; the restore step
+  covers the whole tree; stopping the dev server is described by what actually brings the port back.
+- The e2e shard harness attributes a shard that dies without a jest summary — exit code, signal,
+  elapsed time and its last output — instead of reporting a bare red; `ws-realtime` loads `.env.test`
+  like the other suites.
+- The readings gate separates five exit codes, names how the child process ended, and retries only a
+  run that produced no jest summary.
+- Frontend: Flutter and Taro state guards stale async responses; Taro's i18n gaps are closed and its
+  locale key aligned with Flutter; `TARO_APP_*` is defined at build time so H5 boots without a bare
+  `process`; avatars and stored upload references are re-signed on read.
+- Generator and CLI: a generated query tool honours the filter it declares, AI tool parameters share
+  the DTO's required defaults, and `--list-tools` shows the risk tier a pre-import tool would carry.
+- Dependencies: the two high advisories on the production tree are cleared.
+- Repository hygiene: a branch keeps its archive only through a lightweight `archive/<date>/<branch>`
+  tag, and is retired once its content is in `main`, no worktree holds it, and that tag exists.
+
+Full details: [v1.3.0 release](https://github.com/rain6fish/KeelBase/releases/tag/v1.3.0)
+
+**中文**
+
+### 亮点
+
+- **审计轨迹两端都交代得清。** 审计行现在声明产生它的那条写占位；被拒的调用有自己的计数，而不是混在
+  执行里；链校验报出它据以计数的分母。另一个方向由 `npm run measure:reachability` 回答：在钉住的
+  时间窗与条数上限内，哪些 row type 从审计行出发走不到 —— 覆盖口径（该列落地时**不回填**）打在数字
+  之前。
+
+- **解释面点名真正放行的那次授权。** 释放后的占位再被领取时，现在会一并更新它的授权引用；
+  「这次写入是谁批的」不再指向前一次失败的那份授权。
+
+- **一次都没跑的调用，不再被叫作失败。** 结局词表新增 `not_executed`，用于确认窗口到期、无人裁决的
+  `tool_call`（契约 **v1.15.0**，新向量与冻结的旧向量并列）。被扣下的 MCP 调用留下可裁决的凭据，
+  被扣下的行带上「凭什么扣下」的依据，调用参数单独成列且不进 hash payload。
+
+- **读数是一件仪器，不是一种自觉。** 七类事件用一条命令取读数，与仓里钉住的基线比对；每夜的
+  workflow 在 CI 里跑同一条命令 —— 只告警、无密钥、无服务，先观察两周，再由人决定它是否阻塞。
+
+- **审计读者的范围是声明出来的，不是默认推出来的。** 读者按字段白名单与组织/期间范围取行，四个聚合面
+  按读者所属组织收窄，操作审计读面接纳审计读者并进入它的导航。
+
+- **核验不了的门禁判红。** 契约闸在解析不出 submodule pin 时判红；跨仓闸比 schema，不只比向量；
+  实体列要对得上迁移，不只对表；语义单源闸看得见未提交的改动。
+
+- **契约升到 v1.15.0 与 v1.16.0。** `not_executed` 进入结局词表；报表点名拒绝它的那道闸；链校验带上
+  分母。尚未就绪的成员性产出被撤下而不是带病发布，pin 回到已发布的 tag。
+
+### 其它
+
+- 治理的读面与写面搬进共享模块 —— 七个实体、审计写入面、读侧、副作用撤销器与各控制器 ——
+  配一道 import 棘轮，以及一个比对两侧 DataSource 的对账测试。
+- 管理台：首次信任配置向导；AI 执行轨迹渲染成节点/边的决策图，每个副作用带真实状态；操作审计页进入
+  审计读者的导航，并写明这次写凭什么被允许。
+- 模板：新增 OA 审批垂直模板（请假申请）与进销存垂直模板（采销存）。
+- 冷跑：第 0 步收敛成一条幂等命令，补齐全部门禁前提；还原那一步覆盖整棵树；停 dev server 那一步改成
+  如实描述端口由什么拉回来。
+- e2e 分片在没产出 jest 汇总行时打印退出码、信号、耗时与末段输出，而不是只报一个红；`ws-realtime`
+  与其余套件一样加载 `.env.test`。
+- 读数闸拆成五态退出码，点名子进程是怎么结束的，只对「没产出 jest 汇总行」的那次重跑。
+- 前端：Flutter 与 Taro 的状态回填挡住过期的异步响应；Taro 的 i18n 缺口补齐、locale 键与 Flutter
+  对齐；`TARO_APP_*` 在构建期定义，H5 不再因裸 `process` 起不来；头像与存量的上传引用在读侧重签。
+- 生成器与 CLI：生成的查询工具兑现它声明的过滤；AI 工具参数与 DTO 共用 required 默认值；
+  `--list-tools` 显示接入前工具会落在哪一档风险。
+- 依赖：生产依赖树上的两个 high 公告已清掉。
+- 分支留档：一条分支的留档就是一枚轻量 `archive/<日期>/<分支>` tag —— 内容已在 `main`、无 worktree
+  持有、tag 在位，三条都成立才撤分支。
+
+完整详情：[v1.3.0 发布](https://gitee.com/rain6fish/KeelBase/releases/tag/v1.3.0)
+
+## [1.2.0] - 2026-10-18
+
+**v1.2.0 — The Governance Surface Release: decision evidence, one timeline, and a boundary you can read / 治理面版：决策证据、单一时间线，以及读得懂的边界**
+
+### Highlights
+
+- **Authorization becomes a surface rather than a log line.** `/auth/me/permissions` lists the caller's
+  capabilities and the reason each is granted; `POST /auth/permissions/explain` (and `/explain/target`
+  for administrators) answers a decision with its basis. The governance read faces go through the same
+  capability seam, and a read-only audit reader reaches six of them without holding a write. The
+  console adds a **data-permission boundary view**: who, which data, which tools, and where the
+  boundary is — for administrators and for the caller's own scope.
+
+- **One AI action is one timeline and one status.** The audit row carries its outcome; a single
+  action's audit, confirmation and side-effect rows merge into one timeline; the console reads one
+  status instead of reconstructing it from three.
+
+- **A refusal explains itself.** Policy denials, R5 blocks, confirmation timeouts and the
+  offline-confirmation 404 all carry the same structured guidance — why, and what to do next —
+  localized by `Accept-Language` and rendered as a refusal card rather than a bare status.
+
+- **The audit chain says what it can and cannot show.** The evidence package declares its coverage;
+  the chain-integrity patrol is armed and its load baseline repaired; the canonical gate anchors on
+  the code and runs locally. A private resource now declares its own PII fields, so a customer's name
+  stops reaching the console.
+
+- **A first complete delivery runs end to end from a business spec.** `asset_loans` goes from a
+  Business Spec through the module protocol, generated backend and frontend, permissions, audit and a
+  runnable demo — the first delivery that exercises the whole Consulting → Build chain.
+
+- **Generated modules gain a generated frontend and the hardening the samples already carried.** The
+  Vue/Taro page and model layer are generator output; the templates carry the scoped identity guard;
+  Taro text goes through the dictionary; irregular plurals, optional fields and escaped backticks are
+  fixed. Copying a module runs end to end.
+
+- **Private objects and an updated contract.** S3 objects are private and served through time-limited
+  presigned URLs, and the runtime pins contract **v1.12.0**: the confirmation summary is the
+  presentation-text object, side effects carry `userId`, and the SSE tool summaries declare the same
+  object.
+
+### Also
+
+- The trust showcase adds an interactive six-scenario replay, including a hallucinated tool; the
+  assistant becomes the workbench landing page with a work ledger, conversations can be named, and
+  repeated confirmations become a reading.
+- The audit console leads with the business summary; the auditor's six read surfaces are reachable
+  from the console; the workbench status columns render labels rather than i18n keys.
+- The demo host serves the KeelBase-YuDao instance on its own server block; the offline deploy script
+  no longer ships template secrets; the demo datastore restores itself.
+- Mobile: a streaming reply that fails falls back to a non-streaming answer instead of stopping.
+  Knowledge reads re-sign `/uploads` references, and vector search returns the entity's full field set
+  and `fileUrl` like full-text search.
+- Gates: the canonical gate runs locally, an e2e batch retries when jest itself dies, version parity
+  is enforced, C-6 adds the three entry-module assembly smokes, and the generator/provenance checks
+  cover the samples.
+- Refactors: the tool-effects cluster is split into its own modules with an explicit host seam, the
+  audit resource registry is scanned once, and the 2736-line AI service spec is split by subdomain.
+
+Full details: [v1.2.0 release](https://github.com/rain6fish/KeelBase/releases/tag/v1.2.0)
+
+**中文**
+
+### 亮点
+
+- **授权变成可见的面，而不只是一行日志。** `/auth/me/permissions` 列出调用方的能力与每一项的依据；
+  `POST /auth/permissions/explain`（管理员另有 `/explain/target`）对一次动作给出决策与依据。治理读面
+  走同一条能力缝，只读审计读者无需写权即可到达其中六个面。控制台新增**数据权限边界视图**：谁、能访问
+  哪些数据、哪些工具、边界在哪 —— 管理员与调用方本人都能看到自己的那一份。
+
+- **一次 AI 动作就是一条时间线、一个状态。** 审计行带上它的结局；同一次动作的审计、确认与副作用三行
+  并成一条时间线；控制台读一个状态，而不是从三处拼出来。
+
+- **拒绝自己讲清楚。** 策略拒绝、R5 阻断、确认超时与离线确认 404 都带同一套结构化指引 —— 为什么、
+  下一步怎么办 —— 按 `Accept-Language` 本地化，并渲染成拒绝卡，而不是一个光秃秃的状态码。
+
+- **审计链说得出它看得见什么、看不见什么。** 证据包声明自己的覆盖；链完整性巡检已接线、负载基线已修复；
+  canonical 闸锚在代码上并在本地可跑。私有资源现在声明自己的 PII 字段，客户姓名不再进入控制台。
+
+- **第一份完整交付从业务规格一路跑通。** `asset_loans` 从 Business Spec 经模块协议、生成的后端与前端、
+  权限、审计，到一个可运行的演示 —— 第一份把 Consulting → Build 整条链走完的交付。
+
+- **生成模块拿到了生成的前端，以及样例早已具备的那套加固。** Vue/Taro 页面与模型层是生成器产物；模板
+  带上受范围约束的身份守卫；Taro 文案走词典；不规则复数、可选字段与转义反引号都已修正。复制模块端到端跑通。
+
+- **私有对象与更新后的契约。** S3 对象改为私有，取用走有时效的 presigned URL；运行时钉住契约 **v1.12.0**：
+  确认摘要就是呈现文案对象，副作用行带上 `userId`，SSE 的工具摘要声明同一个对象。
+
+### 其它
+
+- Trust 沙盘新增六场景交互重放（含「不存在的工具」）；助手成为工作台落地页并带工作账本，会话可命名，
+  同一工具被反复要求确认自此是个读数。
+- 审计控制台先读业务摘要；审计读者的六个只读面在控制台可达；工作台状态列渲染标签而不是 i18n 键。
+- 演示宿主用独立 server block 服务 KeelBase-YuDao 实例；离线部署脚本不再携带模板密钥；演示数据存储可自行恢复。
+- 移动端：流式回复失败时回退到非流式作答，而不是停住。知识库读取重新签名 `/uploads` 引用，向量检索
+  返回实体的完整字段集与 `fileUrl`，与全文检索一致。
+- 门禁：canonical 闸本地可跑，e2e 某片在 jest 自身崩溃时重试，版本对账强制，C-6 纳入三个入口模块的装配冒烟，
+  生成器/provenance 检查覆盖样例。
+- 重构：tool-effects 集群拆成独立模块并带显式宿主缝，审计资源注册表只扫描一次，2736 行的 AI service spec 按子域拆分。
+
+完整详情：[v1.2.0 发布](https://gitee.com/rain6fish/KeelBase/releases/tag/v1.2.0)
+
+## [1.1.0] - 2026-10-05
+
+**KeelBase 1.1.0 — The Product-Proof Release: Honest Revocation, Visible Writes / 产品证明版：诚实的撤销、可见的写入**
+
+> 1.1 is the version the product-proof conditions gate (§18.0): a stranger can open the Golden Flow in one
+> command, build a module in thirty minutes from the public docs, and the demo assets are linked. What this
+> release adds on top is the part the version number is really about — a runtime whose claims about what it
+> did can be checked. Revocation stops reporting success it cannot see; every write leaves a claim pointing
+> at its own audit row; and the gates that guard the vocabulary can now fail.
+
+> 1.1 是产品证明条件所闸住的那一版（§18.0）：陌生人一条命令打开 Golden Flow、按公开文档三十分钟建出一个
+> 模块、演示资产已有链接。这一版在其上补的，是版本号真正关涉的那部分 —— 一个**它对自己做过什么的说法可以
+> 被核对**的运行时。撤销不再上报它看不见的成功；每一次写入留下一条指回自己审计行的声明；而守着词汇的那些
+> 闸，现在**能红**。
+
+### Added
+
+- **A write claims its execution before it runs** — a local write records the claim first; an external write claims too, and a failure keeps the claim rather than quietly freeing it. A claim points at the audit row it produced and at what authorized it.
+- **A stuck compensation can be claimed by a person** — the console can take one on and close a dispute, and the claim records who, instead of an assumption that someone is looking.
+- **The window an authorization had is recorded, and it stops moving** — so "was this still allowed when it ran" no longer depends on today's configuration.
+- **Protocol: a field can be decimal, can reference another module, and can declare itself personal data; a module carries attachments in its own table with a real foreign key.** The contract is pinned at v1.6.0 and the display currency is published.
+- **The confirmation wire objects move to v2 with an execution axis** — an approved execution that did not complete is visible and retryable on the console.
+- **Gates that can fail** — the terminology gate covers every public spec and catches affirmative over-claims; the single-source gate accepts the contract pin as the landing; the AIization check can finally fail; the metadata gate covers business events; a new gate keeps entity column defaults pointing at their vocabulary.
+- **The mobile app's tool labels are bilingual, and the parity gate covers them** — the same keys the backend derives, compared against the backend's metadata table.
+
+### Fixed
+
+- **A revoke no longer reports complete while part of the action is still live**; a restored row is not "already revoked"; a disputed group is no longer toasted as done.
+- **The comparability record keeps its history**, so a broken promise cannot be overwritten by a later attempt.
+- **Privacy**: a masked value written back is not a change; the change log records that a sensitive field changed rather than its value; the before-snapshot redacts PII through the shared rule; an entity history returns only the rows its viewer may see.
+- **Authorization**: a generated rule merges into a role's rules instead of replacing them, and where the database has no rules for a role the built-in rules are that role's floor.
+- **The trash covers every soft-deletable entity**, not four of them.
+- **Reliability**: a webhook that stops accepting deliveries says so; the queue dimension gets an honest third state and warns at startup when it is off, because reminders then never fire.
+- **The e2e run is sharded** so a long run cannot hard-crash into a false red, and a shard retries when jest itself dies.
+
+### Changed
+
+- **Performance**: nginx serves brotli (which meant replacing the web image's base), CanvasKit's wasm is compressed and the two configs must agree, and the bundled CJK font is a woff2 GB2312 subset with a gate guarding its coverage.
+- **The mobile side's user-visible text goes through the localization class** — tool labels, page dialogs, the fallback conversation title, provider names, and the failures the data layer used to word itself.
+- **The generator got stricter and wider**: an enum's option list no longer swallows the field after it, a generated module refuses a stale write instead of silently overwriting, and a module can declare a data scope and the columns its search may match.
+
+### 新增
+
+- **写入在执行前先认领一次** —— 本地写先记下认领；外部写同样认领，且失败时**保留**认领而不是悄悄释放。认领指回它产生的那一行审计，以及**是谁授权**了它。
+- **卡住的补偿可以被某个人认领** —— 控制台能接下一条并关闭争议，而认领记下的是**谁**，不是「有人在看」的假设。
+- **授权当时拥有的窗口被记录下来、且不再移动** —— 于是「它跑的时候还合不合法」不再取决于今天的配置。
+- **协议**：字段可以是**小数**、可以**引用另一个模块**、可以声明自己是**个人数据**；模块的**附件**放在自己的表里、带真正的外键。契约 pin 到 **v1.6.0**，显示币种一并发布。
+- **确认的 wire 对象升到 v2 并带上执行轴** —— 「批准了但没跑成」现在在控制台上**可见、可重试**。
+- **会红的闸** —— 术语闸覆盖全部公开 spec 并能抓住**肯定式的过度承诺**；单源闸接受契约 pin 作为落点；AIization 检查**终于能失败**；元数据闸并入业务事件；新增一道闸让实体列默认值指向它自己的词表。
+- **移动端工具名标签改为双语，对账闸覆盖到它** —— 与后端**同规则派生的 key**，拿后端元数据表来对。
+
+### 修复
+
+- **撤销不再在动作的一部分还活着时上报「完成」**；被恢复的行不算「已撤销」；有争议的组不再被自助撤销的提示说成已完成。
+- **可比性记录留住历史**，被破掉的承诺不会被后一次尝试覆写。
+- **隐私**：脱敏值写回不算一次变更；变更日志记「某个敏感字段变了」而不是它的值；前快照走同一套规则遮蔽 PII；实体行为史只返回**看的人有权看**的行。
+- **授权**：生成规则**并入**某角色的规则而不是取代它们；某角色在数据库里没有规则时，内置规则是它的**地板**。
+- **回收站覆盖所有可软删实体**，不再只是四类。
+- **可靠性**：不再接收投递的 webhook 会**说出来**；队列维度有诚实的第三态，并在它关闭时于启动告警 —— 因为那时提醒**永远不会触发**。
+- **e2e 分片跑**，长跑不会再硬崩成假红；某片 jest 自己死掉时会重试。
+
+### 变更
+
+- **性能**：nginx 上 brotli（为此换掉了 web 镜像的基座），CanvasKit 的 wasm 被压缩且两份配置必须一致，打包的中文字体是 woff2 的 GB2312 子集、并有闸守着它的覆盖。
+- **移动端用户可见文本走本地化类** —— 工具标签、页面弹层、对话兜底标题、提供商显示名，以及数据层原先自己措辞的那些失败。
+- **生成器更严也更宽**：enum 的选项列表不再吞掉它后面的字段；生成的模块**拒绝陈旧写入**而不是静默覆写；模块可以声明**数据范围**与**搜索可匹配的列**。
+
+### Release Precheck（2026-10-05）
+
+- **Four layers of code review**: the Alibaba OCR layer **could not run on this machine** — the package and its launcher are installed, but the native `opencodereview.exe` is refused execution (`Exec format error` from the shell, "access denied" from `cmd`), so it is recorded as not run rather than passed off as clean — + Claude's built-in review **5** (1 confirmed) + the code-review skill's dual axis **13** (Standards 7 / Spec 6) + Code Economy **3** (WARN, Critical 0) → **four defects fixed before release**: the changelog named the wrong contract version (it said v1.2.0; the pin is v1.6.0), it claimed built-in role rules are the floor of *every* role (the code floors only the roles the database has no rules for), the trash read became unbounded when it turned schema-derived, and three pairs of migrations shared a timestamp.
+  **四层代码评审**：**阿里 OCR 层在本机无法运行** —— 包与启动器都在，但原生 `opencodereview.exe` 被拒绝执行（shell 报 `Exec format error`、`cmd` 报「拒绝访问」），故**如实记为未运行**，不冒充跑过 —— + Claude 自带 **5**（1 条 confirmed）+ code-review skill 双轴 **13**（Standards 7 / Spec 6）+ Code Economy **3**（WARN，Critical 0）→ **发版前修掉四处**：更新日志写错了契约版本（写的 v1.2.0，pin 实为 v1.6.0）、声称内置角色规则是「每个角色」的底（代码只对数据库里没有规则的角色兜底）、回收站改为随 schema 派生之后读变成无界、三对迁移共用同一时间戳。
+- **Full test run**: backend unit **354 suites / 3232 tests** (security-module tier gate 6/6) · backend e2e (4 shards) · Web-Admin-Vue vitest **80 files / 467 tests** · Flutter **653 tests** · generator / CLI **244** · endpoint-docs consistency **0 missing declarations** · **Release Gate 25/0 PASS** — all green.
+  **全量测试**：后端单测 **354 套 / 3232 用例**（安全模块分档门禁 6/6）· 后端 e2e（4 片）· Web-Admin-Vue vitest **80 文件 / 467 用例** · Flutter **653 用例** · 生成器 / CLI **244** · 端点-文档一致性 **0 条声明缺失** · **Release Gate 25/0 PASS** —— 全过。
+- **Coverage**: backend statements **95.31%** / branches **79.97%** / functions **91.07%** / lines **96.18%** (thresholds 85 / 70 / 80 / 85), and the security-module tier gate passes in every module. The migration chain was re-run from an empty sqlite database (the renamed migrations execute) and `migration:generate` reports "No changes".
+  **覆盖率**：后端 statements **95.31%** / branches **79.97%** / functions **91.07%** / lines **96.18%**（门槛 85 / 70 / 80 / 85），安全模块分档门禁逐模块通过。迁移链在**空 sqlite 库**上重跑过（改名后的迁移确实执行），且 `migration:generate` 报 “No changes”。
+- **Deliberately left as follow-ups (recorded honestly, not overlooked)**: the generator emits neither the Web-Admin console route nor its navigation entry with `module:`, so MOD-4's capability gating never applies to a generated module — `contracts` / `suppliers` / `reports` / `followup_plans` are in that state today · `ai-tool-effects.service.ts` (~2700 lines) still carries the revoke / comparability / dispute cluster · `resource-routes.ts` scans the same table twice within one file · a `revokeClass:'none'` member of a compensation group makes the whole group report `revoke_failed` · the admin tool-effects list can surface a customer's `name` / `company` (the sensitive-key set does not cover them) · and the two oldest migration-timestamp pairs (`1788100000000`, `1788300000000`) are **left alone on purpose**: they shipped before this release, so renaming them would make an already-deployed database treat them as unrun and execute them again.
+  **有意留作后续（如实记录，不是漏掉）**：生成器既不生成管理台路由、也不生成导航条上的 `module:`，故 MOD-4 的能力门对生成的模块从不生效 —— `contracts` / `suppliers` / `reports` / `followup_plans` 如今都是这样 · `ai-tool-effects.service.ts`（约 2700 行）仍背着撤销 / 可比性 / 争议那一簇 · `resource-routes.ts` 在同一个文件里对同一张表扫两遍 · 补偿组里一个 `revokeClass:'none'` 成员会让整组报 `revoke_failed` · 管理台 tool-effects 列表可能显示客户的 `name` / `company`（敏感键集未覆盖它们）· 最早的那两对迁移时间戳（`1788100000000`、`1788300000000`）**有意不动**：它们在本版之前就已发布，改名会让已部署的库把它们当成没跑过而重跑。
+
+## [1.0.11] - 2026-09-22
+
+> **KeelBase 1.0.11 — Business Compensation & Runtime Hardening / 业务级补偿与运行时加固版**
+>
+> Maintenance-line increment 11 (base = v1.0.10 tag, **132 commits**): business-level compensation completed (impact preview + revoke class + cascade revoke in one transaction) · guest identity and audit-to-conversation drill-down · SM2-signed evidence packages · a rule-based AI behaviour baseline that alerts without blocking · an out-of-band "waiting on me" confirmation centre · the Full conformance profile turned into a standing CI gate · a 21-slice split of the ai/audit god services · a version-parity release gate · three release-blocking defects closed after review.
+>
+> 维护线第十一个增量（基线 = v1.0.10 tag，**132 提交**）：**业务级补偿收口**（影响预览 + 撤销口径 + 级联撤销单事务）· **访客标识与审计下钻** · **证据包国密签名（SM2）** · **异常行为基线（只告警不阻断）** · **「等我处理」离线裁决中心** · **一致性剖面 Full 档常绿 CI 门** · **ai / audit god service 拆分 21 刀** · **发版版本对账门** · 评审后修掉的三项阻塞缺陷。
+
+### Added / 新增
+
+- **§22.17 ④ Business-level compensation, both halves complete** — the confirmation card states what it will touch and whether it can be taken back; one business action's side effects across tables are compensated in a single transaction.
+  **§22.17 ④ 业务级补偿，两半齐备** —— 确认卡在执行前说明「将动到什么、事后能不能收回」；一个业务动作的多表副作用可**一次补偿**。
+  - Impact preview v1.0 (`567fce7d`): the confirmation payload carries `impact{actions, targets[]}` (single / R4 approval / run); object types come from the same single source as side-effect registration, **derived only — no queries, no dry run**; wire v2 + Web / Flutter rendering.
+    影响预览 v1.0（`567fce7d`）：确认载荷带 `impact{actions, targets[]}`（单条 / R4 审批 / run 三处），对象类型取**副作用登记同一单源**，**纯推导不查库不试跑**；契约 v2 + Web / Flutter 渲染。
+  - Revoke class v1.1 (`6c7eb4fc`): the payload carries `revokeClass` (the KB-6 four-tier vocabulary, single-sourced in `resolveRevokeClass`); **presentation only** — not in the hash chain, not in the evidence package, no effect on gating; wire v3.
+    撤销口径 v1.1（`6c7eb4fc`）：载荷带 `revokeClass`（KB-6 四档，`resolveRevokeClass` 单源）；**仅呈现层**——不入链、不进证据包、不影响门控；契约 v3。
+  - Cascade revoke (`881d4911`): multi-table side effects land in **one transaction**, all-or-nothing; the compensation itself is recorded in `operation_audit` with the hash chain; `pm_project` / `pm_task` joined the recycle bin (so the "recoverable" promise holds for them too); migration `1823000000000` (both dialects); wire `side-effect-revoke` v3.
+    级联撤销主体（`881d4911`）：多表副作用落**一个事务**、全成或全不成；补偿自身入 `operation_audit` + 哈希链；`pm_project` / `pm_task` 纳入回收站（使其「可恢复」承诺成立）；迁移 `1823000000000`（双方言）；契约 `side-effect-revoke` v3。
+- **§22.19 AU-3 Guest identity — demo visitors sharing one account are distinguishable in the audit trail** (`699c09e4`) — an account-independent identifier (cookie `kb_guest` + `X-Guest-Id` header, no cookie dependency, **zero front-end changes**) lands in a chain-external column on both audit tables (migration `1824000000000`, both dialects). **Honest boundary: client-supplied, so it is an attribution label and never a credential** — not used for authorization, quota, or risk.
+  **§22.19 AU-3 访客标识：共用账号下的访客在审计轨迹上可区分**（`699c09e4`）—— **与账号无关**的标识（cookie `kb_guest` + `X-Guest-Id` 头双载体，不引入 cookie 依赖，**前端零改动**），两张审计表落**链外列**（迁移 `1824000000000`，双方言）。**诚实边界：由客户端提供，所以只是归因标签、从不是凭证**——不用于授权 / 配额 / 风控。
+- **§22.19 AU-4 Drill from an audit row to its conversation, reference first** (`2b4cc94c`) — structure first (message count / span / owner / model); the body requires an explicit second request. **Enforced server-side**: the new `GET /ai/conversations/:id/meta` deliberately returns no message text at all. Wire `conversation-meta` v1.
+  **§22.19 AU-4 从审计行下钻到该次对话，引用优先**（`2b4cc94c`）—— 先给会话结构（消息数 / 时间跨度 / 归属 / 模型），正文须**再显式请求**一次。**约束落在服务端**：新增的 `/meta` 刻意不返回任何消息文本。契约 `conversation-meta` v1。
+- **§22.19 D-4 SM2 signature and trusted timestamp anchor** (`e47daa9c`) — the evidence package's `signature` section widens from "HMAC string or null" to `oneOf[null, string (historical packages), object {hmac, sm2?, tsa?}]`; **additive**, so v1 / v2 packages still verify offline and the canonical signed object is unchanged; wire `evidence-package` v3.
+  **§22.19 D-4 证据包国密签名 + 可信时间锚**（`e47daa9c`）—— `signature` 段由「字符串 HMAC 或 null」扩为 `oneOf[null, 字符串(历史包), 对象 {hmac, sm2?, tsa?}]`；**加性变更**，v1 / v2 包仍可离线验证、canonical 签名对象不变；契约 `evidence-package` v3。
+- **BA — a rule-based AI behaviour baseline that alerts without blocking** (`99f64f04`) — abnormal agent behaviour lands in `ai_behavior_alerts` (migration `1825000000000`, both dialects) with an admin console page registered in all three navigation places; **an observation layer, not an interception layer**.
+  **BA 异常行为基线：只告警、不阻断**（`99f64f04`）—— 异常 Agent 行为落 `ai_behavior_alerts`（迁移 `1825000000000`，双方言）+ 管理台告警页（三处导航同步注册）；**属观测层，不改门控**。
+- **GA — a "waiting on me" centre that decides confirmations outside the conversation** (`dbba676e`) — after the user leaves the conversation they can still decide a write confirmation inside the offline window; it **reads only the database row**, so it survives a restart, and its idempotency guard shares the same conditional-update gate as the in-conversation decision.
+  **GA「等我处理」中心：在对话之外裁决确认**（`dbba676e`）—— 离开对话后仍可在离线窗口内裁决写确认；**只认 DB 行**，服务重启后仍可用；幂等守卫与对话内裁决**共用同一条件更新闸门**。
+- **Conformance: a machine-readable replay grammar, a Full-tier probe, and a standing CI gate** (`0a4554b5`, `caf7ce52`, `0ec29dfe`, `e09899a7`) — the scenario corpus gains a grammar with the forms the rewrite needed (named fixtures, governed writes, cross-step references, negative assertions), the second runtime gets a static Full-tier probe whose criteria self-validate, and F4 / F5 stop being a one-off manual run.
+  **一致性：机读 replay 语法 + Full 档探针 + 常绿 CI 门**（`0a4554b5`、`caf7ce52`、`0ec29dfe`、`e09899a7`）—— replay 语法补齐改写所需构造（命名夹具 / 治理写 / 跨步引用 / 否定断言）；第二载体获静态 Full 档探针且判据自校验；F4 / F5 不再是一次性手跑。
+- **Demo usage and access are archived before the scheduled ECS reset** (`c35a3cfe`) — the reset wipes data, so the evidence is archived first.
+  **ECS 演示环境重置前归档用量与访问**（`c35a3cfe`）—— 定时重置会清数据，先把用量 / 访问证据落档。
+
+### Fixed / 修复
+
+- **Three release-blocking defects closed after pre-release review** (`66ceb3ce`) — ① a client-supplied `X-Guest-Id` longer than the `guest_id varchar(64)` column made the operation-audit row **silently drop** and the AI-audit write throw, so any signed-in user could suppress their own audit trail with a header; ② `ConfirmationStore.resolve` swallowed a failed persistence write and let the tool execute anyway, leaving the row `pending` — a second decision then **re-executed** it, and external MCP write tools carry no idempotency key, so that replay is real; ③ R4 approval used a read-modify-write, so two approvers deciding at once could each execute the same high-risk write. Now: the read boundary rejects over-long ids, the failure path is **fail-closed**, and the conditional update is the **sole arbitration point**.
+  **三条阻塞缺陷经发版前评审查出并修复**（`66ceb3ce`）—— ① `guestId` 超列宽致操作审计**静默丢行** / AI 审计 500（任一登录用户加个头即可压掉自己的审计）② 落库失败仍放行，留下「工具已执行、行仍 pending」，再裁决即**二次执行**（外部写工具无幂等键，那第二次是真重放）③ R4 审批读改写，双人并发各执行一次高风险写。现：超长值判无效、失败路径 **fail-closed**、条件更新为**唯一仲裁点**。
+- **AU-1 `trust proxy` no longer trusts X-Forwarded-For blindly** (`b0429a7c`) — the old "1 hop" default did not validate the source, so it was equivalent to `true` when the app was reached directly, and the audited IP could be forged; the default now names subnets, and `true` warns instead of silently degrading.
+  **AU-1 `trust proxy` 默认值不再盲信 XFF**（`b0429a7c`）—— 旧「默认 1 跳」不校验来源，直连时与 `true` 等价、审计 IP 可被伪造；默认改为具名子网，`true` 由静默降级改为告警。
+- **The SSE envelope's payload references now follow the current versions** (`a9fb7079`) — the envelope still referenced the frozen v1 confirmation payload (`additionalProperties:false`, no `impact` / `revokeClass`), so frames carrying the new fields failed envelope validation; `sse-event` v2, plus the same-class old reference (`confirmation-decision` v1→v2).
+  **SSE 信封的载荷引用跟到当前版本**（`a9fb7079`）—— 信封仍引用冻结的 v1 载荷（无 `impact` / `revokeClass`），带新字段的确认帧会校验失败；`sse-event` 升 v2，并收掉同性质的旧引用（`confirmation-decision` v1→v2）。
+- **External tools go through the governance layer again** (`8d6da13f`) — external tools are resolved only by the provider and are absent from the local registry, while `ToolRegistry.riskLevel` throws on unregistered names, so both reads and writes failed **before their tool card could appear**; `_riskLevelFor` now derives the tier for genuine external tools, while **hallucinated names still throw** — the boundary is not widened.
+  **外部工具重新走通治理层**（`8d6da13f`）—— 外部工具不在本地注册表而 `riskLevel` 对未注册名抛错，导致读写都在**工具卡出现前**就失败；改由 `_riskLevelFor` 单点容错，但**幻觉名仍抛**——边界不放宽。
+- **The application could not boot: the AiService factory's inject/signature misalignment is repaired** (`974f6dec`).
+  **应用起不来：修复 AiService 工厂的注入/签名错配**（`974f6dec`）。
+- **The `forwardRef` cluster is broken** (`a199d245`) — two leaf modules extracted.
+  **打断 `forwardRef` 环族**（`a199d245`）—— 抽出两个叶模块。
+- **The governance control plane is handed the split audit services** (`bca453ac`) — the phase-3 split had left the governance plane without them.
+  **治理控制平面拿到拆分后的审计服务**（`bca453ac`）—— 阶段 3 拆分后治理台缺注入。
+- **The Redis retry storm is gone, and the documented degradation is now real** (`5e213c45`) — the reconnect storm kept flooding the log, and the fallback the docs promised did not actually engage.
+  **消除 Redis 重连刷屏，「自动降级」真正成立**（`5e213c45`）—— 重连风暴持续刷日志，且文档承诺的降级实际不生效。
+- **A tainted provider name is no longer passed as a format string** (`c95f1a5e`).
+  **不再把受污染的 provider 名当格式串传递**（`c95f1a5e`）。
+- **A failed cache load no longer turns reads into exceptions** (`81f14520`).
+  **缓存加载失败不再把读操作变成异常**（`81f14520`）。
+- **Proxy-tool registration no longer fails silently** (`de840d22`).
+  **代理工具注册不再静默失败**（`de840d22`）。
+- **The write intent outranks the topic intent in the demo router** (`dea6c1a8`) — with no model key, the AI's own suggested "create a follow-up task for this customer" was stolen by `query_customers`, so the write confirmation card never appeared.
+  **demo 路由：写意图优先于话题词**（`dea6c1a8`）—— 无模型 key 时 AI 自荐的「为该客户建跟进任务」被 `query_customers` 抢走，写确认卡永不出现。
+- **`/mobile` is built at its real mount path** (`cd4b719e`) — it used to be built for the root path and sat on Loading.
+  **`/mobile` 按真实挂载点构建**（`cd4b719e`）—— 原先按根路径构建，页面卡在 Loading。
+- **The Flutter web build is unbroken** (`7892fcc0`) — `objective_c` needs a `code_assets` carrying arm64e, otherwise the web build produces nothing.
+  **修复 Flutter web 构建**（`7892fcc0`）—— `objective_c` 需配含 arm64e 的 `code_assets`，否则 web 构建不产出。
+- **The published demo videos had no audio track** (`38984107`) — the published cut was a Playwright screen recording (silent) while the storyboard had been rebuilt to 39 shots; narration is now muxed along the real shot timeline (with atempo compression when a window is too tight) into an H.264 + AAC mp4.
+  **发布的演示视频没有音轨**（`38984107`）—— 发布的是 Playwright 屏幕录制（无声），而分镜已重建为 39 镜；现按真实分镜时间轴把旁白混入（窗口装不下时用 atempo 压缩）H.264 + AAC 的 mp4。
+- **AI token usage is accounted for everywhere** (`209c87ba`, `015bf6d5`, `972d053b`, `ef47bffa`, `3bf82008`, `3145f3df`) — intent classification, the delegate and plan pipelines, context compaction, knowledge-base answers, streaming chats, and a tool's own LLM call all went unrecorded, skewing the cost board and the quota.
+  **AI token 记账补全**（`209c87ba`、`015bf6d5`、`972d053b`、`ef47bffa`、`3bf82008`、`3145f3df`）—— 意图分类 / 委托与计划管线 / 上下文压缩 / 知识库问答 / 流式对话 / 工具自调 LLM 的开销此前**未记账**，成本看板与配额据此失真。
+- **The generator reports unconsumed Business Spec keys instead of dropping them silently** (`e010fb0b`).
+  **生成器不再静默丢弃 Business Spec 的未消费键**（`e010fb0b`）。
+- **The migration spec no longer crashes the glob it tripped** (`bc16a983`).
+  **迁移 spec 移出它撞坏的 glob**（`bc16a983`）。
+- **The version-parity release gate** (`7f56f8e9`) — the root manifest had stopped being bumped at 1.0.3, so the generator wrote a stale source identity into generated artifacts and `doctor` compared that same dirty source against itself into a false green; a gate plus a CI job now hold the release line and the lockfiles in step.
+  **发版版本对账门**（`7f56f8e9`）—— 根清单自 1.0.3 起停止随版 bump，生成器把错版来源身份写进生成物、`doctor` 又拿同一脏源自比成假绿；新增门禁 + CI job，把发版线全部清单对齐。
+- **Vector gates compare by content, not by line endings** (`4d2e2d3c`) — autocrlf made the gate compare a CRLF working file against an LF in-memory artifact and report the difference as semantic drift (7/7 false reds across repos); `--sync` also wrote this machine's endings into the Java repo.
+  **向量门禁按内容比、不按行尾比**（`4d2e2d3c`）—— autocrlf 使门禁拿 CRLF 工作区文件比 LF 内存产出，把行尾差异误报成语义漂移（跨仓曾 7/7 全假红）；`--sync` 还会把本机行尾写进 Java 仓。
+- **Text files are pinned to LF** (`23bea4ab`) — so line endings stop faking drift.
+  **文本文件统一 LF**（`23bea4ab`）—— 行尾不再制造假漂移。
+- **Three latent secret/security-scanner hits are cleared** (`58d69f1e`, `653a106e`, `9dda97d5`) — a governance sample, the CodeQL logging alert, and a confirmation token that was a literal UUID matching the gitleaks generic-api-key rule; the scanner rules were **not** relaxed.
+  **清理三处潜伏的密钥/安全扫描命中**（`58d69f1e`、`653a106e`、`9dda97d5`）—— 治理样例、CodeQL 日志告警，以及一个字面 UUID 的确认 token；**未放宽**扫描规则。
+- **The comment marker an unparseable workflow had lost is restored** (`21683b17`).
+  **复位被吃掉的注释符，workflow 重新可解析**（`21683b17`）。
+- **The audit-chain load test is restored to the post-split API** (`3f95f563`).
+  **审计链压测恢复到拆分后的 API**（`3f95f563`）。
+- **Two defects that made the full e2e suite red are fixed** (`192b61c5`), and each test app now gets its own database (`65882bae`, `474659b7`) instead of inheriting the previous run's.
+  **修掉两个让全量 e2e 变红的缺陷**（`192b61c5`），并让每个测试 app 用自己的库（`65882bae`、`474659b7`），不再继承上一轮的库。
+- **`?limit=0` is clamped** (`66ceb3ce`) — it made `totalPages` Infinity (serialised as `null`).
+  **`?limit=0` 钳下界**（`66ceb3ce`）—— 曾使 `totalPages` 为 Infinity（序列化成 `null`）。
+- **The admin trash route validates `type` at runtime** (`66ceb3ce`) — an unknown value fell through the ternary chain into the PM-task branch.
+  **回收站类型加运行时校验**（`66ceb3ce`）—— 未知值曾穿过三元链落到 PM 任务分支。
+- **The proxy-status body is spread before the server-owned fields** (`66ceb3ce`) — otherwise the upstream `/keelbase/status` could overwrite `reachable` / `configured` / `statusEnabled` / `baseUrl` and forge what the console displays.
+  **代理状态体在服务端字段之前展开**（`66ceb3ce`）—— 否则上游可覆写 `reachable` 等字段，伪造管理台所见事实。
+- **Tool-name extraction accepts digits** (`66ceb3ce`) — `summarize_customer_360` was silently skipped by the evidence root and the behaviour baseline.
+  **工具名还原支持数字**（`66ceb3ce`）—— `summarize_customer_360` 曾被证据根与行为基线静默跳过。
+- **A duplicated migration timestamp is renamed** (`66ceb3ce`) — `1824000000000` was held by two migrations; only the filename changed, since the class name is the identity TypeORM records.
+  **迁移时间戳去重**（`66ceb3ce`）—— `1824000000000` 曾被两个迁移共用；**只改文件名**，因为类名才是 TypeORM 记录的身份。
+- **The demo recorder survives real conversation titles** (`0fdb0a2f`).
+  **demo 录制脚本适配真实会话标题**（`0fdb0a2f`）。
+- **The 30-minute onboarding guide is aligned with what the code actually does** (`8b9ccba0`) — it had walked through a `customers` module the flagship already occupies (name-collision protection rejects it outright).
+  **30 分钟 onboarding 指南对齐实际行为**（`8b9ccba0`）—— 原走已被旗舰占用的 `customers` 模块（撞名保护会直接拒绝）。
+- **`SECURITY.md` N-7 no longer claims plan-level confirmation is missing** (`34c9069d`) — the public trust-boundary statement lagged the shipped capability.
+  **`SECURITY.md` N-7 不再声称计划级确认尚未提供**（`34c9069d`）—— 公开信任边界声明落后于已交付能力。
+- **A wire sample no longer trips the secret scanner** (`9dda97d5`).
+  **样例值不再触发密钥扫描**（`9dda97d5`）。
+
+### Changed / 变更
+
+- **The ai / audit god services are split into domain services (21 commits)** — `ai.service.ts` 2275 → 1435 lines, `audit.service.ts` 1263 → 217; domains moved out (tool gate, execution, presentation, exposure surface, R4 approval, provider routing, evidence, statistics, query, daily quota, org directory, CRM analytics, platform observability) and the shared foundations were lifted into single sources (`payload.ts` hash framing, `by-day.ts` trend framing, `cache-keys.ts` invalidation contract, `tool-call-audit.ts`, `llm-usage.ts`, `effect-composition.ts`, `write-impact.ts`); `evidence-root.service` deleted. The split broke neither the app nor the governance plane (`974f6dec`, `bca453ac`).
+  **ai / audit 两个 god service 拆成领域服务（21 刀）** —— `ai.service.ts` 2275→1435 行、`audit.service.ts` 1263→217 行；领域下沉（工具门控 / 执行 / 呈现 / 曝光面 / R4 审批 / Provider 路由 / 证据 / 统计 / 查询 / 日配额 / 组织通讯录 / CRM 分析 / 平台观测），共享地基提为**跨模块单源**（`payload.ts` 哈希口径 / `by-day.ts` 趋势口径 / `cache-keys.ts` 失效契约 / `tool-call-audit.ts` / `llm-usage.ts` / `effect-composition.ts` / `write-impact.ts`）；删除 `evidence-root.service`。拆分一度打断应用启动与治理台注入（`974f6dec`、`bca453ac`）。
+- **The paginated response gets one definition instead of three shapes** (`76afc5d4`), and the front-end type is aligned with what the API actually returns (`c8f4d80f`).
+  **分页响应收敛为单一定义**（`76afc5d4`），前端类型与后端实际返回对齐（`c8f4d80f`）。
+- **Manifest versions are split from the product version** (`ded176c1`) — the product version is the single source in the root manifest; each end's packaging manifest holds its own, so the release line no longer drags four manifests along.
+  **清单版本与产品版本分开**（`ded176c1`）—— 产品版本以根清单为单一真源；各端打包清单各自持版，发版线不再拖四个清单一起 bump。
+- **The bilingual convention becomes English first, blocks kept separate** (`de9c7935`) — commit messages and documentation no longer interleave the two languages.
+  **双语规范改为英文在前、中英各自成块**（`de9c7935`）—— 提交消息与文档的中英不再交错。
+- **Test-file type errors are ratcheted** (`ebbc5d93`) so they stop accumulating unseen; **the module graph is smoked in the unit suite** (`142f0a94`) so a DI break lands there; **the third entry point is assembled too** (`90f4fce9`).
+  **测试文件类型错误设棘轮**（`ebbc5d93`）不再无声累积；**模块图进单测冒烟**（`142f0a94`）让 DI 断裂落在单测；**第三入口也纳入装配检查**（`90f4fce9`）。
+- **The golden path now runs through the front-end's own modules against a real backend** (`158b76f9`, `d585bcb4`, `96520211`) — including the console's own SSE client, with side-effect assertions tightened until the console really renders.
+  **金路径改由前端自有模块打真后端**（`158b76f9`、`d585bcb4`、`96520211`）—— 含控制台自己的流式客户端，副作用断言加严到「控制台真能渲染」。
+- **Two vocabularies are single-sourced**: the approval risk terms (`c6cf3cec`) and the tools' domain terms (`5e54211d`).
+  **两处词汇单源**：审批风险词汇（`c6cf3cec`）与工具领域词汇（`5e54211d`）。
+- **The demo-intent fixture moves out of the protocol directory** (`09d903e8`), the compactor's config import becomes type-only (`4ba17b67`), and generated Flutter directories are excluded from lint (`ca4f6e62`).
+  **demo 意图夹具移出协议目录**（`09d903e8`），压缩器的配置导入改为仅类型（`4ba17b67`），生成的 Flutter 目录排除出 lint（`ca4f6e62`）。
+- **The history divergence is closed by merging `origin/main` back in** (`878a901a`).
+  **合入 `origin/main` 消除历史分叉**（`878a901a`）。
+- **Docs and commands point at `main`** (`84839b0c`, `8f29027e`, `a35bcd6e`) after the Gitee branch rename, and the dead `master` trigger is dropped from the workflows.
+  **文档与命令统一到 `main`**（`84839b0c`、`8f29027e`、`a35bcd6e`）承接 Gitee 主分支改名，并移除 workflow 中已失效的 `master` 触发。
+- **The README links the article series from both language editions** (`25c845d2`), the project intro PDF is regenerated to eight pages (`e6f20710`), and the official demo storyboard is rebuilt on the current codebase (`0cfccc26`).
+  **README 两个语言版都挂上文章系列**（`25c845d2`），作品介绍 PDF 重出为 8 页（`e6f20710`），官方 Demo 分镜按当前代码重建（`0cfccc26`）。
+- **The user-level `~/.claude/CLAUDE.md` is created and the release layout is pinned to a working example** (`f3f3db2e`, `2870e5fe`) — the bilingual release format is now a user-level rule that applies to every repository.
+  **新建用户级 `~/.claude/CLAUDE.md`，并把发布版式锚到一个可运行示例**（`f3f3db2e`、`2870e5fe`）—— 双语发布版式成为**所有仓库通用**的用户级规则。
+- **The lockfile version field is aligned with `package.json` at 1.0.10** (`54a2c9a1`).
+  **对齐 lockfile 版本字段至 1.0.10**（`54a2c9a1`）。
+- **The queue default and the "no Redis" story are corrected in the docs** (`62dde429`).
+  **修正队列默认值与「无 Redis」说明**（`62dde429`）。
+- **The CI analyse job is pinned to the SDK that resolved the lock** (`960c3bfa`) — no more SDK drift masquerading as a red build.
+  **CI 分析作业固定到解析锁文件的 SDK**（`960c3bfa`）—— 不再有 SDK 漂移伪装的假红。
+- **The contract registry grows from 40 to 44 entries** — the three `app/*` endpoints, the error-code catalogue, and the confirmation lifecycle are now covered.
+  **契约 registry 由 40 增至 44 条** —— `app/*` 三端点、错误码目录与确认生命周期入契约。
+
+### Release Precheck（2026-09-22）
+
+- **Four layers of code review**: Alibaba OCR **115 findings** (250 files, a genuine run rather than a manual fallback) + Claude's built-in review **7** + the code-review skill's dual axis **7** (Standards 3 / Spec 4) + Code Economy **4** (WARN, Critical 0) → **3 blocking defects fixed**.
+  **四层代码评审**：阿里 OCR **115 条**（250 文件，真实运行非人工兜底）+ Claude 自带 **7** + code-review skill 双轴 **7**（Standards 3 / Spec 4）+ Code Economy **4**（WARN，Critical 0）→ 修 **3 条阻塞项**。
+- **Full test run**: backend unit **295 suites / 2686 tests** (security-module tier gate 6/6) · backend e2e · Web-Admin-Vue vitest **80 suites / 452 tests** · Flutter **628 tests** · generator / CLI **64 + 8** · endpoint-docs consistency **0 missing declarations** · **Release Gate 24/0 PASS** — all green.
+  **全量测试**：后端单测 **295 套 / 2686 用例**（安全模块分档门禁 6/6）· 后端 e2e · Web-Admin-Vue vitest **80 套 / 452 用例** · Flutter **628 用例** · 生成器 / CLI **64 + 8** · 端点-文档一致性 **0 条声明缺失** · **Release Gate 24/0 PASS** —— 全过。
+- **Coverage**: backend statements **95.13%** / branches **78.94%** / functions **90.49%** / lines **95.97%** (thresholds 85 / 70 / 80 / 85); vitest **87.6 / 78.33 / 58.5 / 87.6** (thresholds 75 / 70 / 54 / 75); Flutter lines **76.47%** (threshold 45%). The repository records no figures for v1.0.10; these exceed every recorded historical value (v1.0.5 was 90.15 / 75.05 / 90.84).
+  **覆盖率**：后端 statements **95.13%** / branches **78.94%** / functions **90.49%** / lines **95.97%**（门槛 85 / 70 / 80 / 85）；vitest **87.6 / 78.33 / 58.5 / 87.6**（门槛 75 / 70 / 54 / 75）；Flutter 行 **76.47%**（门槛 45%）。仓库未记 v1.0.10 的具体数值；本次高于全部有记录的历史值（v1.0.5 为 90.15 / 75.05 / 90.84）。
+- **Deliberately left as follow-ups (recorded honestly, not overlooked)**: idempotency keys for external MCP write tools · the R4 approval "execute-then-mark" state machine (an interruption can leave an approved-but-unexecuted row with no compensation) · `_withChainWrite`'s whole-group transaction semantics on sqlite (the comment claims atomicity, the code is serial) · unifying the two implementations of the offline-window predicate · splitting the ~579-line `chatStreamImpl` · and the frozen schema snapshots not being validated — that last one is **by design** (bare `$id`s are required for cross-file relative `$ref`), so the OCR finding was **not adopted**.
+  **有意留作后续（如实记录，不是漏掉）**：外部 MCP 写工具的幂等键 · R4 审批「先执行后置态」状态机（中断会留下已批准未执行且无补偿）· `_withChainWrite` 在 sqlite 下的整组事务语义（注释声称原子、实为串行）· 离线窗口判据两处合一 · `chatStreamImpl`（约 579 行）拆分 · 冻结版 schema 快照未被校验 —— 最后一条**属有意设计**（裸 `$id` 是跨文件相对 `$ref` 所必需），故 OCR 该条**不采纳**。
+
+## [1.0.10] - 2026-09-15
+
+> **KeelBase 1.0.10 — Attribution & Data Scope / 审计归因与数据范围版**
+> 维护线第十个增量（基线 = v1.0.9 tag）：**权限-2 通用数据范围 + 角色数据范围配置化**（roles/permissions 表 + 动态角色规则注册表，CASL 由配置构建且 fail-safe 回退内置）· **§22.19 审计归因层**（AU-1 真实客户端 IP / AU-2 AI 审计补 IP / AU-5 沙盘补审计去逃逸口 / AU-6 入口来源 source）· **证据交付物层 D-1/D-2/D-3**（离线自包含 HTML 报告：单动作 + 期间 + 人读决策说明）· **CE-2 wire 契约收口**（PC-1…PC-7：CASL 决策 / 审计查询行 / org 数据范围 / Agent 对象 / MCP 投影 / 导航对账 / Application Model 机读）· 生成器防覆盖守卫（`--force` 不覆盖非生成物 + 撞名拒绝）· Web 修复（i18n 响应式 / AI 入口改流式）· Redis 真接线（`@keyv/redis`）· 副作用哈希链写入串行化。
+
+### Added / 新增
+
+- **权限-2 通用数据范围 + 角色数据范围配置化** — `src/authz/`：roles / permissions / role_permissions / user_role 实体 + `RoleRuleRegistry`（装配期载入内存、同步读取；reload 失败 fail-safe 回退内置规则，绝不 fail-open）+ `DataScopeService`（角色配置范围 → `ScopeDescriptor`：own / own_dept_and_below，缺配置回退更紧默认）；CASL 从注册表构建（既有调用点与 spec 零改动）；events/todos 加 `dept_id`（写入盖章）
+  **Data scope**：按角色配置"本人 / 本部门及以下"，改配置即生效、双向可逆
+- **§22.19 审计归因层（AU-1 / AU-2 / AU-5 / AU-6）** — AU-1 真实客户端 IP（`src/config/trust-proxy.ts`，默认 1 跳、可配 CIDR，**绝不盲信 XFF**）；AU-2 AI 审计补 `ip` 列（对齐操作审计）；AU-5 沙盘真改状态补 AI 审计（`effect_revoke` + `source='sandbox'`，fail-closed 不静默丢审计）；AU-6 `ActorContext.source`（web/admin/headless/mcp/sandbox）+ `tool_call` 行补 provider
+- **证据交付物层 D-1 / D-2 / D-3** — 离线自包含 HTML 报告（零外链/零依赖，仅 Node 内置）：D-2 单动作证据报告（`verify-evidence.mjs --format=html`）+ D-1 期间审计报告（`render-period-report.mjs`）+ D-3 人读「决策说明」（`explainAuthorization` 单一真源，随审计响应与 `/2` 导出的 `compliance[].decisionNote` 下发）
+- **CE-2 wire 契约收口（PC-1…PC-7）** — CASL 权限决策 / 审计查询行与聚合端点 / org·orgId 数据范围 membership / Agent 一级对象 / MCP tools-list 治理投影 / AI 导航↔客户端路由双向对账 / Application Model 机读化
+
+### Fixed / 修复
+
+- **迁移 ↔ 实体漂移消除** — 索引/FK/唯一约束对齐 TypeORM 派生名（消除 `migration:generate` 稳定 churn）
+- **生成器防覆盖** — `--force` 不再覆盖非生成器产物（手写/既有模块）；目标文件撞名时拒绝（防静默覆盖旗舰/重复注册）
+- **Web** — 语言切换后表头/筛选/状态标签不重算（i18n 常量改 computed）；三个 AI 入口改走流式（修复非流式下写操作无法弹确认框）
+- **Redis 缓存真接线** — 换 `@keyv/redis` 的 `createKeyv`（移除不兼容的 ioredis-yet）；未接线时显式告警而非静默走内存
+- **副作用哈希链写入串行化** — 修并发分叉（镜像主审计链双保险）；单条撤销幂等守卫（已撤销/已请求补偿不重复触发外部补偿）
+- **部署** — 补 docker/init 建 governance 库（全新部署下治理台/sidecar 起不来）；prod 镜像含 `src/` + tsconfig（修复容器内 create-admin/seed-demo 必然失败）
+
+### Migration / 迁移
+
+- `1820000000000-AddRolesPermissions`（roles/permissions/role_permissions/user_role + pg 白名单单源）
+- `1821000000000-AddDeptIdToTodosEvents`（events/todos 加 dept_id）
+- `1822000000000-AddAiAuditIp`（ai_audit_logs 加 ip，链外列）
+
+### Release Precheck（2026-09-15）
+
+- **全量测试**：后端单测 + 覆盖率（statements≥85 门槛 + 安全模块分档门控）· 后端 e2e · Web-Admin-Vue vitest · Flutter · 生成器 `node --test` · Gate 1 Golden Application · 端点-文档一致性 · **Release Gate 24/24 PASS（确定性）** —— 全过
+- **覆盖率**：达标且不低于 v1.0.9
+- **四层 code review**：本版评审阻塞项已修复（见 `fix(precheck): R-2` 与运行态扫查批提交）；本次发版会话补跑全量测试与 Release Gate 全绿。阿里 OCR 层对 v1.0.9..HEAD 区间（88 提交）两次运行未产出报告——工具在区间内已删/更名路径上停滞，叠发版窗口 GitHub 网络中断；如实记录，不虚报
+- **阻塞项修复**：迁移↔实体漂移（`f5ebd48c`）、data-scope e2e 过期断言（`63fb39f0`）
+
+## [1.0.9] - 2026-09-11
+
+
+> **KeelBase 1.0.9 — Consulting→Build & Enterprise Proof / 业务访谈直生成与两主张同证版**
+> 维护线第九个增量（基线 = v1.0.8 tag）：S4 Consulting→Build 业务访谈直生成（Business Spec 中间层 + 确定性映射器 + CI 全链路）· §internal.6 Enterprise Proof 与 S5 合流（两主张一次运行同证断言化）· CE-1 B4 场景包（行为语料版本化 + 逐字漂移门）· CE-3 Runtime Model 四薄片契约化 · T5 跨入口决策一致深化（sidecar 结构化依据 + MCP 拒绝留痕 + 放行快照单一构造）· FE-1 前端 Runtime-Neutrality（信封/错误/刷新 neutral adapter + capabilities/provenance 三端消费 + 边界门禁）· §4 G1 run 级批量撤销 · B3b 决策词汇统一（approve|decline，wire Schema v2）· NC-3 首次运行就绪清单 · 迁移清单单源化 · 本版四层评审阻塞项修复。
+
+### Added / 新增
+
+- **S4 Consulting→Build（业务访谈直生成）** — `docs/business-spec.md` 中间层 + 确定性映射器（`scripts/generator/business-spec.mjs`，Business Spec → Module Protocol）+ CLI 接线 + `check-business-specs` 门禁 + CI `consulting-to-build` job（真实访谈产物 → 协议 → 生成模块 → 编译/单测/迁移自洽）
+  **Consulting→Build**：业务方一句诉求 → 结构化 Business Spec → 确定性协议 → 生成模块，全链路可验证
+- **§internal.6 Enterprise Proof × S5 合流** — `verify-consulting-to-build.sh`：Build 与 Trust「两主张一次运行同证」断言化
+- **CE-1 B4 场景包** — 行为级语料版本化（golden / trust / failure 三包）+ 漂移门（pack↔e2e 逐字断言、failure doc↔pack 逐字段）
+- **CE-1 C1 语义单源执行化** — 语义变更须先落契约：语义源清单 + 机器闸 `check-semantic-single-source.mjs` + CI 硬门禁（纯重构走 `[no-semantic-change]` trailer 豁免）
+- **CE-3 Runtime Model 四薄片契约化** — capability declaration / invocation semantics / governance binding / failure semantics 落 `specs/protocol`（conformance 33/33）；AI 管道按 Rev-4 显式排除
+- **T5 跨入口决策一致（§internal.17）** — governance sidecar 决策依据结构化（auto/confirm/block → 结构化 authorization）；外部 MCP 工具调用的治理拒绝补审计留痕；放行依据快照单一构造 `buildAllowSnapshot`（SSE/非流式/MCP 共用）
+- **FE-1 前端 Runtime-Neutrality** — 信封/错误/刷新收敛为 neutral adapter（`isSuccess` 2xx 判定、统一 unwrap、单飞刷新）；Web/Flutter/Taro 消费 `/app/capabilities`（导航显隐）与 `/app/provenance`（运行时来源指纹）；前端边界门禁 `check-frontend-boundary`（573 文件）；`docs/manual/frontend-runtime-coupling.md` 只读基线
+- **§4 G1 run 级批量撤销** — 副作用挂 `run_id` + `revokeRun` + 双端 API（`DELETE /ai/(my/)tool-effects?runId=`），同会话内其它 run 不误伤
+- **B3b 决策词汇统一** — `approve|decline`（先落 wire Schema v2 再迁代码；`reject` 为服务端兼容别名）+ 三端迁移；SSE `decision` 忠实镜像 outcome（timeout 不再塌缩为 decline）
+- **NC-3 首次运行就绪清单** — `GET /app/readiness` 五维（runtime/db/ai/governance/demo）+ 每维可执行下一步 + 管理台首屏就绪卡
+- **证据根 v3 / P-③ 策略历史** — 单动作跨链证据包、策略历史快照回放、op-audit 源注入修复、离线 `--key` 全量重算
+
+### Fixed / 修复
+
+- **app-version `latestVersion` 单源化** — 改读 package.json（此前手写常量，1.0.7 / 1.0.8 两次 bump 均漏更新，对外版本落后两版）
+- **NODE_ENV 环境文件** — dev 回退 `.env`（不再因缺 `.env.development` 启动失败）
+- **迁移清单单源化 + 漂移守卫** — postgres 迁移白名单收敛到 `src/config/postgres-migrations.ts` 单一权威 + drift guard；`ai_confirmation_requests.kind` nullable 对齐
+- **`ai_conversation` 落库** — 确认记录补 `conversationId`（实体列此前为死列）；`ai_tool_side_effects` 加 `conversation_id` 索引
+- **审批边界** — 治理台审批列表排除 `kind='run'` 行；审批执行入口拒绝 run token
+- **批量撤销上限回退** — 撤销「500 上限 + truncated 续处理」（重跑返回同批 → 死循环）
+- **v1.0.9 四层评审阻塞项** — 就绪端点限流 / 脱敏 / Ollama 判据单源 / 设置容错；MCP 执行后富化失败不再冒泡（fail-after-execute）；sidecar `confirm` 不再写「拒绝形态」数组；语义单源闸扫全区间提交信息；S4 映射器 fail-closed；生成模块验收脚本防假 PASS + SSE 读绑超时；Taro capabilities 守卫 + 信封状态码；CRM Copilot 保留 timeout 语义 + 服务端决策响应式更新
+- **生产依赖安全** — multer override 2.3.0 + `npm audit fix` + Nest 11.2.3 对齐，清生产漏洞
+
+### Changed / 变更
+
+- **`.gitignore`** — 忽略可再生的验证报告产物（benchmark 报告为本地生成物，不入库）
+- **项目 skills 纳入版本控制** — `.claude/skills/` 定向放开 ignore
+
+### 发布前评审（Release Precheck）
+
+Release Precheck（2026-09-11）：四层 code review —— OpenCodeReview 186 文件（75 条，最高为已修的就绪端点信息泄露）+ Claude 自带多维（无 BLOCKER）+ code-review skill 双轴（Standards 2 硬违规 / Spec PASS WITH FIXES）+ Code Economy（WARN，Critical 0）→ 整合后修复 **15 处阻塞项**。全量测试：后端单测 254 套件 / 2325 用例 + e2e 24/319 + 安全覆盖率门控 + release-gate 19/0；Vue typecheck + 424 用例；Flutter analyze + 628 用例；生成器 104；conformance 33/33 —— 全过。
+
+## [1.0.8] - 2026-09-09
+
+> **KeelBase 1.0.8 — Conformance & Revoke Contract / 契约常绿与撤销契约收口版**
+> 维护线第八个增量（基线 = v1.0.7 tag）：CE-1 Conformance 常绿收口（wire Schema v1 冻结 + 协议语料 + 语义变更纪律）+ Revoke Contract 深化（会话级批量撤销 + run 级单轮聚合 + G4 验收）+ 1.0.8 评审 deferred 修复（s5 撤销前确认 / FP-8 proxy 锚 / proxy 超时调用期读 / 旅程计数防刷）+ 回归门禁评审修复（H1 双语、H2 门控顺序、insights 去日期脆弱）。
+
+### Added / 新增
+
+- **CE-1 Conformance 常绿收口** — wire Schema v1 freeze（tool/SSE/confirmation/trace/side-effect/audit-payload/evidence/governance-policy/delegation + ai-tool 治理面 + D7/E1，registry 24 对象）+ jest wire-schema.spec 常绿校验（对象冻结 + 每样例过 schema）；协议向量语料（B1/B2）由 Node 现实现生成 canonical 金样本 + CI 重生成 diff 漂移检测；release-gate / package / verification-index / 协议文档接线
+  **CE-1 契约常绿**：wire Schema v1 冻结 + 协议语料金样本 + CI 漂移检测，两产品线共同产品资产就位
+- **C1/C2 语义变更纪律** — 语义 PR 先落契约（触 tool/治理/审计/事件语义 → 同步伴生物 → 门禁命令 → 评审勾选，docs/manual/semantic-change-checklist.md）+ 术语单一真源闸（check-protocol-language.mjs，禁第二套/过度承诺词覆盖协议与对外文档，禁词表可扩展）
+  **语义变更纪律**：改语义先落 Protocol/文档，术语单一真源由 CI 把关
+- **Revoke Contract 深化（revoke-contract.spec，A–F 验收矩阵）** — G1 会话级批量撤销（BE：会话内 AI 写副作用一次性补偿汇总；FE：AI Action Center 会话行一键撤销）；G4 工具级撤销 e2e 验收固化；KB-5 run-level approval：同一轮 ≥2 需即时确认写工具聚合为一个 run 一次授权（mode:'run' + 逐条 diff 摘要 + runRisk，R5/R4/trusted/无摘要不并入）；ConfirmationStore.createRun + 实体 kind/run_items 列 + migration
+  **撤销契约闭环**：会话级批量撤销 + run 单轮聚合一次授权 + G4 验收固化
+- **generated modules Trust-ready** — keelbase init 生成模块模板支持 soft-delete revocation 回归（生成业务模块开箱可撤销）
+  **生成模块 Trust-ready**：新生成模块撤销回归内建
+- **evidence-root / governance 平面 e2e 补强** — evidence-root 第④ 真实 verify-evidence `--key` 全量离线验证（PASS + 篡改 FAIL）+ root.anchors 决策/审计/副作用锚同在断言；governance 独立平面 HTTP e2e（guard / @CheckPolicies lambda）
+  **证据 e2e 补强**：--key 全量 + anchors 三源 + 治理台 HTTP 覆盖
+
+### Fixed / 修复
+
+- **1.0.8 评审 deferred 修复（多数由并发收口）** — s5 撤销前确认（沙盘不再静默撤销真实 AI 副作用）；FP-8 proxy 写空体也记 proxy_call 副作用锚（语料宣称落真）；proxy 超时改调用期读 env（PROXY_FETCH_TIMEOUT_MS 配置后即生效）；Trust 旅程完成计数防 lost-update/防刷（同用户冷却 + 进程内串行）
+  **deferred 修复**：s5 确认化 + FP-8 锚 + proxy 超时读点 + 旅程计数防刷
+- **回归门禁评审修复（code-review 双轴，2026-09-09）** — H1：AiConfirmationCard run 计数文案双语化（补 confirmRunCount en/zh，去硬编码中文 fallback，修 §5.5 双语红线）；H2：KB-5 run 聚合在 HS-2 门控预检后才并入（禁/角色/未验证/策略成员不占 run，修「先授权后拒」无效授权序）；insights.service.spec 去日期脆弱（mock Date.now 固定 now，recentEvents 不再随运行日漂移）；proxy-bridge e2e 对齐 Case E 诚实文案（2xx 仅证「已请求补偿」）
+  **评审修复**：H1 双语硬编码 + H2 run 门控顺序 + insights 日期脆弱 + proxy e2e 诚实断言
+
+## [1.0.7] - 2026-09-08
+
+> **KeelBase 1.0.7 — Trust Journey & AI Proof Cards / Trust 旅程与对抗评测 Proof 收口版**
+> 维护线第七个增量：业务用户 Trust 旅程「从看到做」闭环（真实 Copilot 批准 → 落库 → 撤销 → 看证据）+ Proof Cards（T1/T2/T3，陌生人可复现验证）+ KB-1..8 对抗评测文档收口 + revokeClass 撤销语义契约 + AI 门控修复 + 依赖安全更新。基线 = v1.0.6 tag（d7c9d9e0）后的 master（83 commits）。注：治理评审收口与 Evidence Root v3 深化（summary/replay、策略历史、G-1~G-3、effectiveGateMode 收敛等 v1.0.6-post 批次）已在 [1.0.6] 条目描述并于此版随代码发出，本段不再重复列明细。
+
+### Added / 新增
+
+- **Trust Journey "see → act" closed loop (P0-1 → P2)** — P0-1: reach the Trust Journey directly inside the admin console shell (review path reachable); P0-2: one-click run of Ask → human confirm → privilege-violation denied → high-risk blocked, auto-advancing; P1-1: guide a real Copilot approval → persisted → revoke → view evidence; P2 polish: collapsible guide + journey-completion light telemetry + per-step "Powered by" capability tags; P2②: AI write success surfaces a "revoke / manage" shortcut into My AI Activity on the detail page; Demo Journey v1: AI business-insight menu/card drill-down + Trust Journey first-screen entry + sandbox result straight to execution trace
+  **Trust 旅程「从看到做」闭环（P0-1 → P2）**：控制台直达 → 一键连跑（Ask → 人工确认 → 越权拒绝 → 高风险阻断）→ 真实 Copilot 批准落库 → 撤销 → 看证据
+- **Operable Trust Sandbox** — run results shown in a popup / right sticky result pane (sixteen scenario cards + sticky result area, stacks on narrow screens); sandbox data self-cleanup (P2④, removes the user's own synthetic customers/orders + their bob demo accounts); cross-visitor journey-completion counting (server aggregates today/cumulative by Beijing day) with a "Trust Journey today/total" card on the admin overview (P2③) + journey-stats TrustSandbox spec
+  **Trust 沙盘可运营**：结果面板/弹窗 + 数据自清理（P2④）+ 跨访客旅程完成计数与管理台今日/累计卡（P2③）
+- **revokeClass revocation-capability contract + visualization (KB-6)** — tool metadata declares a revocation tier (none / local_compensate / governed_external / transactional) with mandatory validation at registration; side-effect entity gains revoke_class / revoke_status columns + migration; revoke 2xx now only records compensating state when outcome is unknown (never a false `revoked`), status normalized to 4 values; `/ai/tools` exposes the tier; admin / user Action Center / AiTimeline render revoke buttons & state honestly per tier (proxy external side effects no longer look revocable)
+  **revokeClass 撤销能力语义契约（KB-6）**：四档声明 + 注册强校验，副作用实体加列迁移、status 归一 4 值，管理台/用户/时间线按档位诚实渲染「能撤/不能撤」
+- **Proof Cards T1/T2/T3 (reproducible by strangers)** — T1 Protocol×Trust Proof Card spec (§internal.7); T2 one-click orchestration passing (invoices MUT → isolated backend → R5-R9 driven → R10 idempotent → scorecard archived) + demo provider generic create route; T3 CRM Reference (leads-generation rail red-0 + AI CRM flagship rail 17/17, three evidence sets explicit) + Stranger Kit external-verification guide (docs/proof-card-verification.md; R2=green counts as external PASS)
+  **Proof Card 体系（T1/T2/T3）**：T2/T3 跑卡通过留档，陌生人可按公开文档复现验证（Stranger Kit）
+- **KB-1..8 antithesis-review doc wrap-up** — KB-1 external glossary v2 calibration; KB-2 Not-a-* claim list made public bilingual (SECURITY.md Trust Boundaries N-1..13) with each item tied to spec/tests; KB-3 threat model + trust boundaries bilingual + public one-click re-verification of evidence-root v3; KB-4 failure-path regression corpus (failure path stays credible & re-runnable); KB-5 run-level approval spec finalized (same-round multi-write tools aggregate into one run); KB-7 frontend positioning (Web = Vue official main / React preview not a candidate main, promotion/removal driven by real demand); KB-8 reference-deploy path reconciliation + first-use 30-minute acceptance checklist (seed → alex workbench → CRM AI follow-up → approve → revoke → evidence)
+  **KB-1..8 对抗评测收口**：词汇表/不承诺清单/威胁模型/Proof 卡文档双语化并对齐 spec/测试，KB-8 首次使用 30 分钟验收清单可执行化
+- **AI gate fix** — admin users are treated as email-verified, so admin write tools no longer misfire EMAIL_NOT_VERIFIED
+  **AI 门控修复**：admin 角色写工具不再被未验证邮箱误拦（admin 视为已验证）
+
+### Fixed / 修复
+
+- **fix(trust-sandbox): release-precheck review — cleanup authz containment + honest s5 revoke copy + governed dead-link removal** — ① `POST /ai/trust-sandbox/cleanup`: non-admins may only delete bob accounts under their own ownership prefix `bob_sandbox_<uid>_%` (bob demo accounts now use ownership naming `bob_sandbox_<uid>_<ts>`), admins still purge all `bob_sandbox_%` — closes the hole where any signed-in user could hard-delete other users' accounts via sandbox cleanup (usersService.remove has no ownership guard); ② s5 revoke detail now phrases by the actual revoke result (no longer reports "target soft-deleted/restorable" when revocation did not take effect — it says the effect cannot be locally revoked); ③ scenario results carry a `governed` flag — deterministic demo rows created directly are not AI-tool side effects, so the frontend hides the 404-bound "business-action governance detail" CTA (execution trace / P1-1 real-persist drill-down preserved); BE spec 12 + FE typecheck green
+  **Trust 沙盘评审修复**：cleanup 越权收敛（bob 归属命名 + admin 门禁）+ s5 撤销诚实文案 + 治理详情去死链
+- **fix(deploy): Serve official demo video under /demo (China mirror)** — nginx `/demo/` static location + docker-compose.prod.yml mounts host `./demo` (official-demo-en/zh.webm + video html) so the China mirror `https://demo.keelbase.com.cn/demo/video-en.html` plays for real again (previously `location /` SPA fallback served the admin shell, a false 200); README China mirror now points to the https canonical domain
+  **国内镜像恢复官方演示视频**：/demo 静态服务 + prod 挂载，README 指向 https 正式域
+- **fix(governance): register AiGovernancePolicyHistory in the governance standalone module** — the P-③ entity was missing from GovernanceModule forFeature and the GovernanceDataSource entities, crashing the governance process (`npm run start:governance` / docker governance) with Nest UnknownDependenciesException (found on the ECS v1.0.6 deployment)
+  **治理台独立进程启动修复**：策略历史实体补注册（ECS v1.0.6 部署实测暴露）
+
+### Changed / 变更（依赖与安全）
+
+- **Dependabot security-first policy** — routine version updates are turned off (open-pull-requests-limit: 0, to avoid dependency drift affecting Golden Demo / E2E / Agent Benchmark), Security Updates stay on, and a github-actions dependency watch is added
+  **Dependabot 安全优先策略**：普通升级关 PR，只留安全更新 + 补 github-actions 监控
+- **Web-Admin-Vue test toolchain & deps** — vitest / @vitest/coverage-v8 2 → 3.2.7 (clears 2 critical dev vulnerabilities; 400 tests green); vue 3.5.42 / sass / globals / typescript-eslint / @vue/test-utils minor·patch updates
+  **Web-Admin-Vue 测试链与依赖**：vitest 3.2.7 清 dev 漏洞；Vue 系 minor/patch 跟进
+- **Server-NestJS dependencies** — @opentelemetry family (sdk-node / auto-instrumentations / exporter-trace-otlp-http), nestjs-pino 5.1, bullmq 6.3.4, @aws-sdk/client-s3, sharp 0.35.4, @nestjs/cli and others bumped
+  **Server-NestJS 依赖跟进**：otel / pino / bullmq / aws-sdk / sharp 等 bump
+
+## [1.0.6] - 2026-09-06
+
+> **KeelBase 1.0.6 — AI Action Center & Cross-entry Decision Consistency / AI 行为中心与跨入口决策一致版**
+> 1.0 后第六个补丁：AI Action Center「我的 AI 行为」业务用户 Trust 面 + §internal.17 ① 证据根 v3 / G-1~G-3 / P-③ 策略历史回放 + Policy Evidence（授权快照携带策略版本）+ 治理策略可视化编辑（档位化/R4 审批）——证据线「一条 AI 行为完整、不可抵赖地解释与复现」闭环；跨入口决策一致性（T5：MCP deny 审计补齐 + source=bridge + release-gate 登记）；NC-2 可执行 DX 错误前后端闭环（reason/impact/nextStep + LLM_UNAVAILABLE + 错误卡）；副作用状态服务身份反向查询（B 路径对账）。
+
+### Added / 新增
+
+- **AI Action Center — "My AI Activity" business-user Trust surface (§internal.17 North-Star slice, docs/ai-action-center.spec.md)** — new user-scoped endpoint `GET /ai/my/tool-effects` (own AI write side-effect list, status normalized `executed`/`revoked` from target soft-delete + target enrichment; **no args/hash/before-after snapshot echo** — data minimization; owner-isolated, no admin query surface) + workbench page (route `/workbench/my-ai-actions`, "My" menu group, home shortcut, bilingual i18n) with per-row revoke (P0-15) / full evidence (B4 action detail) / object history (A-2 drawer); recent-conversation module deep-links into the trace page via `?conv=`; the `GET /ai/governance/action` contract stays locked on `effectId`+`resultType/resultId` so the future evidence root (AUDIT-ID, §internal.17 ①) upgrades without touching this page; service/controller/vitest/e2e coverage (owner isolation, 401, data minimization, revoke → `revoked` state)
+  **AI Action Center（我的 AI 行为）业务用户 Trust 面**：新本人端点 GET /ai/my/tool-effects（写副作用清单，目标软删→status 归一 executed/revoked + 目标富化；不回显 args/快照——数据最小化；本人隔离，无 admin 查询面）+ 工作台页（/workbench/my-ai-actions，行内撤销 / 完整证据 / 对象历史抽屉；会话深链 ?conv=）；契约锁定 effectId + resultType/resultId，未来证据根（AUDIT-ID）升级不破本页；spec 见 docs/ai-action-center.spec.md；单测/vitest/e2e 覆盖（隔离/401/数据最小化/撤销后 revoked）
+- **Side-effect status reverse query (B 路径 Java 对账, 6899f47)** — service-identity `GET /external/effects/:resultType/:resultId` (x-api-key=GOVERNANCE_API_KEY) returns a side effect + revoke state (local entity `revoked = targetSoftDeleted` truth lives on the main app; `proxy_call` returns an honest `revokeHint` — revocation goes through the Java compensation endpoint, confirm on the Java side); KeelBase-java-starter `KeelbaseClient.querySideEffect` wraps it (404 → notFound)
+  **副作用状态服务身份反向查询（B 路径 Java 对账）**：GET /external/effects/:resultType/:resultId（x-api-key）查某业务动作副作用是否已撤销（本地实体软删真值；proxy_call 诚实 revokeHint「撤销态在 Java 侧」）；Java starter KeelbaseClient.querySideEffect 封装
+- **Cross-entry decision consistency (T5, §internal.17 P1)** — MCP tools/call now writes an AI audit row + structured reasons on deny (aligns REST/SSE deny semantics; was a bare -32603 with no audit/reasons) and marks confirmation-gated calls `requiresConfirmation` in the audit detail; new `test/cross-entry-consistency.e2e-spec.ts` (deterministic: R5 deny leaves audit + same-source `risk_policy` reasons / R3 create requires confirmation, not executed); non-streaming path also sets `source=bridge` for B-path proxy tools; release-gate Trust dimension registers the cross-entry spec
+  **跨入口决策一致性（T5）**：MCP 工具 deny 现写审计 + 结构化 reasons（对齐 REST/SSE，原 -32603 无审计无依据）+ confirmation 审计标注；新 cross-entry e2e（确定性：R5 deny 留痕同源 risk_policy / R3 确认未执行）；非流式 B 路径补 source=bridge；release-gate 登记
+- **Executable DX errors (NC-2, Error → Reason → Impact → Next Step)** — backend: `api-error-codes.ts` defs gain optional `reason/impact/nextStep` (zh/en; main-path codes filled + new `LLM_UNAVAILABLE` 502), `AllExceptionsFilter` passes them through by Accept-Language (omitted when unset, backward compatible), and AI service throws `BusinessException.of('LLM_UNAVAILABLE')` instead of a bare 500 when no provider / all providers fail (CR-5 detail stays in logs); frontend (Web-Admin-Vue): `ApiError` carries the three fields + requests send `Accept-Language`, snackbar gains `apiError()`, `GlobalSnackbar` renders an actionable error card (reason/impact/next-step rows) for such errors, login page shows the email-verification guidance inline and the AI assistant surfaces the check-your-key guidance — errors become guidance end to end
+  **可执行 DX 错误（NC-2，前后端闭环）**：后端错误码带 reason/impact/nextStep（zh/en，主链路码填值 + LLM_UNAVAILABLE 502），filter 按语言透传（缺省省略向后兼容），AI 无 provider/全挂改抛 LLM_UNAVAILABLE（不再笼统 500）；前端 ApiError 透传三字段 + 请求带 Accept-Language + 错误卡渲染（原因/影响/下一步）+ 登录页邮箱验证引导 + AI 助手配 key 引导——报错变向导
+- **Policy Evidence — decision reproducibility via policy-revision in the grant snapshot (§internal.17 ③)** — the governance policy is versioned by an order-insensitive **content-fingerprint revision** (sha256 prefix over normalized `ai_governance_policy.value`; same content → same revision, any change → new revision; **no schema change/migration**), exposed on `getPolicy`/`setPolicy`; every grant-time authorization snapshot now carries `authorization.policy` = { `revision`, `updatedAt` } (via `AuthorizationExplainerService`, single policy read) so "why allowed" cites the exact policy revision in force; new `GovernancePolicyService.verifyReproducible(recorded)` replays a recorded grant decision against the current policy — reproducible when the revision is unchanged or the policy drifted but that tool's allow/deny decision is unaffected (recorded/current revision + drift note returned); audit identity chain & compliance evidence surface the revision via the `allowed` projection (legacy rows unchanged, backward compatible); denied path untouched (checks-array shape kept for A-8); reconciles the two parallel implementations (timestamp-attribution vs fingerprint) into one fingerprint-canonical line; spec docs/audit-authz-snapshot.spec.md §5
+  **Policy Evidence（§internal.17 ③，决策可复现：授权快照携带策略版本）**：治理策略以内容指纹 revision 作版本（value→sha256 前缀、key 顺序无关，同内容恒同号、变更必变号；无 schema 变更/迁移），getPolicy/setPolicy 透出；授权放行快照经 AuthorizationExplainerService（单次取策略）附 authorization.policy={revision,updatedAt}——「当时为什么允许」指向确切策略版本；verifyReproducible(recorded) 用当前策略重放该放行——版本未漂移、或漂移但该工具放行判定未受影响即可复现（返回记录/当前 revision + 漂移说明）；审计身份链/合规证据经 allowed 投影带版本（历史行不变、向后兼容）；拒绝路径不变（保数组形态供 A-8）；两个平行实现收敛为指纹口径单线；spec docs/audit-authz-snapshot.spec.md §5
+- **Evidence Root v3 — per-action cross-chain evidence root (§internal.17 ① Slice 1, docs/evidence-root.spec.md)** — new `GET /api/v1/ai/governance/evidence-root/:resultType/:resultId` (owner or admin) exports a `keelbase-audit-evidence/3` single-file evidence root for one Business Action: grant-time authorization snapshot (incl. `policy.revision`) + Decision Evidence + same-conversation AI audit chain rows + matching `operation_audit` chain rows (reverses REST writes via resource path) + the side-effect row, bound by a `root` cross-chain anchor (`sha256` over sorted anchors: ai-audit hash / side-effect self-consistent digest / op-audit hash) plus a whole-bundle HMAC over the v3 canonical set; `scripts/verify-evidence.mjs` gains a `/3` branch (structure-only, or with `--key` full per-row recompute + side-effect digest + signature; v1/v2 unchanged); owner/admin authz mirrors B4; unit specs cover assembly, 403/404, anchor self-consistency, signature reproducibility
+  **Evidence Root v3（① AUDIT-ID 跨链证据根，§internal.17 ① Slice1）**：新端点 GET /api/v1/ai/governance/evidence-root/:resultType/:resultId（本人或管理员）导出 keelbase-audit-evidence/3 单文件证据根——授权快照(含 policy.revision)+Decision Evidence+同会话 AI 审计链行+operation_audit 链行（资源 path 反查）+副作用行，root 跨链根锚（sha256 排序锚：ai/op 链 hash + 副作用自洽摘要）+ v3 canonical 整包 HMAC；verify-evidence.mjs 加 /3 分支（structure / --key 全量子链重算+副作用摘要+签名；/1 /2 不变）；鉴权对齐 B4；单测覆盖装配/403/404/锚自洽/签名可复现
+- **REST write authorization snapshot (G-1, §internal.17 ①)** — operation audit now records an **event-time authorization basis** for every human write: `operation_audit_logs.authorization` (JSON `{ allowed, role, basis: casl:manage-all | casl:own-scope(handler-enforced), feature, statusCode }`, chain-outside annotation like `changes`/`business_event` so existing hash-chain integrity is untouched) captured in the interceptor tap from the resolved user role + response status; surfaced in the admin log list; migration `AddOperationAuditAuthorization` (both dialects) + postgres whitelist; unit spec asserts the snapshot is stored yet excluded from the hash payload
+  **REST 人类写授权依据快照（§internal.17 ① G-1）**：操作审计对每条人类写记录事件时点授权依据 `operation_audit_logs.authorization`（JSON {allowed, role, basis: casl:manage-all | casl:own-scope(handler 强制), feature, statusCode}；链外注解列对齐 changes/business_event——不入 hash payload 防破链）；拦截器 tap 从解析用户角色+响应码生成；日志列表透出；迁移 AddOperationAuditAuthorization（双方言）+ postgres 白名单；单测断言快照落库但被排除出 hash payload
+- **Chain payload v2 — HS-11 covers chain-outside columns for new rows (G-2, §internal.17 ①)** — `ai_audit_logs.payload_version` (add-only): new audit rows hash a **v2 payload** that includes the previously chain-outside attribution/annotation columns at their real values (`agentId/sessionId/parentActionId/callerAgentId/delegationContext/businessIntent/source/businessEvent/evidence`) so a DB-level edit of those columns now breaks the hash chain; historical rows (no `payload_version`) keep the exact v1 shape (annotation fields pinned null), so existing chains and the offline verifier stay valid — `_payload` dispatches per row and is shared by write/verify/export/evidence-root; migration `AddAiAuditPayloadVersion` (both dialects) + postgres whitelist; unit spec asserts v2 rows carry the annotations in the hash payload and persist `payloadVersion=2`, while v1 feedback/chain-outside tests still pass
+  **链 payload v2 —— HS-11 覆盖链外列（§internal.17 ① G-2）**：`ai_audit_logs.payload_version`（add-only）：新审计行以 **v2 payload** 计入原链外归责/业务注解列真实值（agentId/sessionId/parentActionId/callerAgentId/delegationContext/businessIntent/source/businessEvent/evidence）——DB 层改这些列现在会破链；历史行（无 payload_version）保持 v1 精确形状（注解恒空），既有链与离线验不受影响——`_payload` 按行版本分派，写/验/导出/证据根共用；迁移 AddAiAuditPayloadVersion（双方言）+ postgres 白名单；单测断言 v2 行注解入 payload 且存 payloadVersion=2，v1 恒空用例仍过
+- **Policy history + cross-version replay (P-③, §internal.17 ①, docs/policy-history-reproducible.spec.md)** — new `ai_governance_policy_history` snapshots every `setPolicy` (revision content-fingerprint + normalized value + appliedAt); new `GovernancePolicyService.replayDecision(recorded)` replays a recorded grant against the **actual policy object of that revision** (history-first), falling back to current-policy recompute + drift detection when the revision is not in history (`mode: history | current-fallback`); `verifyReproducible` upgraded to history-first while keeping its return shape (backward compatible); admin history endpoints `GET /ai/governance/policy/history[/:revision]`; honest boundary: only policy-internal inputs (tool_enabled) replay deterministically — role_allowed needs the then-user role, so it stays on the frozen recorded checks; migration `AddAiGovernancePolicyHistory` (both dialects) + postgres whitelist; specs cover snapshot-on-write, history replay true/false, fallback mode
+  **Policy 历史表 + 跨版本回放（§internal.17 ① P-③）**：新表 ai_governance_policy_history 每次 setPolicy 快照（revision+value+appliedAt）；replayDecision(recorded) 历史优先——按 revision 查历史**拿当时策略对象真重演** tool_enabled，未命中回落「当前重放+漂移检出」（mode: history/current-fallback）；verifyReproducible 升级历史优先但返回形状不变（向后兼容）；admin 历史端点 GET /ai/governance/policy/history[/:revision]；诚实边界：仅策略内输入确定性重演（role_allowed 需当时用户角色、以冻结 checks 为准）；迁移双方言 + pg 白名单；spec 覆盖写快照/历史命中可复现与不可复现/回落模式
+- **Side-effect hash chain (G-3, §internal.17 ①)** — `ai_tool_side_effects` gains `prev_hash`/`hash`; new side-effect rows are chained with the shared AuditChainService HMAC over a stable canonical of the effect fields (prev = last hashed row; historical rows stay null and out of the chain, so nothing retroactively re-hashes); admin `GET /ai/tool-effects/verify` checks the hashed segment (`verifySideEffectChain`); concurrency branches are tolerated since verification recomputes each row against its stored prevHash; migration `AddAiToolSideEffectChain` (both dialects) + postgres whitelist; specs cover genesis first row + verify skipping historical rows
+  **副作用哈希链（§internal.17 ① G-3）**：ai_tool_side_effects 加 prev_hash/hash——新副作用行以共享 AuditChainService HMAC 对稳定 canonical（效应字段）入链（prev=最近已哈希行；历史行保持 null 不入链、不回填）；admin GET /ai/tool-effects/verify 校验已哈希段（verifySideEffectChain）；并发分支容忍（逐行按存储 prevHash 重算）；迁移双方言 + pg 白名单；spec 覆盖首行 genesis 与 verify 跳过历史行
+- **P0 证据面接入 UI（演示可点）** — Business Action Detail 加「导出证据根」按钮（调 GET /ai/governance/evidence-root/:resultType/:resultId → 下载 keelbase-audit-evidence/3 JSON，提示离线 verify 命令）；管理台策略中心加「策略历史」区（GET /ai/governance/policy/history，每行可「查看快照」拉取该 revision 的策略 JSON）——P-③/① 能力从后端变可点击；i18n 双语；typecheck + vitest（policy 挂载 2 / api 89）全绿
+  **P0 证据面接入 UI（演示可点）**：Business Action Detail 加「导出证据根」按钮（下载 v3 证据包 + 离线验提示）；管理台策略中心加「策略历史」（列表 + 按 revision 查看快照）；i18n 双语；typecheck + vitest 全绿
+- **Governance policy visual editing (§internal.15(4))** — per-tool **gate mode** (`mode: auto | confirm | approval`) supersedes the raw confirmation boolean: policy can now escalate any R3-or-lower write tool to the **R4 two-person approval tier**, and the runtime approval branch reads the policy tier (no longer only declared R4); a shared `effectiveGateMode` pure function drives both the policy service and the admin tool inventory (which now reports `gateMode`/`requiresApproval`); R5 stays hard-blocked and is shown read-only; legacy `requiresConfirmation` keys keep parsing (old data / presets); the console **diff-saves** only overrides differing from declared defaults (unlisted tools keep declared defaults, so future default changes still propagate); Policy Center gains a tiered segmented control with override badges + per-row "reset to default"; the duplicated old policy-editor card is removed from AI Tools (single editor, diff semantics); the governance sidecar maps `mode` too; spec docs/hs9-governance-policy.spec.md v1.1
+  **治理策略可视化编辑（§internal.15(4)）**：每工具门控档位（mode: auto/confirm/approval）取代布尔「需确认」——任意 R3 及以下写工具可升档到 **R4 双人审批**，运行审批分支改读策略档位（不再只认声明 R4）；`effectiveGateMode` 纯函数供策略服务与工具清单共用（清单新增 gateMode/requiresApproval）；R5 恒阻断、编辑器只读；legacy requiresConfirmation 键继续兼容（旧数据/预设）；策略中心档位化分段单选 + 覆盖徽标 + 单行恢复默认，保存改差异语义（只写与默认不同项）；工具与副作用页移除旧重复策略卡（收敛单一编辑器）；治理 sidecar 同步映射 mode；spec docs/hs9-governance-policy.spec.md v1.1
+
+## [1.0.5] - 2026-09-03
+
+> **KeelBase 1.0.5 — AI Follow-up & Audit Evidence Hardening / AI 主动跟进与审计证据加固版**
+> 1.0 后第五个补丁：AI Follow-up Agent（主动发现该跟进谁）+ AI Bridge 代理工具免重启热更新 + 审计语义收尾（A-2/A-3/A-5/A-7/A-8 事件时点放行快照·越权尝试一级事件·审批语义·生命周期 el-steps）+ Security Showcase 对抗性证明产品化（canary 防线漂移即变红）+ 证据体系（protocol-conformance CI / 证据包离线复核 / 合规映射）+ 全库健康体检阶段 1/2（授权子域下沉切断 import 环）+ 发布前四层评审修复（证据语义/撤销态可达/越权筛选语义等）。**审计与治理证据链的语义在发布评审中进一步修正并全量回归。**
+
+### Added / 新增
+
+- **AI Follow-up Agent** — AI proactively surfaces "who needs follow-up": read-only `detect_idle_customers` tool (R1, default = 30 days with no follow-up activity incl. never-contacted; last-contact derived from `crm_activities.happenedAt`, **no migration**; userId-scoped) → LLM aggregates suggestions → user confirms → reuses `create_followup_task` (R3 confirmation gate + revocable side effect) → audited; adds an "AI proactively finds problems" step to the Golden Flow; spec `docs/ai-crm-followup-agent.spec.md`; end-to-end verified with a real LLM (DeepSeek: "which customers haven't been followed up" → correctly returned never-contacted customers and suggested a task)
+  **AI Follow-up Agent（A1）**：detect_idle_customers 检测长期未跟进客户 → AI 建议 → 确认后建跟进任务；多 provider 实测
+- **ai_proxy_tools no-restart hot reload (AI Bridge B path)** — `ToolRegistry.unregister` + `ProxyToolRegistryService.reload` + `SettingsService.onChange` observer — takes effect as soon as config is written, no restart needed; matching unit tests + e2e hot-reload case; `docs/manual/ai-bridge.md` synced
+  **ai_proxy_tools 免重启热更新**：写 `ai_proxy_tools` 配置即 reload，工具热更新无需重启
+- **Security Showcase (§internal.16 A2 adversarial-proof productization)** — admin "security demo" page runs deterministic adversarial scenarios in one click (injection HS-8 / CASL row-level authorization / R5 blocked / R3 confirmation gate), directly reusing the real defense logic, no LLM; **canary semantics**: defense drift (injection samples no longer hit / CASL allows / risk level changes) fail-loud turns red; reason/trace uses bilingual i18n (`reasonKey`/`params`, backend never emits user-facing copy); frontend adds failure toasts and loading error states; spec `docs/security-showcase.spec.md`
+  **安全演示（A2 产品化）**：确定性对抗场景一键运行 + 决策轨迹业务语言 + 双语；防线漂移 fail-loud（canary）
+- **AI audit evidence semantics wrap-up (A-3/A-5/A-7/A-8)** — event-time authorization snapshot on grant (a granted tool_call records `authorization={allowed,checks,…}`, export prefers the snapshot at event time over recomputing from current policy) + authorization-denial attempts promoted to first-class events (unauthorized / high-risk-blocked / generic-blocked three-way split) + approval manual decide/review recorded with correct audit semantics (businessEvent breakdown) + governance-drawer lifecycle el-steps (initiated→authorized→confirmed→executed→revoked→restored) + A-8 denied view / behavior-replay filtering; each has a spec
+  **审计证据语义收尾**：放行快照 + 越权一级事件 + 审批语义 + 生命周期流转 + denied 筛选
+- **Evidence & protocol suite** — `scripts/verify-protocol-conformance.mjs` (independent re-implementation of the three governance protocols + tamper vectors, 22/22) + CI protocol-conformance job; `docs/evidence` evidence-system overview (L0/L1/L2 layers); offline re-verification of evidence packages retained (86 chains PASS)
+  **证据与协议体系**：conformance 进 CI + 证据三层索引 + 离线复核留档
+- **Compliance mapping (CN GenAI content-safety)** — adds a GenAI content-safety regulatory section (responsibility boundary + audit events landing on the hash chain for self-attestation); factual mapping only
+  **合规映射（国内生成式 AI 内容安全）**：compliance-mapping 新增生成式 AI 内容安全监管节（责任边界 + 审核事件落哈希链自证），纯事实对照
+- **Codebase health audit phase 1/2** — full-repo audit report committed (`docs/manual/codebase-health-audit.md`, ~1232 files); removed 3 orphan exports; **AuthorizationExplainerService authorization sub-domain extracted** (moved out of AiService, net −131 lines, cuts the audit/auth reverse runtime import cycle) + ToolRegistry promoted to a module provider
+  **全库健康体检阶段 1/2**：体检报告入库 + 授权子域下沉切 import 环
+- **Demo & UX** — bilingual demo seeds for all modules (events/todos/CRM/PM/approval/flows etc.) + workbench version badge (reads `/app/version`) + workbench quick cards filtered by feature-flagged modules (lite preset hides flagship entries)
+  **演示与 UX**：全模块中英文演示 seed（events/todos/CRM/PM/approval/flows 等）+ 工作台版本徽标（读 `/app/version`）+ 工作台快捷卡片按 feature-flag module 过滤（lite preset 隐藏旗舰入口）
+- **Generator** — `keelbase init` generated modules now carry an Apache-2.0 SPDX header (comment syntax chosen per file extension) + Module Protocol `required` propagated (DTO/model mandatory fields stay in sync)
+  **生成器**：keelbase init 生成模块自动带 Apache-2.0 SPDX 头（按扩展名选注释语法）+ Module Protocol `required` 透传（DTO/model 必填一致）
+- **Security cleanup** — fixed 6 genuine CodeQL High findings (governance-console startup no longer prints JWT_SECRET / unbiased `randomInt` for verification codes & invite codes / RegExp-injection guard / complete escapeRegExp) + suppressed 12 known false positives via official comments; docker apk steps switched to the Aliyun mirror; prod HTTPS three-entry config
+  **安全清理**：CodeQL 6 个 High 真问题修复（治理台启动不再打印 JWT_SECRET / 验证码邀请码 `randomInt` 无偏 / 防 RegExp 注入 / 完整 escapeRegExp）+ 12 个已知误报官方注释抑制；docker apk 步骤切阿里云镜像；prod HTTPS 三入口配置
+- **Provider compatibility baseline** — verification-index covers three real providers (DeepSeek / GLM-5.1 / Kimi-k2.6), golden-crm 8/8 each + recorded real tool-calling runs
+  **Provider 兼容基准**：verification-index 三真实 provider（DeepSeek / GLM-5.1 / Kimi-k2.6）golden-crm 各 8/8 + tool-calling 实测记录
+- **Docs & language** — README governance overview diagram (EN/ZH SVG) + English glossary + user-visible copy reverted Guard→Governance / Copilot→AI 助手 + internal codenames (MOAT etc.) cleaned up
+  **文档/语言**：README 治理全景图（EN/ZH SVG）+ 词汇表英文版 + Guard→Governance/Copilot→AI 助手用户可见文案回改 + 内部代号（MOAT 等）清理
+
+### Fixed / 修复
+
+- **Pre-release four-layer review fixes (2026-09-03)** — ① audit-grant authorization snapshot written only for the "granted and executed successfully" branch (user rejection / timeout / non-streaming write-denials had been mis-counted as unauthorized/blocked by the A-8 denied view and blocked aggregates, polluting evidence semantics) ② governance-drawer revocation state reachable (B4 effect adds targetSoftDeleted) + authorize node no longer wrongly shows wait ③ AI timeline "unauthorized/denied" filter re-keyed to isError+authorization semantics (previously filtered the wrong rows by color) + added an "AI executed" option ④ Security-Showcase false-green fix + structured bilingual + error toasts ⑤ detect_idle counts before truncation / never-contacted createdAt tie-break / explicit limit 1–50 validation ⑥ AuthorizationExplainerService/ToolRegistry gain `@Injectable()`
+  **发布前四层评审修复**：快照门控 / 撤销态可达 / 越权筛选语义 / showcase canary+双语 / detect_idle 计数排序 / DI 装饰器
+- **Workbench quick cards do not navigate on click** — `WorkbenchHomeView` put `:on-click` on its `el-card` (a v-bind attribute binding, which does not register as an event listener), making the whole card ignore clicks; changed to `@click` + added an "open" link inside the card (el-link + arrow) + `cursor:pointer`; regression tests 6 cards → 5 correct router.push routes + 1 window.open
+  **工作台快捷卡片点击不跳转**：`:on-click` → `@click`（v-bind 不注册事件），卡片加跳转链接；回归测试覆盖
+- **Flow-instance detail 500 (demo-data seed format bug)** — `demo-data.ts` seeded flow definitions with `nodes_json` as a wrapped `{nodes:[...]}` object while `getDefinition` expects a bare array → instance detail with pending approval tasks (hanging human_task) threw a `TypeError` 500 in `def.nodes.find` (completed instances without tasks were fine); fixed the seed to a bare array + made `getDefinition` accept both formats (bad data already on ECS recovered with no migration); regression test + end-to-end verification
+  **流程实例详情 500**：demo-data seed nodes_json 格式错误（`{nodes:[...]}` vs 裸数组），getDefinition 兼容两种格式；回归测试 + 端到端验证
+- **Notification queue hangs when redis is unavailable** — `_pushToDevices`'s BullMQ `pushQueue.add` hangs indefinitely when redis is unreachable (never rejects, so try/catch cannot catch it), blocking business requests such as starting flows / approvals; added a 3s timeout guard — on timeout/failure it degrades to synchronous push; 2 regression tests for the degraded path
+  **redis 不可用通知队列挂起**：pushQueue.add 加 3s 超时，超时/失败降级同步推送；回归测试 2 个
+
+## Release Precheck（2026-09-03）
+
+- 四层 code review：**阿里 OCR**（5 提交 scoped，16 条——含 0c16bc2 快照污染 HIGH）+ **Claude 自带多维审查**（AI/审计/前端/基础设施 4 组并行，19 条——含 A-8 误计回归 + GovernanceActionDrawer 撤销态不可达 2×HIGH）+ **code-review skill**（Standards 7 条：双语红线/showcase 二次注册/规则多重编码；Spec：7 特性逐一对 spec，簇 A 确认为 spec-wrong）+ **Code Economy**（WARN：规模相称，Reuse 项——showcase 二次 ToolRegistry）→ 去重分级后 **修复 6 类阻塞/高价值**（快照门控 / 撤销态可达 / 时间线筛选语义 / showcase canary+双语+错误处理 / detect_idle 计数排序校验 / @Injectable+SPDX）；核实干净：AuthorizationExplainerService 重构逐字搬迁+DI 接线、CodeQL 0 finding、flow 兼容、SPDX 注入、双语 seed 纯增量
+- 全量测试：后端单测 **1997**（+4 评审回归；安全模块 statements 全 ≥85%）+ e2e **17 套/260** + Web-Admin vitest **312** + Flutter **623**（行覆盖 **76.5%**）+ 生成器/CLI **81** + conformance **22/22** + endpoint-docs 0 缺失 + **release-gate 12/12 PASS**
+- 覆盖率：All files Stmts **90.15** / Branch **75.05** / Lines **90.84**，较 v1.0.4 无降级、全部达标（statements≥85 + 安全模块分档）
+
+## [1.0.4] - 2026-09-01
+
+> **KeelBase 1.0.4 — Business Action Ledger & Governance Capabilities 2.x / 业务行为取证与治理能力体系版**
+> 1.0 后第四个补丁：§internal.16 业务行为取证系统完整落地（A-1~A-8）——字段级留痕 + 决策依据 + 业务事件归一化 + 实体行为史账本 + 审计解释器 + 跨系统身份链与授权依据 + 合规证据包 v2 + 越权专门视图 + FLOW 审批链入审计；治理能力体系 2.1/2.2/2.3（协议合规套件 / MCP 治理契约 / 策略实时推送 / 策略模板库 / 合规映射 / 证据包离线验证）；四端业务语言化；产品语言统一（Business-safe AI Runtime + DNA + Trust Manifesto）；EASY-5 首启引导 preset（v1.1 P0-6 第一刀）；Apache-2.0 开源可信包装。**「谁、基于什么授权、做了什么、每级怎么批的」完整业务叙事可现场演示 + 离线可复核证据。**
+
+### Added / 新增
+
+- **Business Action Ledger (§internal.16 A-1/A-2/A-4/A-5/A-6)**: field-level change diff (before/after incl. generic operation audit PATCH/PUT) + Decision Evidence (analyze_* deterministic scoring → {decision,evidence[],policy,confidence}) + Business Event normalization (tool→event name, chain-external columns) (A-1); business entity history ledger (BusinessHistoryService three-source aggregation + BusinessHistoryDrawer + crm_task/pm_task/app_request entries) (A-2); audit interpreter business-language summary + three-layer expand (summary / evidence stats / technical detail) (A-4); cross-system identity chain (Human→Intent→Agent→Tool→Action) + authorization basis (denied checks / allowed explainAuthorization) + source=bridge (A-5); compliance evidence package v2 (`keelbase-audit-evidence/2` — compliance segment with per-sample summary + identity chain, signature-covered; verify-evidence.mjs v1/v2 backward compatible) (A-6)
+  **业务行为取证系统（§internal.16 A-1/A-2/A-4/A-5/A-6）**：字段级变更留痕（含通用操作审计 before/after）+ 决策依据 + 业务事件归一化 + 实体行为史账本 + 审计解释器业务摘要（三层展开）+ 跨系统身份链与授权依据（含 B 路径 source=bridge）+ 合规证据包 v2（compliance 段入签名防篡改，离线验证脚本向后兼容）
+- **A-8 unauthorized-access dedicated view (§internal.16)**: `GET /audit/logs?denied=true` filters 越权/阻断 events (is_error=true AND authorization non-empty — "AI denied" is safety evidence too); admin AI-audit「行为类型」selecting denied now queries the server-side filter instead of filtering only the loaded 50 rows
+  **A-8 越权专门视图（§internal.16）**：`GET /audit/logs?denied=true` 服务端过滤越权/阻断事件（is_error + authorization 非空——「AI 被拒」同样是安全证据）；管理台 AI 审计「行为类型」选「AI 越权/被拒」时走服务端 denied 过滤，而非仅过滤已加载的 50 行
+- **A-7 FLOW approval chain (§internal.16)**: visualize FLOW human_task approval chains — `GET /flows/my` (own instances + definition name + pending-approval count) + `GET /flows/:id` returns the approval chain (initiator + each approver's username/result/comment/time); workbench "my flows" list + instance-detail el-timeline approval chain (initiated → each human_task → terminal state); **approval chains enter the audit** — flow audit enriched with businessEvent (FlowInstanceStarted/FlowNodeReached/FlowTaskApproved/FlowTaskRejected/FlowInstanceCompleted) + evidence (node/approver/decision/comment), the audit-interpreter gains a flow_node branch that reconstructs the approval-chain business summary
+  **A-7 FLOW 审批链（§internal.16）**：FLOW human_task 审批链可视化——`GET /flows/my`（本人实例 + 定义名 + 待审批数）+ `GET /flows/:id` 带出审批链（发起人 + 每级审批人用户名/结果/意见/时间）；工作台「我的流程」列表 + 实例详情 el-timeline 审批链（发起 → 每级 human_task → 终态）；**审批链入审计**——flow 审计富化 businessEvent（FlowInstanceStarted/FlowNodeReached/FlowTaskApproved/FlowTaskRejected/FlowInstanceCompleted）+ evidence（节点/审批人/决策/意见），审计解释器加 flow_node 分支还原审批链业务摘要
+- **Weapp build unblocked (N-1)**: 23 page `<style src scoped>` → script `import scss` (workaround vue-loader scoped-style entry into mini postcss-loader chain crash); CI `taro-build` now includes `build:weapp`
+  **小程序构建修复（N-1）**：23 页 scoped 外链样式改 script import 绕开构建崩溃（rpx 转换验证正常）+ CI taro-build 常驻校验 build:weapp
+- **A-3 lifecycle state machine + A-5 auth chain graph (§internal.16)**: governance-drawer lifecycle section (current state derived from the decision trace: executed / confirmed-executed / blocked / rejected / revoked, revocation reads effect.targetSoftDeleted) (A-3); authorization-chain graph (`GET /auth/permissions/chain` grantor→grantee→policy→resource→effective) + identity-chain Intent node (Human→Intent→Agent→Tool→Business Action) + "why allowed" authorization basis (granted checks / rejection reasons) (A-5)
+  **A-3 生命周期状态机 + A-5 授权链可视化（§internal.16）**：生命周期段（当前态推导）+ 授权链图（授权者→被授权者→策略→资源→生效期）+ 身份链 Intent 节点 + 授权依据
+- **MCP tool declaration governance extension (Capabilities 2.1)**: KeelBase MCP export (`tools/list`) now carries per-tool governance contract over standard MCP fields — `annotations.readOnlyHint/destructiveHint` hints + `_meta.keelbase` namespace (`riskLevel` R0-R5 / `riskStrategy` / `requiresConfirmation`), standardized in ai-governance-protocol §4.4; previously computed metadata was stripped by the SDK `ToolSchema` (no passthrough). Any MCP client can now read each tool's risk profile before invoking.
+  **MCP 工具声明治理扩展（治理能力 2.1）**：KeelBase MCP 出口 `tools/list` 经 MCP 标准字段透出每个工具的治理契约——`annotations.readOnlyHint/destructiveHint` 提示 + `_meta.keelbase` 命名空间（`riskLevel` R0-R5 / `riskStrategy` / `requiresConfirmation`），写入 ai-governance-protocol §4.4 标准；此前元数据被 SDK `ToolSchema`（无 passthrough）剥掉，客户端不可见。任何 MCP 客户端在调用前即可读到工具风险画像。
+- **Protocol conformance suite (Capabilities 2.1 / A1)**: `scripts/verify-protocol-conformance.mjs` independently re-implements the three governance protocols (audit hash chain canonical/hash/verify, delegation-token HS256 verification, risk-level derivation) with tamper-detection test vectors; `npm run conformance`; protocol doc §2.2/§2.3 corrected to exactly match the reference implementation (literal `genesis`, `|` separator, legacy HMAC derivation, AUDIT_HMAC_KEY rotation semantics); §5.1 certification notes for third-party self-audit. Reference implementation 22/22.
+  **协议合规认证套件（治理能力 2.1 / A1）**：`scripts/verify-protocol-conformance.mjs` 独立实现三大治理协议（审计链 canonical/hash/链校验、委托 token HS256 验签、风险分级派生）+ 篡改检测测试向量；`npm run conformance`；协议文档 §2.2/§2.3 修正为精确匹配参考实现（genesis 字面量、`|` 分隔符、legacy HMAC 派生、AUDIT_HMAC_KEY 轮换语义）；§5.1 新增第三方自认证说明。参考实现 22/22 通过。
+- **Audit evidence package offline verification (Capabilities 2.3 / A2)**: `GET /audit/action-report/export` now returns `format=keelbase-audit-evidence/1` + full chain rows (id/prevHash/hash/payload) with the signature covering the chain; `scripts/verify-evidence.mjs` verifies the package offline — chain structure without keys (deletion/reorder/break detection), full payload recompute + signature with `--key <AUDIT_HMAC_KEY>` (content-tamper detection). Auditors can verify without installing KeelBase.
+  **审计证据包离线机器验证（治理能力 2.3 / A2）**：`GET /audit/action-report/export` 现返回 `format=keelbase-audit-evidence/1` + 全量链行（id/prevHash/hash/payload），签名覆盖 chain；`scripts/verify-evidence.mjs` 离线验证证据包——无密钥验链结构（删行/换序/断链），`--key <AUDIT_HMAC_KEY>` 全量重算 payload + 验签（内容篡改检测）。审计机构不装 KeelBase 即可复核。
+- **Governance policy realtime push (Capabilities 2.2 / B2)**: sidecar registers a callback (`SIDECAR_CALLBACK_URL`) with the governance console on startup; policy changes (apply-preset / PUT policy) are pushed to registered sidecars in real time (`POST /v1/policy`, service identity), taking effect in seconds instead of the 60s polling interval (kept as fallback).
+  **治理策略实时推送（治理能力 2.2 / B2）**：sidecar 启动时向治理台注册回调（`SIDECAR_CALLBACK_URL`）；策略变更（apply-preset / PUT policy）后治理台实时推送（`POST /v1/policy`，服务身份），秒级生效；60s 轮询保留作兜底。
+- **Governance policy preset library (§internal.15)**: finance/government/general one-click presets — finance = full audit + confirmation on every write tool / government = audit writes + confirmation on core write tools / general = default; Policy Center preset cards import in one click and take effect immediately (ties into Xinchuang "out-of-the-box compliance")
+  **策略模板库（§internal.15）**：金融/政务/通用三档预设一键导入实时生效 + Policy Center 预设卡片
+- **Compliance Mapping (Capabilities 2.3 / C1)**: factual mapping of KeelBase capabilities ↔ the 7 national standards under China's Agent-Interconnect regime / EU AI Act (record-keeping · human oversight) / MLPS 2.0 (等保) / PIPL & DSL; honest gaps marked (国密 SM2/3/4, domestic databases, SAML-LDAP) = input to the Xinchuang adaptation & certification service plan; bilingual
+  **合规映射表（治理能力 2.3 / C1）**：KeelBase 能力 ↔《智能体互联》国标 / EU AI Act / 等保 2.0 事实性对照，诚实标注信创差距（国密/国产库/SAML-LDAP）
+- **Protocol 2.0 aiTools declaration (Q2)**: Module Protocol gains an optional `aiTools` field (enabled switch + query/create riskLevel & confirmation overrides); the generator consumes it to produce governed AI tools (query R1 auto / create R3 confirm by default, R2=policy / R4=two-person approval overrides, full disable for read-only modules); wiring skips disabled tools; validate + docs + generator tests (59 green).
+  **协议 2.0 aiTools 声明（Q2 主线）**：Module Protocol 新增可选 `aiTools` 字段（enabled 开关 + query/create 的 riskLevel/requiresConfirmation 覆盖）；生成器消费它生成带治理的 AI 工具（缺省 query R1 自动 + create R3 确认；R2=策略决定 / R4=双人审批 覆盖；只读模块可整体关闭）；接线按开关跳过；校验 + 文档 + 生成器测试 59 全绿。
+- **Business-language rendering across the four ends**: AI audit / behavior replay / execution trace / risk center / security review / AI approval / workbench Action Detail / Flutter main-app AI trace — tool calls, confirmations and side effects are all rendered in business language (bilingual toolLabel + parameter business summary + technical params collapsed behind a popover); R5-block errors productized ("this operation was blocked by the security policy (high risk)")
+  **四端业务语言化**：AI 审计/轨迹/风险/审批/安全审查/工作台/Flutter 工具动作业务语言化，技术细节折叠，R5 阻断双语
+- **EASY-5 first-run preset guide (v1.1 P0-6)**: FeatureFlagsService dynamized — applyPreset(full/small/lite) applies in-memory overrides + persists to Settings (feature_<key>) + reload restores overrides on restart; precedence runtime-override > env > preset; `POST /settings/preset` (admin, returns post-apply flags) + admin first-run three-card preset dialog
+  **EASY-5 首启引导 preset（v1.1 P0-6）**：FeatureFlags 运行时 preset 应用（full/small/lite）+ Settings 持久化 + `POST /settings/preset` + 管理台首启引导弹窗
+- **Product language & DNA (P0-4)**: unified positioning line "Business-safe AI Runtime" + glossary v0.1 + KeelBase engineering DNA finalized (docs/keelbase-dna.md) + CLAUDE.md §15.11 DNA self-check into the dev flow + Enterprise AI Trust Manifesto (four procurement/selection questions) + README DNA statement + draft community article《AI 生成的代码，凭什么信任？》
+  **产品语言与 DNA（P0-4）**：Business-safe AI Runtime 定位统一 + DNA 定稿 + Trust Manifesto + 词汇表 + DNA 自检
+- **Developer constitution skill**: consolidated the product/UX/architecture-engineering skills into a single constitution (keelbase-development-constitution, incl. development lifecycle / DoD / three-way review) + CLAUDE.md §15 AI Coding Rules (10 anti-code-slop rules) + release-precheck fixed four-layer review (Code Economy as the 4th layer + observation metrics v0.1)
+  **开发者宪法 skill**：三合一宪法 + AI Coding Rules + Code Economy 第四层评审
+- **Module generation provenance**: `keelbase init` writes `.keelbase-provenance.json` into every generated module directory (source / generator version / protocol / timestamp) + inspect displays it — the engineering-side "code is traceable" counterpart to the runtime Business Action chain
+  **生成模块 provenance**：生成出生证明 + inspect 溯源（DNA「代码可溯源」落地）
+- **Demo video v9**: decision-maker-oriented bilingual-narration demo (28-shot EN/ZH mp4) + PM/Approval/governance walk-through shots + bridge visual shot (legacy Java → governance → AI tools) + dubbing/subtitle/assembly pipeline committed
+  **演示视频 v9**：双语言旁白 + 桥接视觉 + 录制/配音/字幕流水线
+- **Apache-2.0 OSS trust packaging**: Apache-2.0 SPDX headers on all 1515 source files (idempotent `scripts/add-license-headers.mjs`) + DCO sign-off convention + public release plan docs/versioning.md + README badge + CI security scanning (gitleaks secret scan + CodeQL) + THIRD_PARTY_NOTICES SPDX declarations
+  **Apache-2.0 开源可信包装**：全仓 SPDX 许可头 + DCO + 版本计划公开 + gitleaks/CodeQL 扫描
+- **java-starter Maven Central**: KeelBase-java-starter 0.1.2 released; the compatibility matrix no longer marks "pending release"
+  **java-starter**：Maven Central 发布状态入兼容矩阵
+
+### Fixed / 修复
+
+- **Operation-audit hash-chain break**: `changes`/`businessEvent` accidentally included in hash payload (chain-external columns) → split hash/save payload; golden e2e hash-chain verify restored to valid
+  **操作审计哈希链破链修复**：changes/businessEvent 误入 hash payload 致 verify 失败——拆 hash/save payload 链外，哈希链 valid 恢复
+- **audit_chain_lock postgres touched_at type drift**: TIMESTAMP (no timezone) no longer matches the `@UpdateDateColumn` type TypeORM generates, so the column was re-declared to match — fixes the CI migration-consistency-postgres drift
+  **audit_chain_lock postgres 类型漂移**：touched_at 改 TIMESTAMP 匹配 TypeORM，修 CI 迁移一致性
+- **Flutter ai_chat_page tests missing CapabilitiesProvider**: added the provider (a dependency introduced in 94928a2), fixing 4 AI chat page tests (default model in the nav bar / model switch / confirmation card / tool-step card)
+  **Flutter AI 聊天页测试修复**：补 CapabilitiesProvider，4 测试恢复
+- **A-5 auth chain EN keys re-added**: restored the English keys of the permission-center authorization-chain page (lost when a concurrent session overwrote en.ts)
+  **A-5 授权链英文 key 补回**：并发 i18n 覆盖恢复
+
+## Release Precheck（2026-09-01）
+
+- 四层 code review：**阿里 OCR**（7 条——scoped 单提交评审，全区间因网络环境停摆）+ **Claude 自带多维审查**（安全核查 0 阻塞 + 2 条 SUSPECTED）+ **code-review skill**（Standards：auth 双模式内联判权评估为有意设计 / Spec：孤儿 skill 回灌等）+ **Code Economy**（WARN 4 条）→ 修复 3 类：孤儿 skill 删除（merge 回灌死文件）+ operation-audit 覆盖补测 + 2 处 spec 随实现同步；OCR 低成本修复 4 条（agent 负缓存 miss / 死参数 / 双重强转 / 证据包 v1-v2 兼容分支）
+- 全量测试：后端单测 **1947**（安全模块 statements 全 ≥85%，operation-audit 83.5%→**97.7%**）+ e2e **259** + Web-Admin vitest **304**（补 guard 超时 20s）+ Flutter **623**（行覆盖 **76.5%**，ai_trace 断言同步业务语言）+ 生成器/CLI **81** + endpoint-docs 0 缺失 + **release-gate 12/12 PASS**
+- 覆盖率：较 v1.0.3 无降级；operation-audit 门控修复（补 10 测试）、Flutter ≥45% 门槛达标
+
+## [1.0.3] - 2026-08-30
+
+> **KeelBase 1.0.3 — Trust & Governance Hardening / 治理加固与产品证明版**
+> 1.0 后第三个补丁：治理能力 2.0（独立治理台 + sidecar 零代码接入 + 多系统单控制面）+ 审计可视化 E-1/E-2（字段级审计/哈希链视图/证据包导出）+ 关键路径性能 E-3 + 产品证明包（Trust 证明包六场景/越权 V-2/演示复位 V-4）+ 发布前三方评审加固（哈希链锁行/操作审计并发/副作用类型映射/sidecar 鉴权/迁移白名单）。**1.1 仍未触发**（产品证明期 4 项验收未达）。
+
+### Added / 新增
+
+- **Trust Proof Package (P0-6)**: `verify-trust-proof.mjs` six-scenario one-command verification (success / permission-denied 403 / R5 blocked / human confirmation / revoke / Java guidance), verified 15/15 (provider=demo, deterministic no-LLM); new `delete_customer` R5 block tool (irreversible action, policy-blocked, never executes) + DemoProvider always registered (`provider:'demo'` usable even with cloud keys)
+  **Trust 证明包（P0-6）**：六场景一键验证脚本（正常成功/越权 403/R5 阻断/人工确认/撤销/Java 引导，实测 15/15）+ delete_customer R5 阻断工具 + DemoProvider 无条件注册；security-showcase 双语入口 + 60s 视频分镜双语
+- **Java starter access layer**: `keelbase-java-starter` published to Maven Central (0.1.1) as an access-layer integration for existing Java systems.
+  **Java 接入层**：keelbase-java-starter 已发布 Maven Central（0.1.1），供存量 Java 系统接入。
+- **Governance Capabilities 2.0**: standalone governance control plane + external report endpoints (service identity) + audit/effect dual-write + cross-service revoke/approve callbacks + docker orchestration + sidecar AI-gateway audit proxy + tool-call gating (R5 block / R3-4 confirm) + 30-min adoption + multi-system single control plane (10-entry continuous hash chain verified)
+  **治理能力体系 2.0**：独立治理台 + sidecar 零代码接入 + 工具门控 + 多系统单控制面 + 跨服务撤销/审批回调
+- **Audit visualization (E-1/E-2/D4)**: E-1 field-level change audit (before/after snapshot + FieldDiff) + E-2 hash-chain view / daily trend / behavior replay + D4 evidence-package export (HMAC-signed, audit-committee verifiable) + HashChainView component
+  **审计可视化**：字段级审计 + 哈希链可视化 + 行为回放 + 证据包导出
+- **Performance (E-3)**: aggregate-endpoint caching (audit stats/cost/report/verify 60s TTL) + getAllStats column projection + users list cache/index + nginx gzip + vite manualChunks + frontend loading states
+  **关键路径性能（E-3）**：聚合缓存 + 列投影 + gzip + chunk 拆分
+- **AI-23 content safety (deep)**: dynamic sensitive-word/jailbreak table (Settings live) + hit audit + RAG/memory interception + Admin config card
+  **AI 内容安全深度化**：动态词表 + 全链路拦截 + 审计 + 管理台配置卡
+- **AI-config guidance banner**: `/app/capabilities` ai.{enabled,providerConfigured,provider} probe + Flutter/Web AI-page guidance banner
+  **AI 配置引导**：后端能力探测 + 双端 banner
+- **Front-end RBAC (WEB-FRONT-2)**: permission-point constants + `v-permission` directive + permission center page + actionable 403 guidance + first-visit onboarding
+  **前端 RBAC 权限点**：权限点/指令/中心页 + 403 可行动引导 + onboarding
+- **CLI**: generator next-steps full loop (backend/migration/frontend/AI-tool/deploy verification) + `doctor --env` environment preflight
+  **CLI 增强**：next-steps 全闭环 + doctor 环境预检
+- **weapp**: 23-page i18n migration + `build:weapp` fix + CI weapp regression guard
+  **weapp 专项**：i18n 全量 + 构建修复 + CI 防回归
+- **Product proof**: V-2 permission-denied verification (8/8) + V-4 one-command demo reset + V-6 30-min build instrument + verification-index
+  **产品证明**：越权 V-2 + 演示复位 V-4 + 30min V-6 + 验证索引
+- **Demo video production**: unified 37-shot demo video (brand / golden-path / trust / terminal) via `scripts/record-demo-full.mjs` + live system-demo & confirmation-gate shots
+  **演示视频制作**：37 镜统一演示视频（品牌/黄金路径/信任/终端，`record-demo-full.mjs`）+ 系统演示/确认门控实机镜
+- (Carried over from existing work) M2 Guard deepening / Integrator Kit / Live demo / P0-0 DemoProvider / deploy hardening / CORS / audit-chain load testing
+  （承接既有）M2 Guard 深化 / Integrator Kit / Live demo / P0-0 DemoProvider / 部署加固 / CORS / 审计链压测
+
+### Fixed / 修复
+
+- **Three-way review hardening (2026-08-30, pre-release)**: `create_contract` side-effect resultType mis-recorded as `'todo'` (revoke would soft-delete wrong Todo) → mapped `contract`; `audit_chain_lock` lock row only seeded by migration (dev/governance-standalone locked 0 rows → concurrent hash-chain fork) → idempotent ensure before lock; operation-audit sqlite concurrent-transaction interleave → silent audit loss → process `_tail` serialization; getAllStats projection missing detail/authorization/errorMessage → E-2 trend distortion → completed; sidecar `POST /confirmations` unauthenticated token disclosure → requires shared service key; GovernanceDataSource production `synchronize:true` → non-production only; entityFor unknown type defaulted to `Todo` (wrong delete) → fail closed; sidecar upstream fetch no timeout → 120s; external `isError` string parsing; delete_customer redundant requireVerifiedEmail; app.module postgres migration whitelist missing AddAuditChainLock/AddAiAuditUsername/AddAiGovernancePolicy; `reset-demo.sh --docker` no-op → rebuild postgres business DB
+  **三方评审加固（阿里 ocr + Claude 自带 + code-review skill，2026-08-30）**：12 项后端 + 2 项前端阻塞/关键项修复——哈希链锁行/操作审计并发/副作用类型映射/审计趋势/侧边车鉴权/迁移白名单/演示复位等
+- **Front-end (ocr)**: HashChainView `slice(0,n)` dropped newest chain tip → `slice(-n)`; CrmCopilotDrawer stale `executed` after tool failure → cleared on matched tool_end
+  **前端修复（ocr）**：哈希链可视化保留最新证据 + Copilot executed 防残留
+- (Carried over from existing work) P0 deployment/security hardening / CORS / audit-chain load testing
+  （承接既有）P0 部署/安全加固 / CORS / 审计链压测
+
+### Changed / 变更
+
+- (Carried over) audit-chain load testing added to release-gate (multi-instance mode reproduces forks)
+  （承接既有）审计链压测入 release-gate（多实例模式复现分叉）
+
+## Release Precheck（2026-08-30）
+
+- 三方 code review：**阿里 ocr**（v1.11.0 全区间扫描）+ **Claude 自带多维审查** + **code-review skill**（Standards + Spec 双轴）→ 综合修复 14 项（阻塞项全修，余项记录为已知限制）
+- 全量测试：后端单测 **216 套 / 1873 全绿** + e2e + Web-Admin vitest/typecheck + Flutter + 生成器/CLI + release-gate（详见发布记录）
+
+## [1.0.2] - 2026-08-27
+
+> **KeelBase 1.0.2 — Governance & Product-Proof Release / 治理深化与产品证明版**
+>
+> 1.0 后第二个补丁：M2 KeelBase Guard 控制平面成型（Agent Registry / Policy Center / Risk Center / Guard Overview）+ Trust UX 深化（D1 CRM 闭环 / Action Detail / 人类语言审计标签 / 委托字段）+ 产品证明准备（onboarding-30min / 一键 Golden Flow demo / OIDC 企业 SSO / AR-2 MCP）+ 跨端与生成器维护（Taro i18n / README 双语 / React CI / 生成器幂等与锚点修复）。**1.1 仍未触发**（产品证明期 4 项验收未达）。
+
+### Added / 新增
+
+- **M2 KeelBase Guard (M2 deep)**: Agent Registry admin view (D5) + Policy Center standalone (HS-9 策略产品面) + Risk Center (工具风险 R1-R5 / 高风险清单 / 阻断统计) + Guard Overview posture page (一页总览五中心 + 风险分布 + 审计态势 + 哈希链验证) + security-governance nav group + Agent→audit/replay linkage
+  **M2 KeelBase Guard（M2 深化）**：Agent Registry 管理视图（D5）+ Policy Center 独立页（HS-9 策略产品面）+ Risk Center 风险中心（工具风险 R1-R5 / 高风险清单 / 阻断统计）+ Guard Overview 治理总览（一页总览五中心 + 风险分布 + 审计态势 + 哈希链验证）+ 安全治理导航分组 + Agent↔审计/行为回放联动
+- **Trust UX (D1/D2/D4)**: AI CRM closed loop (copilot streaming + inline confirmation + governance drill) + Business Action Detail page (Who/When/What/Why two-layer/Result/Side Effects/Integrity + Human-Agent-System timeline) + tool-level human-readable audit labels (D2) + Agent Delegation Chain fields (D4, parent_action_id/caller_agent_id/…) + `toolLabel` human labels
+  **Trust UX（D1/D2/D4）**：AI CRM 业务闭环（Copilot 流式 + 内联确认卡 + 治理钻取）+ Action Detail 业务动作详情页（七段 + Why 双层 + Human-Agent-System 时间线）+ 工具级人类语言审计标签（D2）+ Agent 委托链字段（D4，parent_action_id/caller_agent_id/…）+ `toolLabel` 人类标签
+- **Product-proof prep (P0·产品证明)**: onboarding-30min (Build an AI module in 30 minutes, invoices sample) + one-command AI CRM Golden Flow workbench demo (`deploy/demo.sh`) + golden-demo recording script aligned to D1 UI + OIDC enterprise SSO frontend + AR-2 MCP-as-Adapter verification
+  **产品证明准备（P0·产品证明）**：onboarding-30min（30 分钟 Build 业务模块，invoices 示例）+ 一键 AI CRM Golden Flow 工作台演示（deploy/demo.sh）+ 录制剧本对齐 D1 UI + OIDC 企业 SSO 前端 + AR-2 MCP 即 Adapter 验证
+- **Cross-client & tooling**: Taro i18n layer (201 keys zh/en) + README/CHANGELOG bilingual + Web-Admin-React CI job + topbar role switch (admin ↔ workbench) + `sync-issues-to-gitee` script + generator DX (idempotent file write / wiring anchor repair / invoices sample spec)
+  **跨端与工具**：Taro i18n 层（zh/en 各 201 键）+ README 双语 + Web-Admin-React CI 接入 + 顶栏角色切换（管理台 ↔ 工作台）+ Gitee issue 同步脚本 + 生成器 DX（文件写入幂等 / 接线锚点修复 / invoices 示例 spec）
+
+### Fixed / 修复
+
+- **GET /events without range crashes on postgres**: `getEventsForRange` built an `Invalid Date` from missing/invalid start/end — silently fine on sqlite but a 500 on postgres; start/end made optional, missing values now filter by ownership only
+  **GET /events 未传时间范围在 postgres 上报 500**：`getEventsForRange` 对缺失/非法的 start/end 构造 `Invalid Date`——sqlite 不报错但 postgres 500；start/end 改可选，缺失时仅按所有权过滤
+- **Generator overwrote flagship AI tools**: `writeGenerated` unconditionally overwrote the existing `query-customers.tool.ts` (the AI CRM flagship) — added "skip if exists" idempotency (`--force` overrides)
+  **生成器覆盖旗舰 AI 工具**：`writeGenerated` 无条件覆盖已存在的 `query-customers.tool.ts`（AI CRM 旗舰）——加「已存在则跳过」幂等（`--force` 覆盖）
+- **Generator wiring anchors broken by code drift**: applyFile gains CRLF normalization (Flutter main.dart) + modules-manifest todos entry description + Taro explore i18n label — generated wiring 24/24 with no misses
+  **生成器接线锚点修复**：applyFile 加 CRLF 归一化（Flutter main.dart）+ modules-manifest todos 条目 description + Taro explore i18n label——生成接线 24/24 无未命中
+- **AiAuditView tests missing useRoute mock** (introduced by the M2 agentId filter): mock added, 281/281 all green
+  **AiAuditView 测试缺 useRoute mock**（M2 agentId 过滤引入）：补 mock，281/281 全绿
+- **P0 deployment & security hardening (external review)**: env templates gain ENCRYPTION_KEY/AUDIT_HMAC_KEY + the deploy script "replaces and appends missing lines"; Docker fails fast when it depends on a host Flutter web prebuild; R4 decideApproval rejects self-approval; SSRF protection extracted into common/utils/ssrf (reused by webhook + MCP registerServer)
+  **P0 部署+安全硬化（外部评审）**：env 模板补 ENCRYPTION_KEY/AUDIT_HMAC_KEY + 部署脚本追加缺失行；Docker 依赖宿主 Flutter web 预构建 fail-fast；R4 审批拒绝自批；SSRF 防护提取 common/utils/ssrf（webhook + MCP 复用）
+- **Deploy no longer hardcodes domain**: docker-compose.prod.yml CORS_ORIGINS switched to a `${CORS_ORIGINS}` env reference; nginx.https.conf server_name switched to a wildcard — deploying on another domain needs no source change
+  **部署不再写死域名**：docker-compose.prod.yml CORS_ORIGINS 改 `${CORS_ORIGINS}` env 引用；nginx.https.conf server_name 改通配——换域名部署无需改源码
+- **Web-Admin fixes**: business-page Copilot button renamed to「AI 分析」(to distinguish it from the top-bar global AI) + StatCard truncates long values (email overflow)
+  **管理台修复**：业务页 Copilot 按钮改「AI 分析」（与全局 AI 区分）+ StatCard 长值截断（邮箱溢出）
+
+## [1.0.1] - 2026-08-22
+
+> **KeelBase 1.0.1 — Maintenance & Coverage Release / 维护与覆盖加固版**
+>
+> 首个 1.0 补丁：v1.0 发布前 review 的两项遗留（AI 每日限额并发原子化 / WS 节流窗口命名）+ 来源身份体系补齐（System AI 来源身份 / doctor 兼容矩阵）+ 测试覆盖大幅提升（后端 24 文件到 85%+、管理台 10 视图、Flutter 102 用例）。
+
+### Added / 新增
+
+- **System AI Assistant source identity (provenance §13.1 ③)**: `AdminAiService.buildSystemContext` now injects the source identity from `.keelbase/manifest.json` (identity / generator+version / protocol / schema / source modules) so the console AI can answer "what system is this / who generated it / which protocol version"; complements the public `GET /app/provenance` runtime fingerprint
+  **System AI 来源身份集成（来源清单 §13.1 ③）**：`AdminAiService.buildSystemContext` 注入 `.keelbase/manifest.json` 的来源身份（identity/generator+version/protocol/schema/来源模块），管理台 AI 可回答「这是什么系统/谁生成的/什么协议版本」；与公开 `GET /app/provenance` 运行时指纹互补
+- **`keelbase doctor` compatibility matrix (provenance §13.1 ⑤)**: fifth check compares the manifest `protocol`/`schema` against the current CLI's supported values (mismatch → FAIL, upgrade CLI or rebuild the source manifest), alongside the existing completeness/consistency/runtime/version checks
+  **`keelbase doctor` 兼容矩阵（来源清单 §13.1 ⑤）**：新增第五查——manifest `protocol`/`schema` 对照当前 CLI 支持的版本（不匹配 → FAIL，需升级 CLI 或重建来源清单），与完整性/一致性/运行时/版本并列
+- **Test coverage surge (maintenance)**: backend 24 low-coverage files raised to 85%+ (most 100%); Web-Admin-Vue 10 core view component tests (35 cases); Flutter flagship detail/list pages, repositories & core (102 cases) — overall backend statements 92.7% / branches 77.8% / functions 90.4%, vitest ~75.5%
+  **测试覆盖大幅提升（维护）**：后端 24 个低覆盖文件提到 85%+（多数 100%）；管理台 10 个核心视图组件测试（35 用例）；Flutter 旗舰详情/列表页 + repository + core（102 用例）——后端 statements 92.7% / branches 77.8% / functions 90.4%，vitest ~75.5%
+
+### Fixed / 修复
+
+- **AI daily limit made concurrency-atomic (v1.0 review S3)**: `reserveDailyUsage` uses an atomic conditional increment (`WHERE count < limit`, same pattern as the headless quota) instead of read-check-write, so concurrent chats can no longer collectively exceed `ai_daily_limit`; failed chats release their reserved slot via `releaseDailyUsage` (only decrements when `count > 0`)
+  **AI 每日限额并发原子化（v1.0 review S3）**：`reserveDailyUsage` 用原子条件递增（`WHERE count < limit`，同 headless 配额）替代「读-判-写」，并发请求不再集体越过 `ai_daily_limit`；对话失败经 `releaseDailyUsage` 释放预留槽（仅 `count > 0` 时递减）
+- **WS `ai:chat` throttle window naming (v1.0 review S4)**: `AI_CHAT_LIMIT_PER_MIN` → `AI_CHAT_LIMIT_PER_WINDOW` with a comment — the window is the 30s heartbeat sweep, so the effective rate is 30/30s (≈60/min), matching the constant
+  **WS `ai:chat` 节流窗口命名（v1.0 review S4）**：`AI_CHAT_LIMIT_PER_MIN` → `AI_CHAT_LIMIT_PER_WINDOW` 并注明窗口=30s 心跳 sweep（实际 30 次/30s ≈ 60/min），常量名与行为一致
+
+## [1.0.0] - 2026-08-22
+
+> **KeelBase 1.0 Release Notes**
+>
+> **KeelBase 1.0：Business-safe AI Application Base**——AI 驱动的企业应用工程体系首个稳定版。
+> 1.0 只证明「三件套」：**AI CRM（Golden Application）** 一次跑通闭环（Customer → 风险分析 → 建跟进 → 确认 → 写 → 审计 → 撤销）+ **Application Protocol** 生成器（协议化配置 → 生成带权限/AI 工具/确认/审计的模块）+ **Runtime 治理**（CASL / 写操作确认 / 审计哈希链 / 副作用撤销 / Explainable Authz）。FLOW / 插件 / MCP / Headless / 模板市场等能力已实现，**1.0 后按需激活**。
+>
+> 关键交付（v0.9.2 后 94+ 提交）：
+> - **Build → Run → Trust → Private Deploy 全链路可验证**：`release-gate.sh` 确定性 10/10 + Gate 1-4（Golden Application 双视角 9/9+8/8 / Adversarial 证据链：越权矩阵 39 + 攻击集 12/12 + 合成陌生人实测 / Release Gate 进 CI）
+> - 三旗舰 AI 应用、私有 AI 全链路、插件生态 CLI、通用 OIDC SSO、管理台 Element Plus、审计哈希链、Agent 安全评测、Explainable Authz、AIization（OpenAPI/Schema 导入）、生成器 DX 等
+>
+> 完整变更见下。README 双叙事：AI 能力 + 数据主权（Private AI 独立叙事）。
+
+Flagship AI applications, Private AI Golden Path, plugin ecosystem CLI, generic OIDC SSO, Web-Admin Element Plus migration. / 三旗舰 AI 应用、私有 AI 全链路验证、插件生态 CLI、通用 OIDC SSO、管理台 Element Plus 迁移。
+
+### Added / 新增
+
+- **AI CRM flagship (backend + Flutter/Web UI)**: Customer/Order/Activity/Task/Risk entities, CRUD/CASL, 5 AI tools (query_customers / query_customer_orders / query_customer_activities / analyze_customer_risk read + create_followup_task write-with-confirmation, revocable `crm_task` side effect), risk scoring (overdue / amount / open-risk tiers), real seed (8 customers / overdue orders / risks), feature flag `crm`
+  **AI CRM 旗舰（后端 + Flutter/Web UI）**：客户/订单/跟进/任务/风险实体，CRUD/CASL，5 个 AI 工具（4 读 + 写需确认可撤销 `create_followup_task`，副作用 `crm_task`）、风险打分（逾期/金额/未解决风险分级）、真实 Seed（8 客户/逾期订单/风险）、feature flag `crm`
+- **AI Project Management flagship (backend + Flutter/Web UI)**: Project/Member/Milestone/Task/Risk entities, CRUD/CASL, 4 AI tools (query_projects / query_project_tasks / analyze_project_risk read + create_project_task write-with-confirmation, revocable `pm_task` side effect), delay-risk scoring, real seed (4 projects / milestones / delayed tasks), feature flag `pm`
+  **AI Project 旗舰（后端 + Flutter/Web UI）**：项目/成员/里程碑/任务/风险实体，CRUD/CASL，4 个 AI 工具（3 读 + 写需确认可撤销 `create_project_task`，副作用 `pm_task`）、延期风险打分、真实 Seed（4 项目/里程碑/延期任务）、feature flag `pm`
+- **AI Approval flagship (backend + Flutter/Web UI)**: ApprovalRequest/ApprovalPolicy entities, CRUD/CASL, AI pre-review with policy-tiered rules (low-risk amount ≤ threshold auto-approve / over-threshold → human review) + manual decide, 4 AI tools, real seed (3 policies / 3 requests), feature flag `approval`
+  **AI Approval 旗舰（后端 + Flutter/Web UI）**：审批请求/政策实体，CRUD/CASL，AI 预审按政策分级（金额≤阈值低风险自动通过 / 超阈值转人工复核）+ 人工 decide，4 个 AI 工具，真实 Seed（3 政策/3 请求），feature flag `approval`
+- **Private AI Golden Path (W1 / POV-1)**: `scripts/verify-private-ai.sh` proves the "data never leaves the perimeter" chain end-to-end — Cloud OFF → local Ollama chat (provider=ollama) → local bge-m3 embedding → CRM read → AI audit `provider=ollama` → audit hash chain `valid`; evidence pack `private-ai-report.md` + `docs/benchmark/private-ai.json`; Release Gate Private dimension ✅
+  **私有 AI 全链路验证（W1 / POV-1）**：`scripts/verify-private-ai.sh` 端到端证明「数据不出域」闭环——Cloud OFF → 本地 Ollama 对话（provider=ollama）→ 本地 bge-m3 embedding → CRM 读 → AI 审计 provider=ollama → 审计哈希链 valid；证据包 `private-ai-report.md` + `docs/benchmark/private-ai.json`；Release Gate Private 维度 ✅
+- **Plugin ecosystem CLI (P1-7)**: `keelbase-plugin` add / remove / list / verify — host-independent manifest validation (name kebab-case / version semver / description / requires / featureFlag / capabilities), self-containment check (host-relative imports → portability warning), real third-party install cycle (approval-intake example)
+  **插件生态 CLI（P1-7）**：`keelbase-plugin` add/remove/list/verify——宿主外 manifest 校验（结构/一致性/featureFlag 对照）、自包含检测（宿主相对导入→可移植性警告）、真实第三方安装闭环（approval-intake 示例）
+- **Generic OIDC SSO backend (P2-4)**: dynamic `.well-known` discovery → token exchange → id_token signature verification (issuer/audience/JWKS, anti-confusion) → userinfo fallback to claims; enterprise provider group appears when `OIDC_ISSUER` / `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` are configured
+  **通用 OIDC SSO 后端（P2-4）**：动态发现 `.well-known` → token 交换 → id_token 签名验证（issuer/audience/JWKS，防混淆）→ userinfo 降级 id_token 声明；配齐 `OIDC_ISSUER`/`OIDC_CLIENT_ID`/`OIDC_CLIENT_SECRET` 后 `/auth/oauth/providers` 出现 oidc（enterprise 组）
+- **Web-Admin-Vue migrated to Element Plus**: Vuetify fully removed (zero `v-*` tags) — 12 shared components + 37 pages + layout migrated (el-table / el-form / el-menu / el-tag / el-dialog …), Vuetify tokens → EP CSS variables (incl. dark), on-demand tree-shaken import
+  **管理台迁移到 Element Plus**：Vuetify 完全移除（零 `v-*` 残留）——12 个共享组件 + 37 个页面 + 布局迁移（el-table/el-form/el-menu/el-tag/el-dialog…），Vuetify token → EP CSS 变量（含 dark），按需 tree-shake 引入
+- **Agent Decision Trace (P0-14)**: `GET /ai/conversations/:id/trace` aggregates messages / audit / tool-effects into a timeline (tool calls / confirmation decisions / side effects / results); Web workbench AiTraceView + Flutter AiTracePage; live tool cards show read/write badges + "needs confirmation" / "confirmed · revocable"
+  **AI 决策执行轨迹（P0-14）**：`GET /ai/conversations/:id/trace` 聚合消息/审计/副作用为时间线（工具调用/确认决策/副作用/结果）；Web 工作台 AiTraceView + Flutter AiTracePage；实时工具卡显示「读/写」徽标 + 「需确认」/「已确认 · 可撤销」
+- **Self-service AI side-effect revocation (P0-15)**: users revoke their own AI-created records (`DELETE /ai/my/tool-effects/:id`, ownership-checked, soft-delete → restorable from recycle bin); trace effect steps carry `effectId`
+  **用户侧 AI 副作用撤销（P0-15）**：本人可撤销 AI 创建的记录（`DELETE /ai/my/tool-effects/:id`，所有权校验，软删可经回收站恢复）；轨迹 effect 步骤带 `effectId`
+- **Existing-system AIization (P0-12)**: `keelbase init --import-openapi` (OpenAPI 3 / Swagger 2) + `--import-schema` (SQL CREATE TABLE — CHECK IN → enum, long VARCHAR → text) turn a legacy schema into a Protocol → generated module; `--out` writes only the Protocol JSON for later `--spec` reuse
+  **已有系统 AI 化（P0-12）**：`keelbase init --import-openapi`（OpenAPI 3/Swagger 2）+ `--import-schema`（SQL 建表——CHECK IN→enum、长 VARCHAR→text）把老 schema 转成 Protocol → 生成模块；`--out` 只写协议 JSON 供 `--spec` 复用
+- **AI-consumable module metadata (P1-3)**: `/app/capabilities` businessModules expose a `description` so AI agents know what each module does at a glance
+  **AI 可消费模块元数据（P1-3）**：`/app/capabilities` businessModules 透出 `description`，AI 读模块地图即知每个模块做什么
+- **Flagship demo templates (P1-9)**: template market gains `crm-demo` / `pm-demo` / `approval-demo` — one-click import of flagship scenario seeds (at-risk customers / delayed projects / approval policies)
+  **旗舰演示模板（P1-9）**：模板市场新增 `crm-demo`/`pm-demo`/`approval-demo`——一键导入旗舰场景种子（流失风险客户/延期项目/审批政策）
+- **Protocol reverse-engineering + business protocol specs**: generator supports `enum` fields (@IsIn / defaults + Flutter dropdown + admin/taro type mapping); `specs/` common business protocols (events / todos / books / notes) usable with `keelbase init --spec`
+  **协议反推 + 业务协议示例**：生成器支持 enum 字段（`@IsIn`/默认值 + Flutter 下拉 + admin/taro 类型映射）；`specs/` 常用业务协议（events/todos/books/notes）可直接 `--spec` 生成
+- **Generated modules ship AI tools + tests (30-min acceptance)**: `keelbase init` auto-attaches `query_<module>` (read) + `create_<module>` (write, requires confirmation + verified email) and registers them in ai.module; generated controller + AI-tool specs; 30-min acceptance script (`docs/manual/30min-acceptance.md`)
+  **生成模块自带 AI 工具 + 测试（30min 验收）**：`keelbase init` 自动附带 `query_<module>`（读）+ `create_<module>`（写，需确认 + 已验证邮箱）并注册 ai.module；生成 controller/AI 工具单测；30min 验收脚本（`docs/manual/30min-acceptance.md`）
+- **Flagship strict verification (Phase 2-1)**: `scripts/verify-flagships.sh` runs 4 e2e suites (crm / pm / approval / generated-modules — CRUD/CASL/confirmation/audit) with explicit security acceptance points; Release Gate Run dimension gains real LLM evidence (3/3 SUCCESS, DeepSeek)
+  **三旗舰严格验证（Phase 2-1）**：`scripts/verify-flagships.sh` 跑 4 个 e2e suite（crm/pm/approval/generated-modules——CRUD/CASL/确认/审计）+ 显式安全验收点；Release Gate Run 维度补真实 LLM 实测证据（3/3 SUCCESS，DeepSeek）
+- **Signed-URL upload access control (CR-21)**: `/uploads` files served via HMAC-SHA256 signed URLs with expiry (progressive default; `UPLOAD_REQUIRE_SIGN=1` forces 403) + path-traversal guard; avatar/upload responses return signed URLs
+  **上传签名访问（CR-21）**：`/uploads` 经 HMAC-SHA256 签名 URL（含过期时间）访问（渐进默认放行；`UPLOAD_REQUIRE_SIGN=1` 强制 403）+ 路径穿越防护；头像/上传响应返回签名 URL
+- **Web root → workbench, Flutter web as `/mobile` preview**: single-container/nginx root redirects to the Web workbench; Flutter web moves to `/mobile` as the mobile-app preview (Web business UI host = workbench)
+  **Web 根路径切工作台 + Flutter web 移 `/mobile` 预览**：单容器/nginx 根路径重定向到 Web 工作台；Flutter web 移到 `/mobile` 作移动 App 预览（Web 业务 UI 唯一宿主=工作台）
+- **Explainable Authorization (W5-⑦)**: authorization denials now carry structured reasons (which policy / why blocked); `GET /auth/me/permissions` exposes the caller's capability list
+  **授权依据可解释化（W5-⑦）**：授权拒绝返回结构化原因（哪条策略/为何阻止）；`GET /auth/me/permissions` 暴露调用方能力清单
+- **Agent Security Eval attack set (W4)**: security eval cases 6→12 (injection-write / confirmation-bypass / revoke-bypass / cross-org read·approve / unauthorized-read), verified 12/12 blocked on DeepSeek; `scripts/verify-security-eval.sh` scripts the regression with a 90% pass gate
+  **Agent 安全评测攻击集（W4）**：评测用例 6→12（注入写/确认绕过/撤销绕过/跨组织读·审批/越权读），DeepSeek 实测 12/12 全挡；`scripts/verify-security-eval.sh` 脚本化安全回归（90% 门槛）
+- **Stranger-challenge harness (W3)**: self-contained challenge card (30min Build + 60min Business) + `run.sh` clean-clone script for reproducible external-developer evaluation
+  **合成陌生人挑战包（W3）**：自包含挑战卡（30min Build + 60min Business）+ `run.sh` 干净 clone 脚本，供外部开发者可复现评估
+- **Audit-chain key separation + rotation (W4-②)**: `AUDIT_HMAC_KEY` (independent 64-hex) + `AUDIT_HMAC_KEY_PREVIOUS`; verify accepts `[current, previous, legacy]` candidate keys so old records stay verifiable after rotation
+  **审计链密钥分离 + 轮换（W4-②）**：独立 `AUDIT_HMAC_KEY`（64 hex）+ `AUDIT_HMAC_KEY_PREVIOUS`；verify 用候选集 `[current, previous, legacy]` 任一匹配——轮换后旧记录仍可验证
+- **AIization hardening (ai-bridge §3)**: `--import-openapi`/`--import-schema` extract `required`/label + skipped diagnostics; Protocol `required` propagates to DTO `@IsNotEmpty` and non-null model fields
+  **已有系统 AI 化加固（ai-bridge §3）**：`--import-openapi`/`--import-schema` 提取 `required`/标签 + 跳过诊断；Protocol `required` 透传到 DTO `@IsNotEmpty` 与非空模型字段
+- **Generator DX**: `--fields` supports inline enum options (`status:enum:active,paid`); create AI-tool files named with the plural module (consistent `jest <plural>` matching — 30-min acceptance "20 passed" now true); CLI tests 32→36
+  **生成器 DX**：`--fields` 支持内联 enum 选项（`status:enum:active,paid`）；create 工具文件统一复数命名（`jest <plural>` 匹配一致——30min 验收「20 passed」成立）；CLI 测试 32→36
+- **Business-safe Agent Benchmark (W2)**: `agent-benchmark.mjs` — 15 cases (Normal/Unauthorized/Ambiguous/High-risk/Prompt Injection × CRM/PM/Approval) with Run/Trust/Safety scores; deterministic Trust via `agent-benchmark.sh` (e2e 403/confirmation/audit-chain)
+  **Business-safe Agent Benchmark（W2）**：`agent-benchmark.mjs`——15 用例（五类任务 × 三旗舰）+ Run/Trust/Safety 评分；确定性 Trust 由 `agent-benchmark.sh`（e2e 越权/确认/审计链）补足
+- **Release Gate unified entry (W3 / 08-21)**: `scripts/release-gate.sh` — one command proving Build / Gate 1 / Trust / Private / Adversarial (deterministic 10/10, CI-able; `LLM_ENV=1` adds Run/Adversarial), wired as a `release-gate` CI job; Release Precheck standard program (Alibaba `ocr` + Claude double code review → full tests → coverage) as the pre-publish gate
+  **Release Gate 统一入口（W3 / 08-21）**：`scripts/release-gate.sh`——一命令证明 Build/Gate 1/Trust/Private/Adversarial（确定性 10/10，可 CI；`LLM_ENV=1` 加 Run/Adversarial），接线 `release-gate` CI job；发布前标准程序（阿里 ocr + Claude 双重 code review → 全量测试 → 覆盖率）作为发布前置
+- **Gate 1 Golden Application = AI CRM one-pass closed loop**: `test/golden-application.e2e-spec.ts` — 7-step deterministic loop (Customer → Risk Analysis → Create Follow-up Task → confirmation gate, no-write-without-approval → write + revocable side-effect → audit hash-chain verify → revoke soft-delete → cross-user revoke 404) + `scripts/verify-golden-application.sh` (8-item single acceptance, 9/9); release-gate gains a Gate 1 block
+  **Gate 1 Golden Application = AI CRM 一次跑通闭环**：`test/golden-application.e2e-spec.ts`——7 步确定性闭环（客户 → 风险分析 → 建跟进 → 确认门控，不确认不写 → 写入 + 可撤销副作用 → 审计哈希链 verify → 撤销软删 → 越权撤销 404）+ `scripts/verify-golden-application.sh`（8 项单一验收，9/9）；release-gate 加 Gate 1 段
+- **Gate 4 1.0 Candidate freeze list + policy**: `docs/manual/release-1.0-candidate.md` — scope slimming (1.0 proves only AI CRM + Protocol generator + Runtime governance; FLOW / plugin / MCP / Headless / template market marked "available, activate on demand after 1.0"), core-architecture freeze, Exit Criteria tracker (10 items); operations.md §3.1 v1.0 compatibility / upgrade policy (dual-driver migrations, v0.9.x→v1.0 path, honest technical-vs-market declaration)
+  **Gate 4 1.0 Candidate 冻结清单 + 政策**：`docs/manual/release-1.0-candidate.md`——1.0 边界瘦身（只证明 AI CRM + Protocol 生成器 + Runtime 治理三件套；FLOW/插件/MCP/Headless/模板市场标「具备，1.0 后按需激活」）、核心架构冻结、Exit Criteria 状态表（10 项）；operations.md §3.1 v1.0 兼容与升级政策（双驱动迁移、v0.9.x→v1.0 升级路径、技术/市场诚实声明）
+- **Private AI promoted to co-equal narrative (§7.4 #4)**: enterprise-capabilities.md "Dual narrative" — AI capability (Business-safe Agent acting within rules) and data sovereignty (data-never-leaves-perimeter Private AI) as parallel external narratives, with Private AI evidence strengthened (private-ai-report 8/8 + verify-private-ai.sh)
+  **Private AI 升为独立叙事（§7.4 #4）**：enterprise-capabilities.md 加「双叙事」——AI 能力（Business-safe Agent 在规则内干活）与数据主权（数据不出域 Private AI）并列为对外叙事，并强化 §10 私有 AI 证据（private-ai-report 8/8 + verify-private-ai.sh）
+
+### Fixed / 修复
+
+- **Private AI chain repairs (W1)**: Joi schema accepts `AI_PROVIDER=ollama`; BullMQ workers register only when `QUEUE_ENABLED` (test env never connects Redis); ollama default model follows `OLLAMA_MODEL`
+  **私有 AI 断链修复（W1）**：Joi 放行 `AI_PROVIDER=ollama`；BullMQ worker 条件注册（测试环境不连 Redis）；ollama 默认模型用 `OLLAMA_MODEL`
+- **CI repair (6 failure domains)**: migration-consistency job (no-change exits 1 under `bash -e` → `|| true`), 2 flaky e2e timeouts, coverage gates (Flutter 46.1% / web-admin ≥30%), e2e queue stubbing (never connects Redis), email-verified cache clear
+  **CI 修复（6 个失败域）**：migration-consistency job（`bash -e` 下无变化退出码 1 → `|| true`）、2 个抖动 e2e 超时、覆盖率门禁（Flutter 46.1% / web-admin ≥30%）、e2e 队列 stub（永不连 Redis）、email-verified 缓存清除
+- **Queue disabled in test env**: BullMQ no longer hangs e2e when Redis is absent (conditional registration + stub overrides); `.env.test` auto-generated when missing
+  **测试环境禁用队列**：无 Redis 时 BullMQ 不再挂起 e2e（条件注册 + stub override）；缺 `.env.test` 时自动生成
+- **Redis exposed to host loopback**: compose `redis` now maps `127.0.0.1:6379:6379` (loopback-only) so local dev/e2e can reach it without binding 0.0.0.0
+  **Redis 暴露到宿主机回环**：compose `redis` 加 `127.0.0.1:6379:6379` loopback-only 映射（本机可用、不绑 0.0.0.0 避免生产外网暴露）
+- **Generated-module CASL wiring (30-min acceptance hardening)**: `keelbase init` modules now auto-wire `can('manage','<Module>',{userId})` — owner update/delete previously returned 403
+  **生成模块 CASL 接线修复（30min 验收加固）**：`keelbase init` 生成模块自动接线 `can('manage','<Module>',{userId})`——此前本人更新/删除全 403
+- **TypeORM logging type**: `app.module` logging `string[]` → `LogLevel[]` (build blocker from read/write-split)
+  **TypeORM logging 类型**：`app.module` logging `string[]`→`LogLevel[]`（读写分离遗留的 build 阻塞）
+- **W4 production bug fixes (security/robustness batch)**: MFA TOTP failures now accumulate lockout attempts (prevent per-IP brute force of the 6-digit code); WebP magic bytes require the `WEBP` marker at offset 8 (WAV/AVI can no longer masquerade); webhook delivery blocks private/loopback/link-local targets (SSRF guard); headless quota uses atomic UPDATE (concurrent requests can no longer exceed `quotaPerDay`); `PUT /users/:id` phone change syncs `phoneHash` + uniqueness; search returns safe-empty on missing `q`; op-audit / form-builder pagination clamped 1-100; flow instance marked `failed` when an AI node throws; single `ai:done` on WS stream close; admin analytics uses per-dialect date expression (Postgres no longer empty)
+  **W4 生产 bug 修复（安全/健壮性批次）**：MFA TOTP 失败累计锁定（防换 IP 爆破 6 位码）；WebP 魔数补 offset8 "WEBP"（WAV/AVI 无法再伪装）；webhook 投递阻止私网/回环/链接本地（SSRF 防护）；headless 配额改原子 UPDATE（并发无法超 quotaPerDay）；`PUT /users/:id` 改手机号同步 phoneHash + 唯一性；search 缺 q 安全返回空；op-audit/form-builder 分页钳制 1-100；AI 节点抛错时流程实例置 failed；WS 流关闭单一 ai:done；admin 分析按库用日期表达式（Postgres 不再空）
+- **DST-safe calendar-day iteration (events)**: Flutter events list page & provider use `DateTime(y,m,d+1)` instead of `+24h` — no infinite loop / repeated day on DST fall-back weeks
+  **事件日历加法（DST 安全）**：Flutter 事件列表页与 provider 用 `DateTime(y,m,d+1)` 替代 `+24h`——DST 回拨周不再死循环/重复日期
+- **Check-in streak no longer truncated**: `_checkinState` reads `checkin_date` keys without a 40-day window (>40-day streaks now counted)
+  **连签不再截断**：`_checkinState` 按 `checkin_date` 键取全部签到（无 40 天窗口），>40 天连签正常统计
+- **Events reminders removed on update**: clearing/cancelling a reminder or moving an event to the past removes the stale delayed job; range queries use interval-overlap (`startTime<=end AND endTime>=start`) so month view shows spanning events
+  **事件提醒更新清理**：清空/取消提醒或事件改到过去时移除残留 delayed job；范围查询改区间重叠判断（跨月事件月视图完整）
+- **Invite code not burned for existing members**: `redeemOrgInvite` returns false (no consume / no "new member" notification) when the user is already a member
+  **邀请码重复兑换防护**：已是组织成员时 `redeemOrgInvite` 直接返回（不消耗邀请码、不发「新成员加入」通知）
+- **Maintenance-mode string trap + marketing audience strictness**: `isMaintenanceMode` accepts string `'true'`; marketing `send` throws on unknown audience instead of silently emailing everyone
+  **维护模式字符串陷阱 + marketing audience 严格化**：`isMaintenanceMode` 兼容字符串 'true'；marketing send 对未知 audience 抛错而非静默群发全员
+- **Audit hash-chain concurrent fork fixed (W3 2nd stranger challenge)**: `AuditService` / `OperationAuditService` serialize chain writes (read last `prev_hash` → compute → insert atomically) — two writes in the same second no longer fork the chain (`brokenIndex` in `/audit/verify` fixed); concurrent unit tests assert `prev_hash` continuity
+  **审计哈希链并发写分叉修复（W3 二次合成陌生人）**：`AuditService`/`OperationAuditService` 串行化链写（读 lastHash → 计算 → 插入原子化）——同一秒两次并发写不再分叉（`/audit/verify` 的 `brokenIndex` 修复）；并发单测验证 `prev_hash` 连续
+- **W4 Fix hardening batches (5th–10th) + cross-module consistency**: flow instances marked `failed` when an AI node throws; single `ai:done` on WS stream close; form-builder pagination clamped; Flutter unread-count increment / search request-seq guard / route id redirect guard / avatar empty-name guard / table empty-state; AI tool contracts (create_contract `counterparty` required, create_followup_task customerId guard, query_contracts keyword); CASL manage rules for Book/Tag/Note/Post; proactive-ai date-range digest; metrics route labels on finish + close in-flight dec; AddSuppliers/AddContracts postgres dialect; approval pre-review scoped to policy owner; pm-demo status `planned`; broadcast default type `broadcast`; complete `FEATURE_*_ENABLED` schema
+  **W4 Fix 加固批次（第 5-10 批）+ 跨模块一致性**：AI 节点抛错流程实例置 failed；WS 单一 ai:done；form-builder 分页钳制；Flutter 未读计数增量/search 请求序号/路由 id 守卫/头像空名守卫/表格空态；AI 工具契约（create_contract counterparty required、create_followup_task customerId 校验、query_contracts keyword）；CASL Book/Tag/Note/Post 规则；proactive-ai 区间查询；metrics route 标签/断连 in-flight；AddSuppliers/AddContracts postgres 方言；approval 预审按政策所有者；pm-demo 状态 planned；广播默认 broadcast；补全 FEATURE_*_ENABLED schema
+- **W4-⑤ Agent Identity minimal slice**: `ai_audit_logs` gains `agent_id`/`session_id` columns + `AuditEntry` extension (answers "who asked whom to do what under which authorization"; excluded from hash-chain payload to preserve historical chain); bilingual migration `AddAiAuditIdentity` (pg ALTER / sqlite rebuild)
+  **W4-⑤ Agent Identity 最小切片**：`ai_audit_logs` 补 `agent_id`/`session_id` 列 + `AuditEntry` 扩展（回答「谁让谁以什么授权做了什么」；不加入哈希链 payload 防破坏历史链）；双方言迁移 `AddAiAuditIdentity`
+- **Pre-release double-review fixes (v1.0, 2026-08-22)**: AI audit hash chain stays valid after `POST /audit/feedback` — feedback/feedbackNote are treated as non-chain annotation columns (previously any thumbs-up/down broke `/audit/verify` from that row on, HS-11); webhook delivery validates every redirect hop (`redirect:'manual'`) so a public 302 can no longer bounce to private/cloud-metadata targets (SSRF hardening follow-on to W4-④); `PUT /users/:id` resets `emailVerified` when the email changes (prevents swapping to an unverified address while keeping "verified" — which would defeat the `requireVerifiedEmail` gate on AI write tools, HS-2)
+  **发布前双重 review 修复（v1.0，2026-08-22）**：`POST /audit/feedback` 后 AI 审计哈希链仍 valid——feedback/feedbackNote 作为链外注解列（此前任意赞/踩会让 `/audit/verify` 从该行起断链，HS-11）；webhook 投递对每一跳重定向复用私网校验（`redirect:'manual'`，公网 302 不能再弹到内网/云元数据，W4-④ SSRF 加固后续）；`PUT /users/:id` 改 email 时重置 `emailVerified`（防换成未验证地址仍保有「已验证」，使 AI 写工具 `requireVerifiedEmail` 门失效，HS-2）
+- **Security-matrix completions (v1.0)**: SSE/WS long-connection cross-user isolation asserted (A's notification stream cannot see B's + WS `emitToUser` mutually invisible), admin user-detail field-level sanitize asserted (bio / dateOfBirth / firstName / lastName / avatarUrl / provider not returned + email masked + password / refreshTokenHash / loginAttempts / lockedUntil hidden), cross-org AI tool isolation asserted (org approval task stats bidirectional) — security-matrix §3 known gaps all closed
+  **安全矩阵补测（v1.0）**：SSE/WS 长连接跨用户隔离断言（A 的流收不到 B 的通知 + WS `emitToUser` 互不可见）、管理台用户详情字段级脱敏断言（bio/生日/名姓/头像/provider 不返回 + email 掩码 + password/refreshTokenHash/loginAttempts/lockedUntil 不返回）、跨组织 AI 工具隔离断言（组织审批统计双向隔离）——security-matrix §3 已知缺口全部闭环
+- **books/notes backfilled to protocol specs (v1.0)**: books gains `status`/`rating`, notes gains `category` (entity / DTO / migration / Flutter model / admin model), consistency check extended to 4 verified modules + books/notes e2e coverage
+  **books/notes 回填协议一致（v1.0）**：books 补 `status`/`rating`、notes 补 `category`（含 DTO/迁移/Flutter 模型/管理端模型），一致性检查从 contracts/suppliers 扩至 4 个已验证模块 + books/notes e2e
+- **CI workflow parse restored (v1.0, 752066d)**: `run-adversarial` job referenced `secrets.DEEPSEEK_API_KEY` directly in step `if:` conditions — GitHub Actions forbids secrets in `if`, which failed to load the whole workflow (every CI run after merge 777a436 died in 0s with "workflow file issue", invalidating the earlier CI PASS record). Fixed by passing the secret through job-level `env` and gating steps on `env.DEEPSEEK_API_KEY`; CI back to green 14/14
+  **CI workflow 解析恢复（v1.0，752066d）**：`run-adversarial` job 在步骤级 `if:` 直接引用 `secrets.DEEPSEEK_API_KEY`——GitHub Actions 禁止在 if 条件引用 secrets，导致整个 workflow 加载失败（merge 777a436 后每次 CI 都 0s 报 "workflow file issue"，此前 CI PASS 记录失效）。改为 job 级 env 透传 secret + 步骤 if 用 `env.DEEPSEEK_API_KEY` 判断；CI 恢复全绿 14/14
+
+### Release Precheck / 发布前检查（2026-08-22）
+
+```text
+Release Precheck（2026-08-22）：
+- 双重 code review：阿里 OCR（v1.9.8 delegate 规则）+ Claude 多维审查 → 修复 3 处（1 阻塞 B1 审计链 feedback 断链 + 2 建议 S1 webhook SSRF 重定向 / S2 emailVerified 重置）；S3/S4 记入 1.0 后加固
+- 全量测试：后端单测 189 suite / 1591 全过（statements 91.1% / branches 77.1% / functions 84.9%，安全模块分档全 ≥85%）+ e2e 16 suite / 245 全过 + vitest 39.5%（≥32%）+ Flutter 62.3%（≥45%）+ CLI（init 44 / plugin 8）+ 端点-文档一致性 + verify-golden 9/9 + release-gate 确定性
+- 覆盖率：较 v0.9.2 无降级、全部达标
+```
+
+## [0.9.2] - 2026-08-17
+
+Preset guidance & capabilities-driven navigation, streaming resilience, WeChat mini-app, enterprise login security (MFA / forced password change), deployment scale-out. / 首启预设引导 + capabilities 三端导航联动、流式韧性与 SSE 重连、微信小程序、企业登录安全（TOTP / 强制改密）、部署扩展（读写分离 / K8s / 蓝绿）。
+
+### Added / 新增
+
+- **Audit hash chain (HS-11)**: `ai_audit_logs` & `operation_audit_logs` gain `prev_hash`/`hash` (HMAC chain, key domain-separated); tamper-evident and verifiable via `GET /audit/logs/verify` + `GET /audit/operations/logs/verify`
+  **审计哈希链（HS-11）**：AI/操作审计表加 `prev_hash`/`hash`（HMAC 链，密钥域分离）；防篡改可验证，`GET /audit/logs/verify` + `/audit/operations/logs/verify`
+- **MCP adapter (HS-10)**: export built-in AI tools as an MCP server (`POST /api/v1/mcp`, JSON-RPC) with the same governance (permission + confirmation + audit); entry gateway (`/admin/mcp/*`) registers external MCP servers via Settings and calls their tools through the same governance layer (tool key `mcp_<server>_<tool>`, non-read-only defaults to confirmation); agent chat integration (`ExternalToolProvider`) merges external tools into the LLM tool flow
+  **MCP 适配（HS-10）**：内置 AI 工具出口为 MCP server（`POST /api/v1/mcp`，JSON-RPC）且过同一治理层（权限+确认+审计）；入口 gateway（`/admin/mcp/*`）经 Settings 注册外部 MCP server 并让其工具强制过治理层（工具键 `mcp_<server>_<tool>`，非只读默认需确认）；Agent 对话集成（`ExternalToolProvider`）把外部工具并入 LLM 工具流
+- **Per-module coverage gate (T.5)**: `scripts/check-security-coverage.mjs` enforces statements ≥60% for critical modules (auth / casl / audit / ai-tools / governance / headless) after `test:cov`
+  **关键模块覆盖率分档门控（T.5）**：`scripts/check-security-coverage.mjs` 在 `test:cov` 后按模块门控 statements ≥60%（auth/casl/audit/ai-tools/governance/headless）
+- **Webhook subscriptions (PL-14)**: users register callback URLs for platform events (`feedback.created`, `todo.created`); delivery is HMAC-SHA256 signed, 5s-timeout non-blocking; self-service endpoints (subscribe / list / enable / delete / test delivery)
+  **Webhook 订阅投递（PL-14）**：用户为平台事件（`feedback.created`、`todo.created`）注册回调 URL；投递 HMAC-SHA256 签名、5s 超时不阻断；自助端点（订阅/列表/启停/删除/测试投递）
+- **Admin governance policy editor (HS-9)**: Web-Admin-Vue「AI Tools」page gains a governance editor — per-tool enabled / confirmation / allowed-roles toggles + audit granularity (all / write / off), saved to `ai_governance_policy` and effective immediately (no redeploy)
+  **管理台治理策略编辑器（HS-9）**：Web-Admin-Vue「工具与副作用」页新增治理策略编辑——每工具启用/需确认/允许角色开关 + 审计粒度（全部/仅写/关闭），保存即写入 `ai_governance_policy` 实时生效
+- **MCP integration admin page (HS-10)**: register / remove MCP servers, discover external tools (30s cache, force refresh), and call tools with a JSON argument template pre-filled from `inputSchema` — all through the governance layer (permission + confirmation + audit)
+  **MCP 集成管理页（HS-10）**：注册/移除 MCP Server、发现外部工具（30s 缓存 + 强制刷新）、调用工具（按 `inputSchema` 预填 JSON 参数模板），全部过治理层
+- **Flutter AI i18n hardening (T.8)**: AI chat error messages no longer hardcoded Chinese — injected i18n callbacks into the provider; stable keys on suggested-question chips; `UserModel.copyWith` can clear nullable fields; `ToolStepModel` extracted to a domain model
+  **Flutter AI i18n 加固（T.8）**：AI 对话错误文案不再硬编码中文——向 provider 注入 i18n 回调；建议问题 chips 补稳定 key；`UserModel.copyWith` 支持清空可空字段；`ToolStepModel` 抽取到领域模型
+- **Preset guidance & capabilities navigation (EASY-5 / MOD-4)**: Flutter shows a one-time first-login dialog for the active preset (full / small / lite) and hides the search entry when the `search` feature is disabled; Web-Admin-Vue filters console routes & nav by `businessModules` (route `meta.module` + guard interception + nav filtering)
+  **首启预设引导 + capabilities 导航联动（EASY-5 / MOD-4）**：Flutter 首次登录弹一次性预设说明（full/small/lite），`search` 禁用时隐藏搜索入口；Web-Admin-Vue 按 `businessModules` 过滤控制台路由与导航（`meta.module` + 守卫拦截 + 导航过滤）
+- **WeChat mini-app login + subscribe messages (MINI-3 / MINI-2)**: `/auth/oauth` supports `providerType: miniapp` (code2Session → openid), one-tap WeChat login in Taro + subscribe-message reminder authorization (`WxSubscribeService`, template messages on event reminders)
+  **微信小程序登录 + 订阅消息（MINI-3 / MINI-2）**：`/auth/oauth` 支持 `providerType: miniapp`（code2Session→openid）；Taro 微信一键登录 + 订阅消息授权（`WxSubscribeService` 事件提醒模板消息）
+- **Enterprise login security (WEB-FRONT-4)**: TOTP two-factor auth (RFC 6238, zero-dependency `MfaService` — setup / verify / disable endpoints + login integration with unified `MFA_REQUIRED` anti-enumeration) and forced password change (`/auth/change-password` + admin `must-change-password` marker)
+  **企业登录安全（WEB-FRONT-4）**：TOTP 双因素（RFC 6238 零依赖 `MfaService`——setup/verify/disable 端点 + 登录集成，统一 `MFA_REQUIRED` 防枚举）+ 强制改密（`/auth/change-password` + admin 强制标记）
+- **DB read/write splitting + K8s + blue-green/canary (3.3 / D.2 / D.3)**: TypeORM replication (`DB_READ_REPLICAS`), `infra/k8s/` manifests (rolling update / HPA / Ingress), and compose blue-green script + canary ingress with weight switching
+  **读写分离 + K8s + 蓝绿/金丝雀（3.3 / D.2 / D.3）**：TypeORM 主从复制（`DB_READ_REPLICAS`）、`infra/k8s/` 清单（滚动更新/HPA/Ingress）、compose 蓝绿脚本 + 金丝雀 Ingress 权重切换
+- **Webhook reliability (PL-14)**: exponential-backoff retry on delivery failure (default 3 attempts, injectable) + `event.created` trigger (3 real events now: feedback / todo / event)
+  **Webhook 可靠性（PL-14）**：投递失败指数退避重试（默认 3 次，可注入）+ `event.created` 触发点（现覆盖 feedback/todo/event 三个真实事件）
+- **Todos bulk import (POV-2)**: `POST /admin/import/todos` + admin page card with CSV template download (BOM + formula-injection guard)
+  **待办批量导入（POV-2）**：`POST /admin/import/todos` + 管理台待办导入卡 + CSV 模板下载（BOM + 公式注入防护）
+- **Online demo site (PM-1)**: `deploy/demo.sh` one-command read-only demo (Taro H5 + seeded backend + static hosting) + README Live Demo block
+  **在线演示站（PM-1）**：`deploy/demo.sh` 一键起只读体验站（Taro H5 + 种子数据后端 + 静态托管）+ README Live Demo 区块
+- **Org-dimension AI audit (ORG-5 v3)**: `GET /audit/logs?orgId=X` filters AI audit by organization (org_members subquery) for admin per-org oversight
+  **AI 审计组织维度（ORG-5 v3）**：`GET /audit/logs?orgId=X` 按组织过滤 AI 审计（org_members 子查询），管理台按组织看 AI 行为
+
+### Fixed / 修复
+
+- **Streaming provider fallback (CR-28)**: `chatStreamImpl` now falls back to the next provider when the primary errors before emitting any content (previously a broken primary failed the whole stream); `tryFallback` keeps the actually-successful provider
+  **流式 provider fallback（CR-28）**：`chatStreamImpl` 在主 provider 未产出内容即失败时自动切换下一个 provider（此前主 provider 故障整个流失败）；`tryFallback` 用实际成功的 provider
+- **SSE reconnect + 401 refresh (CR-17)**: `SseClient.postStream` gains exponential-backoff reconnect (opt-in, max attempts) and refresh-then-retry on 401 via `ApiClient.refreshNow()` (single-flight); notifications SSE fallback enables reconnect
+  **SSE 断流重连 + 401 刷新（CR-17）**：`SseClient.postStream` 加指数退避重连（可选、限次）+ 401 经 `ApiClient.refreshNow()`（single-flight）刷新后重试；通知 SSE 兜底开启重连
+- **Eval isolation (CR-18)**: eval runs use a per-run identity `eval:<ts>` instead of the shared system account `'0'` — no longer polluting quota / memory / audit
+  **评测隔离（CR-18）**：评测跑批用每次独立身份 `eval:<ts>` 替代共享系统账号 `'0'`——不再污染配额/记忆/审计
+- **Provider race cleanup (CR-26)**: Flutter `AiChatProvider` dispose-guard (`_safeNotify`), day/week calendar scroll hijack fixed (once per date); Taro search request-seq guard + notification-store try/catch
+  **Provider 竞态清理（CR-26）**：Flutter `AiChatProvider` dispose 守卫（`_safeNotify`）、日历日/周视图抢滚动修复（每日期一次）；Taro 搜索请求序号守卫 + 通知 store try/catch
+- **Streaming tool-round apology (CR-29)** + **PII log removal / non-streaming fallback (CR-28/CR-30)**
+  **流式超轮次道歉（CR-29）** + **PII 日志移除 / 非流式 fallback（CR-28/CR-30）**
+
+- Migration schema consistency: named/placeholder constraint names (post_likes, user_follows, ai_daily_usage, …) caused CI `migration:generate` drift; `AddSchemaConsistencyConstraints` reconciles the chain (fresh-DB generate → "No changes")
+  **迁移一致性**：可读/占位约束名（post_likes、user_follows、ai_daily_usage 等）导致 CI 迁移一致性校验漂移；`AddSchemaConsistencyConstraints` 修正迁移收敛（全新库 generate → No changes）
+- MCP admin DTO validation: `RegisterServerDto` / `CallExternalToolDto` lacked class-validator decorators, so the global `whitelist + forbidNonWhitelisted` pipe stripped them and `POST /admin/mcp/servers` / `POST /admin/mcp/call` returned 400 (service unit tests bypass the HTTP pipe, so this was a blind spot); added decorators + DTO spec
+  **MCP 管理 DTO 校验**：`RegisterServerDto`/`CallExternalToolDto` 缺 class-validator 装饰器，被全局 `whitelist + forbidNonWhitelisted` 管道整条剥掉致 register/call 400（service 单测直调绕过 HTTP 层所以是盲区）；补装饰器 + DTO 单测
+
+## [0.9.1] - 2026-08-15
+
+Quality & governance release: full-codebase review with two independent audit tools, 281 findings fixed, all tests green. / 质量与治理版：两套独立审计全仓审查，281 条发现全部修复，测试全绿。
+
+### Added / 新增
+
+- **AI governance as policy (HS-9)**: tool switches / confirmation rules / role allow-list / audit granularity as runtime policy via `ai_governance_policy` setting, wired into gating, confirmation, inventory and audit
+  **AI 治理策略化（HS-9）**：工具开关 / 确认规则 / 角色白名单 / 审计粒度由 `ai_governance_policy` 动态配置，接入门控、确认、清单与审计
+- **Points / check-in / achievements (GROWTH-3)**: daily check-in with streak bonus, masked leaderboard, rule-driven achievements (backend + Flutter page)
+  **积分 / 签到 / 成就（GROWTH-3）**：每日签到 + 连签加成，脱敏排行榜 + 规则成就（后端 + Flutter 页面）
+- **Health dependency details (D.9)**: `GET /health?detail=true` reports db/redis/queue/storage status, rate-limited 60/min
+  **健康检查依赖详情（D.9）**：`/health?detail=true` 返回依赖状态，限流 60/min
+- **Org-level todos isolation (ORG-3 v2)**: member-visible org todos, consistent list/detail/update/delete permissions
+  **待办组织级隔离（ORG-3 v2）**：组织成员可见同组待办，列表/详情/更新/删除权限一致
+- **Web-Admin-React preview (MUI)**: React 19 + MUI preview console aligned page-by-page with the Vue admin (Vue remains primary)
+  **Web-Admin-React 预览版（MUI）**：React 19 + MUI 预览控制台逐页对齐 Vue 管理台（Vue 保持主版本）
+
+### Fixed / 修复
+
+- Check-in race: `(user_id, checkin_date)` unique constraint prevents double points on concurrent check-ins
+  **签到竞态**：`(user_id, checkin_date)` 唯一约束防止并发签到双倍积分
+- AI daily quota decoupled from audit granularity (independent `ai_daily_usage` counter) — `off`/`write` audit no longer disables the quota
+  **AI 每日限额与审计粒度解耦**（独立 `ai_daily_usage` 计数）——审计粒度 `off`/`write` 不再关闭限额
+- 401 refresh hardened: single-flight, transport errors no longer log users out, retry propagates real error; SSE line buffering + leak-free cleanup
+  **401 刷新加固**：single-flight、瞬断网络不再误登出、重试传播真实错误；SSE 行缓冲 + 连接无泄漏
+- Provider race cleanup: in-flight guards / generation tokens / dispose guards across ai/events/books/announcements/push
+  **Provider 竞态清理**：AI/事件/图书/公告/推送均加在途守卫 / 代际 token / dispose 守卫
+- Admin console: React 401→login wiring, snackbar infinite-refetch loop, org first-load timing; localized audit detail fields
+  **管理台**：React 401 跳登录接线、snackbar 无限重取循环、首组织加载时序；审计详情双语化
+- i18n: 20+ hardcoded strings migrated; plural forms and zh_TW/zh_HK variants corrected
+  **i18n**：20+ 硬编码文案接入 AppLocalizations；复数与 zh_TW/zh_HK 变体修正
+
+### Quality / 质量
+
+- Coverage gates raised (NestJS ≥65/55/60/65; Flutter CI ≥45% lines); 838 backend + 273 Flutter tests green; new SSE loopback, rate-limit and refresh boundary tests
+  覆盖率门槛提升（NestJS ≥65/55/60/65；Flutter CI ≥45% 行）；838 后端 + 273 Flutter 用例全绿；新增 SSE 真连、限流、刷新边界测试
+
+## [0.9.0] - 2026-08-13
+
+First public release (milestone). / 首个公开版本（里程碑发布）。
+
+### Milestones / 里程碑
+
+- **Business-safe AI Agent harness**: AI tool calls scoped to the user's data, human confirmation for writes, reversible side effects, eval loop, CASL row-level permissions wired into AI tools
+  **业务安全的 AI Agent harness**：AI 工具调用限定用户数据范围、写操作人工确认、副作用可撤销、评测闭环、CASL 行级权限与 AI 工具打通
+- **Consistent across three ends**: Flutter App (iOS/Android/Web) + Taro mini-program/H5 + PC Web admin console (Vue3 + Vuetify3) — one backend, three ends
+  **三端一致**：Flutter App（iOS/Android/Web）+ Taro 小程序/H5 + PC Web 管理台（Vue3 + Vuetify3），一套后端三端出
+- **Production-grade engineering**: CASL permissions, full audit trails, static encryption of sensitive data, OTel/Prometheus/Loki observability, green CI, one-click deploy & single-container delivery
+  **生产级工程化**：CASL 权限、全链路审计、敏感数据静态加密、OTel/Prometheus/Loki 可观测、CI 全绿、一键部署与单容器交付
+
+### Added / 新增
+
+**AI & Agent / AI 与 Agent**
+
+- AI chat (non-streaming + SSE streaming), tool-call process visualization (tool_start/tool_end)
+  AI 对话（非流式 + SSE 流式），工具调用过程可视化（tool_start/tool_end）
+- Actionable tools + human-confirmation protocol (create_event/create_todo), side-effect preview + one-click revoke + confirmation decisions logged to audit
+  可操作工具 + 人工确认协议（create_event/create_todo），副作用预览 + 一键撤销 + 确认决策落审计
+- Long-term user memory, context compaction, sub-agent delegation + skills (SkillsRegistry)
+  长程用户记忆、上下文压缩、子代理委托 + 技能（SkillsRegistry）
+- RAG knowledge base: document upload/chunking/vector search (pgvector), retrieval debugging & chunk preview
+  RAG 知识库：文档上传/切块/向量检索（pgvector），检索调试与切块预览
+- web_search browsing, multimodal image understanding, image generation
+  web_search 联网、多模态图片理解、图像生成
+- Proactive AI services (daily digest), conversation-feedback loop, AI eval set, cost dashboard, headless API, admin AI assistant
+  主动 AI 服务（每日摘要）、对话反馈闭环、AI 评测集、成本看板、headless API、管理端 AI 助手
+- AI behavior replay: admin-console timeline view (tool calls / confirmation decisions / side effects / errors)
+  AI 行为回放：管理台时间线视图（工具调用 / 确认决策 / 副作用 / 错误）
+
+**Three Ends / 三端**
+
+- Flutter main app: event calendar, todos, notification center, global search, upload, profile, Onboarding, offline cache, data visualization, first-run experience pack
+  Flutter 主 App：事件日历、待办、通知中心、全局搜索、上传、个人中心、Onboarding、离线缓存、数据可视化、首次体验三件套
+- Taro mini-program/H5: AI chat, todos, search, notification center, session management
+  Taro 小程序/H5：AI 对话、待办、搜索、通知中心、会话管理
+- PC Web admin console: users/events/knowledge/notifications/both audits/sessions/monitoring/trash/import/template market/AI eval/tool effects/platform stats
+  PC Web 管理台：用户/事件/知识库/通知/两类审计/会话/监控/回收站/导入/模板市场/AI 评测/工具副作用/平台统计
+
+**Security & Compliance / 安全与合规**
+
+- CASL row-level permissions, JWT rotation + login lockout, email/phone verification, AES-256-GCM static encryption of sensitive fields
+  CASL 行级权限、JWT 轮换 + 登录锁定、邮箱/手机号验证、敏感字段 AES-256-GCM 静态加密
+- Operation audit + AI audit + confirmation-decision audit, admin-side data masking (privacy red line)
+  操作审计 + AI 审计 + 确认决策审计，管理端数据脱敏（隐私红线）
+- Enumeration/timing-attack protection, SSRF protection, OAuth signature verification, tightened production CORS, upload magic-byte validation
+  防枚举/防时序、SSRF 防护、OAuth 验签、CORS 生产收紧、上传魔数校验
+
+**Platform Capabilities / 平台能力**
+
+- Low-code forms (JSON Schema dynamic rendering), plugin mechanism, template market, data import/migration
+  低代码表单（JSON Schema 动态渲染）、插件机制、模板市场、数据导入迁移
+- Notification center (SSE realtime + push abstraction), dynamic config center, soft-delete trash
+  通知中心（SSE 实时 + 推送抽象层）、动态配置中心、软删除回收站
+- Scheduled-task framework, feature flags, unified error codes + i18n
+  定时任务框架、特性开关、统一错误码 + i18n
+
+**Engineering & Ops / 工程化与运维**
+
+- GitHub Actions CI: lint / unit / e2e / coverage thresholds / migration consistency / three-end builds
+  GitHub Actions CI：lint / 单测 / e2e / 覆盖率门槛 / 迁移一致性 / 三端构建
+- One-click deploy, single-container `docker run` full-stack delivery, offline/air-gapped deploy, on-prem AI (Ollama)
+  一键部署、单容器 `docker run` 全栈交付、离线/内网部署、私有化 AI（Ollama）
+- OTel tracing, Prometheus alerts, Loki logs, alert webhooks, ops health inspection
+  OTel 链路追踪、Prometheus 告警、Loki 日志、告警 Webhook、运维健康巡检
+- Data backup/restore, sqlite/postgres dual migration baselines, module manifest & dependency graph
+  数据备份/恢复、sqlite/postgres 双迁移基线、模块清单与依赖图谱
+
+### Fixed / 修复
+
+- Initial release — no prior fix history; security/deployment hardening is tracked in git history and the DEP/CR series of the internal roadmap.
+  初始版本，无历史修复记录；安全/部署硬伤治理见 git history 与项目内部 roadmap 的 DEP/CR 系列。

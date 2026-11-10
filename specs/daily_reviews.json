@@ -1,0 +1,14 @@
+{
+  "module": "daily_reviews",
+  "label": "每日评价",
+  "searchable": true,
+  "fields": [
+    { "name": "reviewDate", "type": "date", "label": "评价日期", "required": true },
+    { "name": "content", "type": "text", "label": "评价内容", "required": true },
+    { "name": "rating", "type": "int", "label": "评分" }
+  ],
+  "aiTools": {
+    "query": true,
+    "create": { "riskLevel": "R3", "requiresConfirmation": true }
+  }
+}

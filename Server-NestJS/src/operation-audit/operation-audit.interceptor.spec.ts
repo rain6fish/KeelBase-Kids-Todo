@@ -1,0 +1,491 @@
+// SPDX-License-Identifier: Apache-2.0
+
+import { Logger } from '@nestjs/common';
+import { Reflector } from '@nestjs/core';
+import { of, firstValueFrom } from 'rxjs';
+import { OperationAuditInterceptor } from './operation-audit.interceptor';
+import { OperationAuditService } from './operation-audit.service';
+import { SKIP_AUDIT_KEY } from './skip-audit.decorator';
+import { APPROVAL_DECISIONS } from '../approval/approval-request.entity';
+
+describe('OperationAuditInterceptor', () => {
+  let interceptor: OperationAuditInterceptor;
+  const auditService = { log: jest.fn().mockResolvedValue(undefined) };
+  const reflector = { getAllAndOverride: jest.fn() } as unknown as Reflector;
+
+  function mockContext(req: any) {
+    return {
+      switchToHttp: () => ({
+        getRequest: () => req,
+        getResponse: () => ({ statusCode: 200 }),
+      }),
+      getHandler: () => ({}),
+      getClass: () => ({}),
+    } as any;
+  }
+
+  const next = { handle: () => of({ ok: true }) };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    (reflector as any).getAllAndOverride.mockReturnValue(false);
+    interceptor = new OperationAuditInterceptor(
+      reflector,
+      auditService as any,
+      // §internal.16 A-1 before 查询：默认无行（before null → 退化记录 after 值）
+      { getRepository: jest.fn().mockReturnValue({ findOne: jest.fn().mockResolvedValue(null) }) } as any,
+    );
+  });
+
+  it('records a write request (POST)', async () => {
+    const req = {
+      method: 'POST',
+      originalUrl: '/api/v1/events',
+      url: '/api/v1/events',
+      body: { title: 'X' },
+      ip: '1.1.1.1',
+      headers: { 'user-agent': 'ua' },
+      params: {},
+      user: { sub: 5 },
+    };
+
+    await firstValueFrom(await interceptor.intercept(mockContext(req), next));
+
+    expect(auditService.log).toHaveBeenCalledWith(
+      expect.objectContaining({
+        userId: 5,
+        action: 'CREATE',
+        method: 'POST',
+        path: '/api/v1/events',
+        requestBody: '{"title":"X"}',
+        ip: '1.1.1.1',
+        statusCode: 200,
+      }),
+    );
+  });
+
+  it('A-1 captures field changes + business event on PATCH', async () => {
+    const req = {
+      method: 'PATCH',
+      originalUrl: '/api/v1/crm/customers/3',
+      url: '/api/v1/crm/customers/3',
+      body: { status: 'active', riskLevel: 'high' },
+      ip: '1.1.1.1',
+      headers: {},
+      params: { id: '3' },
+      user: { sub: 5 },
+    };
+
+    await firstValueFrom(await interceptor.intercept(mockContext(req), next));
+
+    expect(auditService.log).toHaveBeenCalledWith(
+      expect.objectContaining({
+        businessEvent: 'CustomerUpdated',
+        changes: JSON.stringify([
+          { field: 'status', before: null, after: 'active' },
+          { field: 'riskLevel', before: null, after: 'high' },
+        ]),
+      }),
+    );
+  });
+
+  it('A-1 skips sensitive/noise fields in changes', async () => {
+    const req = {
+      method: 'PUT',
+      originalUrl: '/api/v1/users/7',
+      url: '/api/v1/users/7',
+      body: { nickname: 'New', password: 'secret', createdAt: '2026-01-01', id: 7 },
+      ip: '1.1.1.1',
+      headers: {},
+      params: { id: '7' },
+      user: { sub: 5 },
+    };
+
+    await firstValueFrom(await interceptor.intercept(mockContext(req), next));
+
+    expect(auditService.log).toHaveBeenCalledWith(
+      expect.objectContaining({
+        businessEvent: 'UserUpdated',
+        changes: JSON.stringify([{ field: 'nickname', before: null, after: 'New' }]),
+      }),
+    );
+  });
+
+  it('skips GET requests', async () => {
+    const req = { method: 'GET', originalUrl: '/x', url: '/x', body: null, headers: {}, params: {} };
+
+    await firstValueFrom(await interceptor.intercept(mockContext(req), next));
+
+    expect(auditService.log).not.toHaveBeenCalled();
+  });
+
+  it('skips endpoints marked @SkipAudit()', async () => {
+    (reflector as any).getAllAndOverride.mockReturnValue(true);
+    const req = { method: 'POST', originalUrl: '/x', url: '/x', body: {}, headers: {}, params: {} };
+
+    await firstValueFrom(await interceptor.intercept(mockContext(req), next));
+
+    expect(auditService.log).not.toHaveBeenCalled();
+  });
+
+  it('does not block response when audit log fails', async () => {
+    auditService.log.mockRejectedValue(new Error('db down'));
+    const req = { method: 'DELETE', originalUrl: '/api/v1/events/1', url: '/api/v1/events/1', body: {}, headers: {}, params: { id: '1' }, user: { sub: 1 } };
+
+    const result = await firstValueFrom(await interceptor.intercept(mockContext(req), next));
+
+    expect(result).toEqual({ ok: true });
+  });
+
+  it('ACT-4 余项：审计写入失败**可见**（不再静默）—— 丢的那行与「没发生过」不可同形', async () => {
+    auditService.log.mockRejectedValue(new Error('db down'));
+    const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    const req = { method: 'POST', originalUrl: '/api/v1/events', url: '/api/v1/events', body: {}, headers: {}, params: {}, user: { sub: 1 } };
+
+    const result = await firstValueFrom(await interceptor.intercept(mockContext(req), next));
+    // 等一拍，让 fire-and-forget 的 catch 跑完（响应不阻塞是有意设计，见测试上方那条）
+    await new Promise((r) => setImmediate(r));
+
+    expect(result).toEqual({ ok: true }); // 仍不阻塞响应
+    // 旧实现 `.catch(() => undefined)` ⇒ 这里为红（一次 warn 都没有）
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('操作审计写入失败'));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('POST /api/v1/events'));
+    warn.mockRestore();
+  });
+
+  it('derives targetId from path params', async () => {
+    const req = { method: 'PATCH', originalUrl: '/api/v1/events/42', url: '/api/v1/events/42', body: {}, headers: {}, params: { id: '42' }, user: { sub: 1 } };
+
+    await firstValueFrom(await interceptor.intercept(mockContext(req), next));
+
+    expect(auditService.log).toHaveBeenCalledWith(expect.objectContaining({ targetId: '42', action: 'UPDATE' }));
+  });
+
+  it('非写方法（OPTIONS）→ 跳过不审计（WRITE_METHODS 过滤）', async () => {
+    const req = { method: 'OPTIONS', originalUrl: '/api/v1/x', url: '/api/v1/x', body: {}, headers: {}, params: {} };
+
+    await firstValueFrom(await interceptor.intercept(mockContext(req), next));
+
+    expect(auditService.log).not.toHaveBeenCalled();
+  });
+
+  it('body 循环引用（JSON.stringify 抛错）→ 审计仍记录且不抛错（_safeBody catch 兜底）', async () => {
+    const cyclic: any = { name: 'x' };
+    cyclic.self = cyclic;
+    const req = { method: 'POST', originalUrl: '/api/v1/events', url: '/api/v1/events', body: cyclic, headers: {}, params: {}, user: { sub: 1 } };
+
+    await expect(firstValueFrom(await interceptor.intercept(mockContext(req), next))).resolves.toEqual({ ok: true });
+    expect(auditService.log).toHaveBeenCalled();
+  });
+
+  describe('A-1 before 快照（PATCH/PUT 字段级 diff）', () => {
+    function interceptorWithRepo(repo: { findOne: jest.Mock }) {
+      return new OperationAuditInterceptor(
+        reflector,
+        auditService as any,
+        { getRepository: jest.fn().mockReturnValue(repo) } as any,
+      );
+    }
+
+    it('带 before 快照 → 真 diff + 敏感字段打码（[REDACTED]）', async () => {
+      const ic = interceptorWithRepo({
+        findOne: jest.fn().mockResolvedValue({
+          id: 3,
+          status: 'lead',
+          riskLevel: 'low',
+          title: 'Acme',
+          apiToken: 'secret-tok',
+          password: 'x',
+          createdAt: new Date(),
+        }),
+      });
+      const req = {
+        method: 'PATCH',
+        originalUrl: '/api/v1/crm/customers/3',
+        url: '/api/v1/crm/customers/3',
+        body: { status: 'active', riskLevel: 'high', title: 'Acme' },
+        ip: '1.1.1.1',
+        headers: {},
+        params: { id: '3' },
+        user: { sub: 5 },
+      };
+
+      await firstValueFrom(await ic.intercept(mockContext(req), next));
+
+      expect(auditService.log).toHaveBeenCalledWith(
+        expect.objectContaining({
+          changes: JSON.stringify([
+            { field: 'status', before: 'lead', after: 'active' },
+            { field: 'riskLevel', before: 'low', after: 'high' },
+          ]),
+        }),
+      );
+    });
+
+    it('before 快照的 PII 明文被打码 —— 旧实现只用 password|token|secret|refresh, 邮箱/手机号会漏进 changes', async () => {
+      // The fragment half of the predicate (names like apiToken / resetTokenHash) is pinned by the
+      // isSensitiveKey cases in mask.spec; what is pinned here is the wiring — the interceptor really
+      // goes through the shared predicate, and the PII names no longer slip past it.
+      // 片段名那一半（apiToken / resetTokenHash 之类）由 mask.spec 的 isSensitiveKey 用例钉住；
+      // 这里钉的是接线：拦截器确实走共享判据，且 PII 名不再漏。
+      const ic = interceptorWithRepo({
+        findOne: jest.fn().mockResolvedValue({
+          id: 7,
+          status: 'active',
+          email: 'alice@example.com',
+          phone: '13800138000',
+        }),
+      });
+      const req = {
+        method: 'PATCH',
+        originalUrl: '/api/v1/crm/customers/7',
+        url: '/api/v1/crm/customers/7',
+        body: { email: 'bob@example.com', phone: '13900139000', status: 'inactive' },
+        ip: '1.1.1.1',
+        headers: {},
+        params: { id: '7' },
+        user: { sub: 5 },
+      };
+
+      await firstValueFrom(await ic.intercept(mockContext(req), next));
+
+      const calls = (auditService.log as jest.Mock).mock.calls;
+      const logged = calls[calls.length - 1][0];
+      const entries = JSON.parse(logged.changes) as Array<{ field: string; before: string; after: string }>;
+      const byField = Object.fromEntries(entries.map((e) => [e.field, e]));
+      // Both sides record that it changed, neither records a value.
+      // 两侧都留痕不留值。
+      expect(byField.email).toEqual({ field: 'email', before: '[REDACTED]', after: '[REDACTED]' });
+      expect(byField.phone).toEqual({ field: 'phone', before: '[REDACTED]', after: '[REDACTED]' });
+      // Neither the old nor the new value appears in clear text.
+      // 新旧两值都不以明文出现。
+      for (const leaked of ['alice@example.com', '13800138000', 'bob@example.com', '13900139000']) {
+        expect(logged.changes).not.toContain(leaked);
+      }
+      // A non-sensitive field still records both values truthfully.
+      // 非敏感字段照旧如实留痕（前后两值都在）。
+      expect(byField.status).toEqual({ field: 'status', before: 'active', after: 'inactive' });
+    });
+
+    it('未变化的敏感字段不产生 diff —— 拿打码值去比明文会凭空造出一条带明文的 diff', async () => {
+      const ic = interceptorWithRepo({
+        findOne: jest.fn().mockResolvedValue({ id: 8, email: 'same@example.com', status: 'active' }),
+      });
+      const req = {
+        method: 'PATCH',
+        originalUrl: '/api/v1/crm/customers/8',
+        url: '/api/v1/crm/customers/8',
+        body: { email: 'same@example.com', status: 'inactive' },
+        ip: '1.1.1.1',
+        headers: {},
+        params: { id: '8' },
+        user: { sub: 5 },
+      };
+
+      await firstValueFrom(await ic.intercept(mockContext(req), next));
+
+      const calls = (auditService.log as jest.Mock).mock.calls;
+      const logged = calls[calls.length - 1][0];
+      const entries = JSON.parse(logged.changes) as Array<{ field: string }>;
+      expect(entries.map((e) => e.field)).toEqual(['status']);
+      expect(logged.changes).not.toContain('same@example.com');
+    });
+
+    it('before 查询抛错 → 降级 null（catch 不阻塞）', async () => {
+      const ic = interceptorWithRepo({ findOne: jest.fn().mockRejectedValue(new Error('db down')) });
+      const req = {
+        method: 'PUT',
+        originalUrl: '/api/v1/events/9',
+        url: '/api/v1/events/9',
+        body: { title: 'New' },
+        ip: '1.1.1.1',
+        headers: {},
+        params: { id: '9' },
+        user: { sub: 1 },
+      };
+
+      await firstValueFrom(await ic.intercept(mockContext(req), next));
+
+      expect(auditService.log).toHaveBeenCalled();
+    });
+
+    it('无实体映射的写路径 → 不查 before 仍记录', async () => {
+      const repo = { findOne: jest.fn().mockResolvedValue({ id: 5, name: 'X' }) };
+      const getRepository = jest.fn().mockReturnValue(repo);
+      const ic = new OperationAuditInterceptor(reflector, auditService as any, { getRepository } as any);
+      const req = {
+        method: 'PATCH',
+        originalUrl: '/api/v1/notifications/5',
+        url: '/api/v1/notifications/5',
+        body: { name: 'New' },
+        ip: '1.1.1.1',
+        headers: {},
+        params: { id: '5' },
+        user: { sub: 1 },
+      };
+
+      await firstValueFrom(await ic.intercept(mockContext(req), next));
+
+      expect(getRepository).not.toHaveBeenCalled();
+      expect(auditService.log).toHaveBeenCalledWith(expect.objectContaining({ targetId: '5' }));
+    });
+
+    it('生成模块路径（旧实现无实体映射）→ 现在查 before 快照', async () => {
+      // 资源注册表合并前，`/contracts` 不在拦截器的实体映射里 ⇒ 生成模块的 PATCH/PUT 静默没有
+      // before 快照（同一次操作在业务事件里却有名字）。这条钉住合并后的行为。
+      const repo = { findOne: jest.fn().mockResolvedValue({ id: 5, name: 'Old' }) };
+      const getRepository = jest.fn().mockReturnValue(repo);
+      const ic = new OperationAuditInterceptor(reflector, auditService as any, { getRepository } as any);
+      const req = {
+        method: 'PATCH',
+        originalUrl: '/api/v1/contracts/5',
+        url: '/api/v1/contracts/5',
+        body: { name: 'New' },
+        ip: '1.1.1.1',
+        headers: {},
+        params: { id: '5' },
+        user: { sub: 1 },
+      };
+
+      await firstValueFrom(await ic.intercept(mockContext(req), next));
+
+      expect(getRepository).toHaveBeenCalledWith('Contract');
+      expect(auditService.log).toHaveBeenCalledWith(
+        expect.objectContaining({ changes: JSON.stringify([{ field: 'name', before: 'Old', after: 'New' }]) }),
+      );
+    });
+  });
+
+  describe('approval 审批动作入审计（decide/review 语义，非误记 Created）', () => {
+    // The wire contract is pinned here, not just in the interceptor: the DTO and the audit
+    // derivation share one vocabulary, so a rename in either place has to fail this test.
+    // wire 契约在此钉死：DTO 与审计派生共用一份词表，任一侧改名都必须让本用例红。
+    it('共享裁决词表与 wire 契约一致（approved / rejected）', () => {
+      expect([...APPROVAL_DECISIONS]).toEqual(['approved', 'rejected']);
+    });
+
+    it('decide approved（真实 DTO 取值）→ action DECIDE + ApprovalRequestApproved', async () => {
+      const req = {
+        method: 'POST',
+        originalUrl: '/api/v1/approval/requests/3/decide',
+        url: '/api/v1/approval/requests/3/decide',
+        body: { decision: 'approved' },
+        ip: '1.1.1.1',
+        headers: {},
+        params: { id: '3' },
+        user: { sub: 5 },
+      };
+
+      await firstValueFrom(await interceptor.intercept(mockContext(req), next));
+
+      expect(auditService.log).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'DECIDE', businessEvent: 'ApprovalRequestApproved' }),
+      );
+    });
+
+    it('decide rejected（真实 DTO 取值）→ action DECIDE + ApprovalRequestRejected', async () => {
+      const req = {
+        method: 'POST',
+        originalUrl: '/api/v1/approval/requests/3/decide',
+        url: '/api/v1/approval/requests/3/decide',
+        body: { decision: 'rejected' },
+        ip: '1.1.1.1',
+        headers: {},
+        params: { id: '3' },
+        user: { sub: 5 },
+      };
+
+      await firstValueFrom(await interceptor.intercept(mockContext(req), next));
+
+      expect(auditService.log).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'DECIDE', businessEvent: 'ApprovalRequestRejected' }),
+      );
+    });
+
+    it('review → action REVIEW + ApprovalRequestReviewed', async () => {
+      const req = {
+        method: 'POST',
+        originalUrl: '/api/v1/approval/requests/3/review',
+        url: '/api/v1/approval/requests/3/review',
+        body: {},
+        ip: '1.1.1.1',
+        headers: {},
+        params: { id: '3' },
+        user: { sub: 5 },
+      };
+
+      await firstValueFrom(await interceptor.intercept(mockContext(req), next));
+
+      expect(auditService.log).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'REVIEW', businessEvent: 'ApprovalRequestReviewed' }),
+      );
+    });
+  });
+
+  /**
+   * 按**资源**声明的 PII：管理台「工具与副作用」列表与操作审计的 requestBody 会带出 CRM 客户的
+   * `name` / `company`，而全局键集只覆盖 `email` / `phone`。取舍是**不**把 `name` 加进全局键集
+   * （十五个实体都有这个键），改由资源自己声明 —— 下面这对用例钉的正是这条界：同一个 `name` 键，
+   * 在客户上打码、在合同上不打码。
+   *
+   * PII declared per resource. The pair below pins the boundary: the same `name` key is masked on a
+   * customer and left alone on a contract.
+   */
+  describe('按资源声明的 PII（客户的 name / company）', () => {
+    const interceptorWithEmptyRepo = () =>
+      new OperationAuditInterceptor(
+        reflector,
+        auditService as any,
+        { getRepository: jest.fn().mockReturnValue({ findOne: jest.fn().mockResolvedValue(null) }) } as any,
+      );
+
+    const lastLogged = () => {
+      const calls = (auditService.log as jest.Mock).mock.calls;
+      return calls[calls.length - 1][0] as { requestBody: string; changes: string | null };
+    };
+
+    it('CRM 客户：name / company 打码（此前原样落进 requestBody 与 changes）', async () => {
+      const req = {
+        method: 'POST',
+        originalUrl: '/api/v1/crm/customers',
+        url: '/api/v1/crm/customers',
+        body: { name: '云帆商贸', company: '云帆科技', email: 'a@b.com', status: 'lead' },
+        ip: '1.1.1.1',
+        headers: {},
+        params: {},
+        user: { sub: 5 },
+      };
+
+      await firstValueFrom(await interceptorWithEmptyRepo().intercept(mockContext(req), next));
+
+      const logged = lastLogged();
+      expect(JSON.parse(logged.requestBody)).toEqual({
+        name: '[REDACTED]',
+        company: '[REDACTED]',
+        email: '[REDACTED]',
+        status: 'lead',
+      });
+      // 两处都要：`changes` 是同一批值走另一条路落库的。
+      expect(logged.changes ?? '').not.toContain('云帆商贸');
+      expect(logged.requestBody).not.toContain('云帆商贸');
+      expect(logged.requestBody).not.toContain('云帆科技');
+    });
+
+    it('合同：同一个 `name` 键**不**打码 —— 声明是按资源，不是按键名', async () => {
+      const req = {
+        method: 'POST',
+        originalUrl: '/api/v1/contracts',
+        url: '/api/v1/contracts',
+        body: { name: '服务合同 2026', amount: 100 },
+        ip: '1.1.1.1',
+        headers: {},
+        params: {},
+        user: { sub: 5 },
+      };
+
+      await firstValueFrom(await interceptorWithEmptyRepo().intercept(mockContext(req), next));
+
+      expect(lastLogged().requestBody).toContain('服务合同 2026');
+    });
+  });
+});

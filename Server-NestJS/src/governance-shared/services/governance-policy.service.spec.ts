@@ -1,0 +1,409 @@
+// SPDX-License-Identifier: Apache-2.0
+
+import {
+  GovernancePolicyService,
+  effectiveGateMode,
+  policyRevisionOf,
+} from './governance-policy.service';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+
+describe('GovernancePolicyService (HS-9, D2-1d 自有表)', () => {
+  let service: GovernancePolicyService;
+  let repo: { findOne: jest.Mock; save: jest.Mock };
+  let historyRepo: { findOne: jest.Mock; find: jest.Mock; save: jest.Mock; create: jest.Mock };
+
+  beforeEach(() => {
+    repo = { findOne: jest.fn(), save: jest.fn() };
+    historyRepo = { findOne: jest.fn(), find: jest.fn(), save: jest.fn(), create: jest.fn((x: any) => x) };
+    service = new GovernancePolicyService(repo as any, historyRepo as any);
+  });
+
+  const mockRow = (value: string | null) =>
+    repo.findOne.mockResolvedValue(value ? { id: 1, value } : null);
+
+  describe('getPolicy', () => {
+    it('未配置 → 默认全放行 + 审计 all', async () => {
+      mockRow(null);
+      const policy = await service.getPolicy();
+      expect(policy.tools).toEqual({});
+      expect(policy.audit.granularity).toBe('all');
+      // ② 绑定：策略键集 == governance-policy 冻结契约
+      const props = Object.keys(
+        (
+          JSON.parse(
+            readFileSync(resolve(__dirname, '../../../specs/protocol/schemas/v1/governance-policy.schema.json'), 'utf8'),
+          ) as { properties: Record<string, unknown> }
+        ).properties,
+      );
+      expect(Object.keys(policy).sort()).toEqual(props.sort());
+    });
+
+    it('JSON 字符串策略被解析', async () => {
+      mockRow(
+        JSON.stringify({
+          tools: { create_event: { enabled: false } },
+          audit: { granularity: 'write' },
+        }),
+      );
+      const policy = await service.getPolicy();
+      expect(policy.tools.create_event.enabled).toBe(false);
+      expect(policy.audit.granularity).toBe('write');
+    });
+
+    it('非法 JSON → 回退默认', async () => {
+      mockRow('{ not valid json');
+      const policy = await service.getPolicy();
+      expect(policy.tools).toEqual({});
+      expect(policy.audit.granularity).toBe('all');
+    });
+
+    it('非法 granularity → 回退 all', async () => {
+      mockRow(JSON.stringify({ audit: { granularity: 'bogus' } }));
+      const policy = await service.getPolicy();
+      expect(policy.audit.granularity).toBe('all');
+    });
+  });
+
+  describe('setPolicy', () => {
+    it('写策略 upsert 单行 id=1，返回规范化策略', async () => {
+      repo.save.mockResolvedValue({ id: 1 });
+      const result = await service.setPolicy({
+        tools: { create_event: { enabled: false } },
+        audit: { granularity: 'off' },
+      });
+      expect(repo.save).toHaveBeenCalledWith({
+        id: 1,
+        value: expect.stringContaining('"enabled":false'),
+      });
+      expect(result.audit.granularity).toBe('off');
+    });
+
+    it('缺失维度回退默认', async () => {
+      repo.save.mockResolvedValue({ id: 1 });
+      const result = await service.setPolicy({ tools: {} } as any);
+      expect(result.audit.granularity).toBe('all');
+    });
+  });
+
+  describe('getToolPolicy（默认 + 覆盖合并）', () => {
+    it('未配置 → 默认值生效', async () => {
+      mockRow(null);
+      const p = await service.getToolPolicy('create_event', { requiresConfirmation: true });
+      expect(p.enabled).toBe(true);
+      expect(p.requiresConfirmation).toBe(true);
+      expect(p.allowedRoles).toEqual([]);
+    });
+
+    it('策略覆盖默认', async () => {
+      mockRow(
+        JSON.stringify({
+          tools: {
+            create_event: { enabled: false, requiresConfirmation: false, allowedRoles: ['admin'] },
+          },
+        }),
+      );
+      const p = await service.getToolPolicy('create_event', { requiresConfirmation: true });
+      expect(p.enabled).toBe(false);
+      expect(p.requiresConfirmation).toBe(false);
+      expect(p.allowedRoles).toEqual(['admin']);
+    });
+  });
+
+  describe('便捷方法', () => {
+    it('isToolEnabled 读取策略开关', async () => {
+      mockRow(JSON.stringify({ tools: { web_search: { enabled: false } } }));
+      await expect(service.isToolEnabled('web_search')).resolves.toBe(false);
+      await expect(service.isToolEnabled('query_events')).resolves.toBe(true);
+    });
+
+    it('requiresConfirmation 覆盖工具默认', async () => {
+      mockRow(JSON.stringify({ tools: { create_todo: { requiresConfirmation: false } } }));
+      await expect(service.requiresConfirmation('create_todo', true)).resolves.toBe(false);
+      await expect(service.requiresConfirmation('other', true)).resolves.toBe(true);
+    });
+
+    it('getAllowedRoles 返回白名单', async () => {
+      mockRow(JSON.stringify({ tools: { x: { allowedRoles: ['admin'] } } }));
+      await expect(service.getAllowedRoles('x')).resolves.toEqual(['admin']);
+      await expect(service.getAllowedRoles('y')).resolves.toEqual([]);
+    });
+
+    it('getAuditGranularity 返回配置值', async () => {
+      mockRow(JSON.stringify({ audit: { granularity: 'off' } }));
+      await expect(service.getAuditGranularity()).resolves.toBe('off');
+    });
+  });
+
+  describe('effectiveGateMode（§internal.15(4) 门控档位，唯一权威口径）', () => {
+    it('无覆盖时声明风险级推导默认档：R5→blocked / R4→approval / R3→confirm / R0-R2→auto', () => {
+      expect(effectiveGateMode(undefined, 'R5')).toBe('blocked');
+      expect(effectiveGateMode(undefined, 'R4')).toBe('approval');
+      expect(effectiveGateMode(undefined, 'R3')).toBe('confirm');
+      expect(effectiveGateMode(undefined, 'R2')).toBe('auto');
+      expect(effectiveGateMode(undefined, 'R1')).toBe('auto');
+      expect(effectiveGateMode(undefined, 'R0')).toBe('auto');
+    });
+
+    it('mode 覆盖优先于声明档位：可升档 R3→approval、R2→confirm，可降档 R4→auto', () => {
+      expect(effectiveGateMode({ mode: 'approval' }, 'R3')).toBe('approval');
+      expect(effectiveGateMode({ mode: 'confirm' }, 'R2')).toBe('confirm');
+      expect(effectiveGateMode({ mode: 'auto' }, 'R4')).toBe('auto');
+    });
+
+    it('R5 恒 blocked：即使写了 mode 覆盖也不可放宽', () => {
+      expect(effectiveGateMode({ mode: 'auto' }, 'R5')).toBe('blocked');
+      expect(effectiveGateMode({ mode: 'confirm' }, 'R5')).toBe('blocked');
+    });
+
+    it('legacy requiresConfirmation 布尔兼容：false→auto（降级）；true 在 R2 工具上→confirm', () => {
+      expect(effectiveGateMode({ requiresConfirmation: false }, 'R4')).toBe('auto');
+      expect(effectiveGateMode({ requiresConfirmation: false }, 'R3')).toBe('auto');
+      expect(effectiveGateMode({ requiresConfirmation: true }, 'R2')).toBe('confirm');
+      expect(effectiveGateMode({ requiresConfirmation: true }, 'R4')).toBe('approval');
+    });
+  });
+
+  describe('resolveGateMode / requiresApproval / requiresConfirmation（§internal.15(4) 档位读策略）', () => {
+    it('无覆盖时按声明：R4→approval / R3→confirm', async () => {
+      mockRow(null);
+      await expect(service.resolveGateMode('review_approval_request', 'R4')).resolves.toBe('approval');
+      await expect(service.requiresApproval('review_approval_request', 'R4')).resolves.toBe(true);
+      await expect(service.resolveGateMode('create_event', 'R3')).resolves.toBe('confirm');
+      await expect(service.requiresApproval('create_event', 'R3')).resolves.toBe(false);
+    });
+
+    it('策略把 R3 工具升档 approval → 判为需审批', async () => {
+      mockRow(JSON.stringify({ tools: { create_customer: { mode: 'approval' } } }));
+      await expect(service.resolveGateMode('create_customer', 'R3')).resolves.toBe('approval');
+      await expect(service.requiresApproval('create_customer', 'R3')).resolves.toBe(true);
+    });
+
+    it('策略把 R4 工具降档 confirm/auto → 不再走审批', async () => {
+      mockRow(JSON.stringify({ tools: { review_approval_request: { mode: 'auto' } } }));
+      await expect(service.resolveGateMode('review_approval_request', 'R4')).resolves.toBe('auto');
+      await expect(service.requiresApproval('review_approval_request', 'R4')).resolves.toBe(false);
+    });
+
+    it('requiresConfirmation（模式）在档位下正确：approval/confirm→需确认，auto→免确认', async () => {
+      mockRow(JSON.stringify({ tools: { a: { mode: 'approval' }, b: { mode: 'auto' } } }));
+      await expect(service.requiresConfirmation('a', false)).resolves.toBe(true);
+      await expect(service.requiresConfirmation('b', true)).resolves.toBe(false);
+      await expect(service.requiresConfirmation('legacy_off', true)).resolves.toBe(true);
+    });
+  });
+
+  describe('§internal.17③ policy revision（内容指纹版本）', () => {
+    it('无行 → 固定空策略指纹', async () => {
+      mockRow(null);
+      const a = await service.getPolicy();
+      const b = await service.getPolicy();
+      expect(a.revision).toBe(policyRevisionOf(undefined));
+      expect(a.revision).toBe(b.revision);
+    });
+
+    it('同内容恒同号、改内容变号', async () => {
+      const v1 = JSON.stringify({
+        tools: { create_event: { enabled: false } },
+        audit: { granularity: 'write' },
+      });
+      mockRow(v1);
+      const r1a = (await service.getPolicy()).revision;
+      mockRow(v1);
+      const r1b = (await service.getPolicy()).revision;
+      expect(r1b).toBe(r1a);
+      mockRow(
+        JSON.stringify({
+          tools: { create_event: { enabled: true } },
+          audit: { granularity: 'write' },
+        }),
+      );
+      const r2 = (await service.getPolicy()).revision;
+      expect(r2).not.toBe(r1a);
+    });
+
+    it('CONF-1：声明界限进内容指纹 —— 收紧/放宽界限必须产生新 revision', async () => {
+      mockRow(JSON.stringify({ tools: { create_contract: { boundedFields: { amount: { max: 10000 } } } } }));
+      const wide = (await service.getPolicy()).revision;
+      // 同一份内容再读：同号（指纹稳定）
+      expect((await service.getPolicy()).revision).toBe(wide);
+
+      mockRow(JSON.stringify({ tools: { create_contract: { boundedFields: { amount: { max: 500 } } } } }));
+      const tight = (await service.getPolicy()).revision;
+      // 收紧界限 ⇒ 新号；否则「决策可复现」会把两版不同界限读成同一版
+      expect(tight).not.toBe(wide);
+
+      // 字段顺序无关（normalize 按键排序）
+      mockRow(JSON.stringify({ tools: { t: { boundedFields: { b: { max: 2 }, a: { max: 1 } } } } }));
+      const r1 = (await service.getPolicy()).revision;
+      mockRow(JSON.stringify({ tools: { t: { boundedFields: { a: { max: 1 }, b: { max: 2 } } } } }));
+      expect((await service.getPolicy()).revision).toBe(r1);
+    });
+
+    it('CONF-1：非有限 / 非数的界限被剔除（它比不了，不该进指纹也不该生效）', async () => {
+      mockRow(JSON.stringify({ tools: { t: { boundedFields: { amount: { max: 10000 } } } } }));
+      const clean = (await service.getPolicy()).revision;
+      mockRow(
+        JSON.stringify({
+          tools: { t: { boundedFields: { amount: { max: 10000 }, junk: { max: 'x' } } } },
+        }),
+      );
+      expect((await service.getPolicy()).revision).toBe(clean);
+      expect((await service.getToolPolicy('t')).boundedFields).toEqual({ amount: { max: 10000 } });
+    });
+
+    it('key 顺序无关（normalize 排序）', async () => {
+      mockRow(JSON.stringify({ tools: { b: { allowedRoles: ['admin'] }, a: { enabled: false } } }));
+      const r1 = (await service.getPolicy()).revision;
+      mockRow(JSON.stringify({ tools: { a: { enabled: false }, b: { allowedRoles: ['admin'] } } }));
+      const r2 = (await service.getPolicy()).revision;
+      expect(r2).toBe(r1);
+    });
+
+    it('setPolicy 返回带 revision，与 getPolicy 再读一致', async () => {
+      let stored: string | null = null;
+      repo.save.mockImplementation(async (args: any) => {
+        stored = args.value;
+        return { id: 1, value: args.value, updatedAt: new Date('2026-09-04T12:00:00Z') };
+      });
+      const result = await service.setPolicy({ tools: { create_event: { enabled: false } } });
+      expect(result.revision).toBeTruthy();
+      mockRow(stored!);
+      const reread = await service.getPolicy();
+      expect(reread.revision).toBe(result.revision);
+    });
+  });
+
+  describe('§internal.17③ verifyReproducible（决策可复现）', () => {
+    it('无 policyRevision → verifiable false（历史记录）', async () => {
+      const res = await service.verifyReproducible({
+        tool: 'create_event',
+        checks: [{ name: 'tool_enabled', ok: true }],
+      });
+      expect(res.verifiable).toBe(false);
+      expect(res.note).toContain('历史');
+    });
+
+    it('策略未漂移 → 可复现', async () => {
+      const stored = JSON.stringify({ tools: { create_event: { enabled: true } } });
+      mockRow(stored);
+      const ra = (await service.getPolicy()).revision as string;
+      const res = await service.verifyReproducible({
+        tool: 'create_event',
+        checks: [{ name: 'tool_enabled', ok: true }],
+        policyRevision: ra,
+      });
+      expect(res.verifiable).toBe(true);
+      expect(res.policyChanged).toBe(false);
+      expect(res.reproducible).toBe(true);
+    });
+
+    it('策略漂移但该工具放行判定未变 → 仍可复现', async () => {
+      mockRow(JSON.stringify({ tools: { web_search: { enabled: false } } }));
+      const res = await service.verifyReproducible({
+        tool: 'create_event',
+        checks: [{ name: 'tool_enabled', ok: true }],
+        policyRevision: 'oldhash',
+      });
+      expect(res.verifiable).toBe(true);
+      expect(res.policyChanged).toBe(true);
+      expect(res.toolDecisionChanged).toBe(false);
+      expect(res.reproducible).toBe(true);
+    });
+
+    it('策略漂移且该工具被禁用 → 不可复现', async () => {
+      mockRow(JSON.stringify({ tools: { create_event: { enabled: false } } }));
+      const res = await service.verifyReproducible({
+        tool: 'create_event',
+        checks: [{ name: 'tool_enabled', ok: true }],
+        policyRevision: 'oldhash',
+      });
+      expect(res.verifiable).toBe(true);
+      expect(res.policyChanged).toBe(true);
+      expect(res.toolDecisionChanged).toBe(true);
+      expect(res.reproducible).toBe(false);
+    });
+  });
+
+  describe('P-③ 策略历史表 + replayDecision（跨版本回放）', () => {
+    it('setPolicy 同步落历史快照行（revision + value + appliedAt）', async () => {
+      const stored = JSON.stringify({ tools: {}, audit: { granularity: 'all' } });
+      repo.save.mockResolvedValue({ id: 1, value: stored, updatedAt: new Date('2026-09-04T12:00:00Z') });
+      await service.setPolicy({ tools: { create_event: { enabled: false } } });
+      expect(historyRepo.save).toHaveBeenCalledTimes(1);
+      const saved = historyRepo.save.mock.calls[0][0] as { revision: string; value: string; appliedAt: Date };
+      expect(saved.revision).toMatch(/^[0-9a-f]{12}$/);
+      expect(saved.appliedAt).toBeInstanceOf(Date);
+    });
+
+    it('replayDecision 历史命中 → 拿当时策略真重演（当时禁用 vs 记录放行 → 不可复现）', async () => {
+      // 历史快照：当时 create_event 禁用
+      historyRepo.findOne.mockResolvedValue({
+        id: 1,
+        revision: 'ab12cd34ef56',
+        value: JSON.stringify({ tools: { create_event: { enabled: false } } }),
+        appliedAt: new Date('2026-09-04T09:00:00Z'),
+      });
+      // 当前策略：create_event 启用（已漂移）
+      mockRow(JSON.stringify({ tools: { create_event: { enabled: true } } }));
+      const res = await service.replayDecision({
+        tool: 'create_event',
+        checks: [{ name: 'tool_enabled', ok: true }],
+        policyRevision: 'ab12cd34ef56',
+      });
+      expect(res.mode).toBe('history');
+      expect(res.snapshotRevision).toBe('ab12cd34ef56');
+      expect(res.policyChanged).toBe(true);
+      expect(res.toolDecisionChanged).toBe(true);
+      expect(res.reproducible).toBe(false);
+    });
+
+    it('replayDecision 历史命中且当时仍放行 → 可复现（跨版本一致）', async () => {
+      historyRepo.findOne.mockResolvedValue({
+        id: 1,
+        revision: 'ab12cd34ef56',
+        value: JSON.stringify({ tools: { create_event: { enabled: true } } }),
+        appliedAt: new Date('2026-09-04T09:00:00Z'),
+      });
+      mockRow(JSON.stringify({ tools: { create_event: { enabled: false } } }));
+      const res = await service.replayDecision({
+        tool: 'create_event',
+        checks: [{ name: 'tool_enabled', ok: true }],
+        policyRevision: 'ab12cd34ef56',
+      });
+      expect(res.mode).toBe('history');
+      expect(res.policyChanged).toBe(true);
+      expect(res.toolDecisionChanged).toBe(false);
+      expect(res.reproducible).toBe(true);
+    });
+
+    it('历史未命中 → mode current-fallback（原 verifyReproducible 语义）', async () => {
+      historyRepo.findOne.mockResolvedValue(undefined);
+      mockRow(JSON.stringify({ tools: { create_event: { enabled: false } } }));
+      const res = await service.replayDecision({
+        tool: 'create_event',
+        checks: [{ name: 'tool_enabled', ok: true }],
+        policyRevision: 'oldhash',
+      });
+      expect(res.mode).toBe('current-fallback');
+      expect(res.policyChanged).toBe(true);
+      expect(res.toolDecisionChanged).toBe(true);
+      expect(res.reproducible).toBe(false);
+    });
+
+    it('getPolicyRevisionHistory 返回列表含规范化 value（spec §5 value 摘要，供「当时策略」展示/比对人读）', async () => {
+      historyRepo.find.mockResolvedValue([
+        { id: 2, revision: 'ab12cd34ef56', value: JSON.stringify({ tools: { create_event: { enabled: false } } }), appliedAt: new Date('2026-09-04T12:00:00Z') },
+        { id: 1, revision: '000000000000', value: JSON.stringify({ tools: {} }), appliedAt: new Date('2026-09-04T09:00:00Z') },
+      ]);
+      const list = await service.getPolicyRevisionHistory(50);
+      expect(list).toHaveLength(2);
+      expect(list[0]).toEqual({
+        id: 2,
+        revision: 'ab12cd34ef56',
+        value: expect.stringContaining('"enabled":false'),
+        appliedAt: expect.any(Date),
+      });
+    });
+  });
+});

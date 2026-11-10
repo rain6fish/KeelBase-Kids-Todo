@@ -1,0 +1,385 @@
+// SPDX-License-Identifier: Apache-2.0
+
+import { Injectable, Logger, Optional, OnModuleInit } from '@nestjs/common';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { SettingsService } from '../../settings/settings.service';
+import { assertPublicUrl } from '../../common/utils/ssrf';
+import { GovernancePolicyService } from '../../governance-shared/services/governance-policy.service';
+import { AuditService } from '../../governance-shared/services/audit.service';
+import { ToolExposureService } from '../../ai/tools/tool-exposure.service';
+import { ExternalToolProvider, ExternalToolDef, ExternalToolCall } from '../../ai/external-tool-provider.interface';
+import { ToolRiskLevel, RISK_STRATEGY } from '../../ai/interfaces/tool.interface';
+import { MCP_TOOL_PREFIX, mcpToolKey, parseMcpToolKey } from '../../ai/tools/tool-destination';
+
+export interface McpServerConfig {
+  name: string;
+  url: string;
+}
+
+export interface ExternalMcpTool {
+  name: string;
+  description?: string;
+  inputSchema?: Record<string, unknown>;
+  /** readOnlyHint=true 视为只读；否则默认需确认（第三方工具安全默认） */
+  readOnly: boolean;
+  /** A2 风险声明：优先采纳 `_meta.keelbase.riskLevel`（外部权威声明，闭集校验）；否则 readOnly→R1(auto) / 非只读→R3(confirmation) */
+  riskLevel: ToolRiskLevel;
+  riskStrategy: string;
+}
+
+export interface ExternalToolCallResult {
+  content: Array<{ type: string; text?: string }>;
+  isError?: boolean;
+}
+
+export interface ExternalToolOutcome {
+  executed: boolean;
+  requiresConfirmation: boolean;
+  result?: ExternalToolCallResult;
+  error?: string;
+}
+
+/** 连接器接口：真实实现走 SDK StreamableHTTPClientTransport，测试可注入 InMemoryTransport */
+export type McpTransportFactory = (server: McpServerConfig) => Promise<{ transport: unknown; close: () => void }>;
+
+const defaultTransportFactory: McpTransportFactory = async (server) => {
+  const transport = new StreamableHTTPClientTransport(new URL(server.url));
+  return { transport, close: () => transport.close() };
+};
+
+/**
+ * HS-10 MCP 入口 gateway：注册外部 MCP server（Settings key=mcp_servers），
+ * 发现其工具并调用，每次调用强制过治理层（HS-9 权限/确认 + 审计）。
+ * 外部工具键：mcp_<server>_<tool>（写入 ai_governance_policy 可配置 enabled/requiresConfirmation/allowedRoles）。
+ * 安全默认：readOnlyHint!=true 的工具要求确认；策略可覆盖。
+ * Agent 对话集成（外部工具并入 LLM 工具流）为下一步，本版暴露 admin 端点。
+ */
+@Injectable()
+export class McpGatewayService implements ExternalToolProvider, OnModuleInit {
+  static readonly SETTING_KEY = 'mcp_servers';
+  private static readonly CACHE_TTL_MS = 30_000;
+  private readonly logger = new Logger(McpGatewayService.name);
+  private readonly cache = new Map<string, { tools: ExternalMcpTool[]; at: number }>();
+
+  constructor(
+    private readonly settings: SettingsService,
+    private readonly governance: GovernancePolicyService,
+    private readonly audit: AuditService,
+    @Optional() private readonly toolExposure?: ToolExposureService,
+    @Optional() private readonly transportFactory?: McpTransportFactory,
+  ) {}
+
+  /** HS-10 Agent 对话集成：启动时把本 gateway 注册为工具对外面的外部工具提供者。 */
+  async onModuleInit(): Promise<void> {
+    this.toolExposure?.registerExternalToolProvider(this);
+  }
+
+  // --- ExternalToolProvider 接口实现（供 ToolExposureService 工具流合并/路由） ---
+
+  async listExternalTools(): Promise<ExternalToolDef[]> {
+    const discovered = await this.discoverTools();
+    const tools: ExternalToolDef[] = [];
+    for (const d of discovered) {
+      for (const t of d.tools) {
+        tools.push({
+          name: mcpToolKey(d.server, t.name),
+          description: t.description ?? '',
+          parameters: (t.inputSchema ?? {}) as Record<string, unknown>,
+        });
+      }
+    }
+    return tools;
+  }
+
+  isExternal(name: string): boolean {
+    return name.startsWith(MCP_TOOL_PREFIX);
+  }
+
+  async requiresConfirmation(name: string): Promise<boolean> {
+    const key = this._parseKey(name);
+    if (!key) return false;
+    const server = (await this.listServers()).find((s) => s.name === key.server);
+    if (!server) return false;
+    const readOnly = (await this._findTool(server, key.tool))?.readOnly ?? false;
+    return this.governance.requiresConfirmation(name, !readOnly);
+  }
+
+  async callTool(
+    name: string,
+    args: Record<string, unknown>,
+    userId: string,
+  ): Promise<ExternalToolCall> {
+    const key = this._parseKey(name);
+    if (!key) {
+      return { executed: false, error: `"${name}" is not an external tool key` };
+    }
+    const out = await this.callExternalTool(key.server, key.tool, args, userId);
+    if (!out.executed) {
+      return {
+        executed: false,
+        requiresConfirmation: out.requiresConfirmation,
+        error: out.error ?? 'External tool call failed',
+      };
+    }
+    const text =
+      out.result?.content?.map((c) => c.text).filter(Boolean).join('\n') ?? '';
+    return { executed: true, content: text };
+  }
+
+  private _parseKey(name: string): { server: string; tool: string } | null {
+    // 键形状单一源在 ai 侧（`tool-destination.ts`）——目的地解析（AUTHZ-1）用的是同一份解析，
+    // 两处各自写一个正则就会漂移成「同一个键、两种目的地」。
+    return parseMcpToolKey(name);
+  }
+
+  async listServers(): Promise<McpServerConfig[]> {
+    const raw = await this.settings.get(McpGatewayService.SETTING_KEY);
+    if (!raw) return [];
+    try {
+      const parsed = typeof raw === 'string' ? (JSON.parse(raw) as unknown) : raw;
+      return Array.isArray(parsed) ? (parsed as McpServerConfig[]) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  async registerServer(name: string, url: string): Promise<McpServerConfig[]> {
+    // SSRF 防护（复用 webhook 同套校验）：目标不得为私网/回环/链接本地（含云元数据）
+    await assertPublicUrl(url);
+    const servers = await this.listServers();
+    if (servers.some((s) => s.name === name)) {
+      throw new Error(`MCP server "${name}" already registered`);
+    }
+    const next = [...servers, { name, url }];
+    await this.settings.set(McpGatewayService.SETTING_KEY, JSON.stringify(next));
+    return next;
+  }
+
+  async removeServer(name: string): Promise<McpServerConfig[]> {
+    const next = (await this.listServers()).filter((s) => s.name !== name);
+    await this.settings.set(McpGatewayService.SETTING_KEY, JSON.stringify(next));
+    this.cache.delete(name);
+    return next;
+  }
+
+  /** 发现所有已注册 server 的工具（每 server 缓存 30s；force 强制刷新）。 */
+  async discoverTools(force = false): Promise<
+    Array<{ server: string; tools: ExternalMcpTool[]; error?: string }>
+  > {
+    const servers = await this.listServers();
+    const results: Array<{ server: string; tools: ExternalMcpTool[]; error?: string }> = [];
+    for (const server of servers) {
+      const cached = this.cache.get(server.name);
+      if (cached && !force && Date.now() - cached.at < McpGatewayService.CACHE_TTL_MS) {
+        results.push({ server: server.name, tools: cached.tools });
+        continue;
+      }
+      try {
+        const tools = await this._listTools(server);
+        this.cache.set(server.name, { tools, at: Date.now() });
+        results.push({ server: server.name, tools });
+      } catch (e) {
+        this.logger.warn(`[McpGateway] discover ${server.name} failed: ${(e as Error).message}`);
+        results.push({ server: server.name, tools: [], error: (e as Error).message });
+      }
+    }
+    return results;
+  }
+
+  /**
+   * 调用外部 MCP 工具（强制过治理层）：
+   * 1) HS-9 策略 enabled 检查（工具键 mcp_<server>_<tool>）
+   * 2) 确认规则：readOnly 默认不确认；非只读默认需确认；策略可覆盖
+   * 3) 审计（provider=mcp）
+   * 4) 转发给外部 server
+   */
+  async callExternalTool(
+    serverName: string,
+    toolName: string,
+    args: Record<string, unknown>,
+    userId: string,
+  ): Promise<ExternalToolOutcome> {
+    const extKey = mcpToolKey(serverName, toolName);
+    const server = (await this.listServers()).find((s) => s.name === serverName);
+    if (!server) {
+      await this._auditDenied(userId, serverName, toolName, args, 'mcp_server_registered', `MCP server "${serverName}" not registered`);
+      return { executed: false, requiresConfirmation: false, error: `MCP server "${serverName}" not registered` };
+    }
+
+    if (!(await this.governance.isToolEnabled(extKey))) {
+      await this._auditDenied(userId, serverName, toolName, args, 'tool_enabled', `Tool "${extKey}" is disabled by governance policy`);
+      return { executed: false, requiresConfirmation: false, error: `Tool "${extKey}" is disabled by governance policy` };
+    }
+
+    // PC-5：外部声明的风险契约**必须真的用于门控**（协议 §4.4「应以其门控」）——声明 R5（不可逆/外部动作）
+    // 直接阻断，与内部工具 `_assertToolAllowed` 的 R5 语义一致；声明 R3/R4 → readOnly=false → 走确认/审批门。
+    const tool = await this._findTool(server, toolName);
+    if (tool?.riskLevel === 'R5') {
+      await this._auditDenied(
+        userId,
+        serverName,
+        toolName,
+        args,
+        'risk_policy',
+        `Tool "${extKey}" is blocked (declared risk level R5)`,
+      );
+      return { executed: false, requiresConfirmation: false, error: `Tool "${extKey}" is blocked (declared risk level R5)` };
+    }
+
+    const readOnly = tool?.readOnly ?? false;
+    const defaultRequires = !readOnly;
+    const requiresConfirmation = await this.governance.requiresConfirmation(extKey, defaultRequires);
+    if (requiresConfirmation) {
+      return { executed: false, requiresConfirmation: true };
+    }
+
+    // C-4: the `tool_call` row is written once the outcome is known, so it can answer the two
+    // off-chain attribution columns with what actually happened. It is deliberately not written
+    // before the call: a pre-execution row could only say `attempted`, and that word names a later
+    // row this path never writes — a reader would go looking for an outcome that never arrives.
+    // C-4：这条 `tool_call` 行在结局已知之后才写，故能用真实结局答那两列链外归因列。**有意**不写在调用
+    // 之前：执行前的行只能写 `attempted`，而那个词点名一条本路径从不写的后续行 —— 读者会去找一个永远
+    // 不来的结局。
+    const detail = `mcp:${serverName}:${toolName}(${JSON.stringify(args).slice(0, 500)})`;
+    let result: ExternalToolCallResult;
+    try {
+      result = await this._callRemote(server, toolName, args);
+    } catch (e) {
+      const error = (e as Error).message;
+      await this.audit.log({
+        userId,
+        action: 'tool_call',
+        detail,
+        provider: 'mcp',
+        outcome: 'failed',
+        tool: toolName,
+        isError: true,
+        errorMessage: error,
+      });
+      return { executed: true, requiresConfirmation: false, error };
+    }
+    // The remote call already happened. Its audit row is written outside that try: an audit failure
+    // must be reported, never turn a call that succeeded into an `outcome: 'failed'` row.
+    // 远端调用已经发生。它的审计行写在那段 try 之外：审计失败要被报告，绝不能把一次成功的调用
+    // 记成 `outcome: 'failed'`。
+    try {
+      await this.audit.log({
+        userId,
+        action: 'tool_call',
+        detail,
+        provider: 'mcp',
+        outcome: 'executed',
+        tool: toolName,
+      });
+    } catch (auditError) {
+      this.logger.error(
+        `MCP call succeeded but its audit row was not written: ${serverName}/${toolName}: ${(auditError as Error).message}`,
+      );
+    }
+    return { executed: true, requiresConfirmation: false, result };
+  }
+
+  /**
+   * T5 跨入口一致：网关 deny 也留审计（此前两个 deny 分支直接 return → **治理拒绝无痕**）。
+   * reasons 用拒绝数组形状，与 REST/SSE 及 MCP 出口侧 `authorization: JSON.stringify(reasons)` 对齐
+   * （读取侧 parseAllowedSnapshot 对数组返回 null → 不会被误判为放行快照）。
+   */
+  private async _auditDenied(
+    userId: string,
+    serverName: string,
+    toolName: string,
+    args: Record<string, unknown>,
+    checkName: string,
+    message: string,
+  ): Promise<void> {
+    await this.audit.log({
+      userId,
+      action: 'tool_call',
+      detail: `mcp:${serverName}:${toolName}(${JSON.stringify(args).slice(0, 500)}) — authorization denied`,
+      provider: 'mcp',
+      isError: true,
+      errorMessage: message,
+      authorization: JSON.stringify([{ name: checkName, ok: false, note: message }]),
+      // C-4: a `tool_call` row answers the two off-chain attribution columns. `risk_policy` is
+      // `blocked` (the call never reached a decision); every other refusal this helper is called
+      // with is `refused` — the split `buildToolCallAudit` makes, keyed on the one check name here.
+      // C-4：`tool_call` 行该答两列链外归因列。`risk_policy` 是 `blocked`（这次调用从没到过裁决）；
+      // 本助手其余拒绝是 `refused` —— 与 `buildToolCallAudit` 同一套分法，此处按唯一那个 check 名取。
+      outcome: checkName === 'risk_policy' ? 'blocked' : 'refused',
+      tool: toolName,
+    });
+  }
+
+  private async _findTool(server: McpServerConfig, toolName: string): Promise<ExternalMcpTool | undefined> {
+    const cached = this.cache.get(server.name);
+    const tools = cached ? cached.tools : await this._listTools(server);
+    return tools.find((t) => t.name === toolName);
+  }
+
+  private async _listTools(server: McpServerConfig): Promise<ExternalMcpTool[]> {
+    const { transport, close } = await this._makeTransport(server);
+    const client = new Client({ name: 'keelbase-gateway', version: '0.9.1' });
+    try {
+      await client.connect(transport as never);
+      const { tools } = await client.listTools();
+      return tools.map((t) => {
+        // PC-5（CE-2 缺口）：导入侧读 `_meta.keelbase`（与导出 §4.4 对称）——外部实现经 MCP 标准
+        // 扩展槽声明权威 R0-R5 契约；仅当落在闭集内才采用（防脏值/伪造），否则回落
+        // annotations.readOnlyHint 派生（读 R1 / 写 R3，第三方工具安全默认）。
+        // `readOnly` 仍取 readOnlyHint（**不**由声明反推）——避免「声明 R2 但 hint 说非只读」这类
+        // 不自洽输入反而放宽默认确认；声明只用于**收紧**（见 callExternalTool 的 R5 阻断）。
+        const declared = (t as { _meta?: { keelbase?: { riskLevel?: unknown } } })._meta?.keelbase
+          ?.riskLevel;
+        const declaredRisk =
+          typeof declared === 'string' && Object.prototype.hasOwnProperty.call(RISK_STRATEGY, declared)
+            ? (declared as ToolRiskLevel)
+            : undefined;
+        const riskLevel: ToolRiskLevel =
+          declaredRisk ?? ((t.annotations?.readOnlyHint ?? false) ? 'R1' : 'R3');
+        return {
+          name: t.name,
+          description: t.description,
+          inputSchema: t.inputSchema as Record<string, unknown> | undefined,
+          readOnly: t.annotations?.readOnlyHint ?? false,
+          riskLevel,
+          riskStrategy: RISK_STRATEGY[riskLevel],
+        };
+      });
+    } finally {
+      await client.close().catch(() => undefined);
+      close();
+    }
+  }
+
+  private async _callRemote(
+    server: McpServerConfig,
+    toolName: string,
+    args: Record<string, unknown>,
+  ): Promise<ExternalToolCallResult> {
+    const { transport, close } = await this._makeTransport(server);
+    const client = new Client({ name: 'keelbase-gateway', version: '0.9.1' });
+    try {
+      await client.connect(transport as never);
+      const res = (await client.callTool({ name: toolName, arguments: args })) as {
+        content?: Array<{ type: string; text?: string }>;
+        isError?: boolean;
+      };
+      const content = (res.content ?? []).map((c) => ({
+        type: c.type,
+        text: (c as { text?: string }).text,
+      }));
+      return { content, isError: res.isError ?? false };
+    } finally {
+      await client.close().catch(() => undefined);
+      close();
+    }
+  }
+
+  private async _makeTransport(server: McpServerConfig): Promise<{ transport: unknown; close: () => void }> {
+    if (this.transportFactory) {
+      return this.transportFactory(server);
+    }
+    return defaultTransportFactory(server);
+  }
+}

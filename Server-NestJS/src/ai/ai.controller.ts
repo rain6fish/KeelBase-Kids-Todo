@@ -1,0 +1,890 @@
+// SPDX-License-Identifier: Apache-2.0
+
+/**
+ * AI 控制器
+ *
+ * 提供 REST 和 SSE 流式两种对话接口。
+ * 所有端点默认继承全局 JwtAuthGuard（需认证）。
+ */
+
+import {
+  Controller,
+  Post,
+  Get,
+  Delete,
+  Body,
+  Param,
+  Query,
+  Res,
+  HttpCode,
+  HttpStatus,
+  ParseIntPipe,
+  DefaultValuePipe,
+  Put,
+  Patch,
+  Headers,
+} from '@nestjs/common';
+import { ApiTags, ApiOperation, ApiBearerAuth, ApiQuery } from '@nestjs/swagger';
+import {
+  BadRequestException,
+  ConflictException,
+  NotFoundException,
+} from '@nestjs/common';
+import type { Response } from 'express';
+import { AiService } from './ai.service';
+import { R4ApprovalService } from './approvals/r4-approval.service';
+import { ToolExposureService } from './tools/tool-exposure.service';
+import { TrustSandboxService } from './trust-sandbox/trust-sandbox.service';
+import { actorContext } from '../governance-shared/actor-context';
+import { ConversationService } from './conversation/conversation.service';
+import { ConfirmationStore } from './confirmation/confirmation.store';
+import { MyConfirmationService } from './confirmation/my-confirmation.service';
+import {
+  buildDenialExplanation,
+  pickLanguageFromHeader,
+} from '../common/errors/denial-guidance';
+import { AuditEvidenceService } from '../governance-shared/services/audit-evidence.service';
+import { MemoriesService } from './memory/memory.service';
+import { ChatRequestDto } from './dto/chat-request.dto';
+import { ConfirmDecisionDto } from './dto/confirm-decision.dto';
+import { ApproveDecisionDto } from './dto/approve-decision.dto';
+import { MyConfirmationQueryDto } from './dto/my-confirmation-query.dto';
+import { RenameConversationDto } from './dto/rename-conversation.dto';
+import { CurrentUser } from '../auth/decorators/current-user.decorator';
+import { CurrentAbility } from '../common/casl/current-ability.decorator';
+import { CheckPolicies } from '../common/casl/check-policies.decorator';
+import { SkipAudit } from '../operation-audit/skip-audit.decorator';
+import { FeatureFlag } from '../feature-flags/feature-flag.decorator';
+import { AiToolEffectsService } from '../governance-shared/services/ai-tool-effects.service';
+import { DecisionTraceService, DecisionTrace } from './trace/decision-trace.service';
+import { GovernancePolicyService } from '../governance-shared/services/governance-policy.service';
+import type { GovernancePolicy } from '../governance-shared/services/governance-policy.service';
+import { BusinessHistoryService } from './governance-bridge/business-history.service';
+import { AuditService } from '../governance-shared/services/audit.service';
+import type { JwtPayload } from '../auth/interfaces/jwt-payload.interface';
+import type { AppAbility } from '../common/casl/casl-ability.factory';
+
+@ApiTags('AI')
+@ApiBearerAuth()
+@FeatureFlag('ai')
+@Controller({ path: 'ai', version: '1' })
+export class AiController {
+  constructor(
+    private readonly aiService: AiService,
+    private readonly conversationService: ConversationService,
+    private readonly confirmationStore: ConfirmationStore,
+    private readonly myConfirmationService: MyConfirmationService,
+    private readonly memoriesService: MemoriesService,
+    private readonly toolEffectsService: AiToolEffectsService,
+    private readonly decisionTraceService: DecisionTraceService,
+    private readonly governancePolicy: GovernancePolicyService,
+    private readonly businessHistoryService: BusinessHistoryService,
+    private readonly trustSandbox: TrustSandboxService,
+    private readonly auditService: AuditService,
+    // 证据根装配（阶段 3 第三刀：证据/报表域已独立）
+    private readonly auditEvidence: AuditEvidenceService,
+    // R4 审批（阶段 3 第七刀：审批生命周期已独立）
+    private readonly r4Approval: R4ApprovalService,
+    // 工具对外面（阶段 3 第九刀：清单/集成诊断已独立）
+    private readonly toolExposure: ToolExposureService,
+  ) {}
+
+  /**
+   * 非流式对话
+   */
+  @Post('chat')
+  @SkipAudit()
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'AI 对话（非流式）' })
+  async chat(
+    @Body() dto: ChatRequestDto,
+    @CurrentUser() user: JwtPayload,
+    @Headers('accept-language') acceptLanguage?: string,
+  ) {
+    // Agent Identity（评审二 §5）：access token 会话标识贯穿审计
+    // AU-6（§22.19）：入口来源 source=web（首方客户端对话入口）
+    const chatRequest = {
+      message: dto.message,
+      provider: dto.provider,
+      model: dto.model,
+      conversationId: dto.conversationId,
+      images: dto.images,
+    };
+    // Only add the language argument when the request actually negotiated one, so the existing
+    // two-argument call shape stays untouched for callers/tests that send no Accept-Language.
+    // 仅在请求确实带语言协商时追加参数；未带 Accept-Language 的调用保持原来的两参形态。
+    return actorContext.run({ sessionId: user.sessionId, username: user.username, source: 'web' }, () =>
+      acceptLanguage
+        ? this.aiService.chat(String(user.sub), chatRequest, pickLanguageFromHeader(acceptLanguage))
+        : this.aiService.chat(String(user.sub), chatRequest),
+    );
+  }
+
+  /**
+   * 流式对话（SSE — Server-Sent Events）
+   *
+   * 返回 text/event-stream，逐块推送 AI 回复。
+   * 前端使用 EventSource 或 fetch + ReadableStream 消费。
+   */
+  @Post('chat/stream')
+  @SkipAudit()
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'AI 对话（SSE 流式）' })
+  async chatStream(
+    @Body() dto: ChatRequestDto,
+    @CurrentUser() user: JwtPayload,
+    @Res() response: Response,
+    @Headers('accept-language') acceptLanguage?: string,
+  ) {
+    // 设置 SSE 头部
+    response.setHeader('Content-Type', 'text/event-stream');
+    response.setHeader('Cache-Control', 'no-cache');
+    response.setHeader('Connection', 'keep-alive');
+    response.flushHeaders();
+
+    const streamRequest = {
+      message: dto.message,
+      provider: dto.provider,
+      model: dto.model,
+      conversationId: dto.conversationId,
+      images: dto.images,
+    };
+    // Same rule as `chat`: keep the two-argument call shape when no language was negotiated.
+    // 与 `chat` 同口径：未协商语言时保持两参调用形态。
+    const stream = acceptLanguage
+      ? this.aiService.chatStream(
+          String(user.sub),
+          streamRequest,
+          pickLanguageFromHeader(acceptLanguage),
+        )
+      : this.aiService.chatStream(String(user.sub), streamRequest);
+
+    // 客户端断开时停止
+    let aborted = false;
+    response.on('close', () => {
+      aborted = true;
+    });
+
+    // Agent Identity（评审二 §5）：access token 会话标识贯穿审计（流创建 + 消费均在 ALS 上下文内）
+    await actorContext.run({ sessionId: user.sessionId, username: user.username, source: 'web' }, async () => {
+      try {
+        for await (const chunk of stream) {
+          if (aborted) break;
+
+          response.write(`event: ${chunk.type}\n`);
+          response.write(`data: ${JSON.stringify(chunk)}\n\n`);
+        }
+      } catch {
+        if (!response.destroyed) {
+          response.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: 'Internal stream error' })}\n\n`);
+        }
+      } finally {
+        if (!response.destroyed && !aborted) {
+          response.end();
+        }
+      }
+    });
+  }
+
+  /**
+   * 确认 AI 写操作（create_event / create_todo）
+   *
+   * 流式对话中服务端发出 confirmation_request 后，前端展示确认卡，
+   * 用户点击后调用此端点 resolve 对应的 pending 操作。
+   */
+  @Post('confirmations/:token')
+  @SkipAudit()
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'AI 写入操作确认' })
+  async confirm(
+    @Param('token') token: string,
+    @Body() dto: ConfirmDecisionDto,
+    @CurrentUser() user: JwtPayload,
+    @Headers('accept-language') acceptLanguage?: string,
+  ) {
+    const ok = await this.confirmationStore.resolve(
+      token,
+      String(user.sub),
+      dto.decision,
+      dto.trustTool,
+    );
+    if (!ok) {
+      // Non-leaking: the same response covers not-found, expired, already-decided and wrong-owner.
+      // The explanation says why + how to recover without revealing whether someone else's token exists.
+      //
+      // 不泄漏：不存在 / 已过期 / 已裁决 / 他人 token 同形返回。指引给出原因与恢复动作，
+      // 不透露他人 token 是否存在。
+      const lang = pickLanguageFromHeader(acceptLanguage);
+      throw new NotFoundException({
+        message:
+          lang === 'zh'
+            ? '确认请求不存在或已过期'
+            : 'Confirmation request not found or expired',
+        explanation: buildDenialExplanation('confirmation_invalid', undefined, lang),
+      });
+    }
+    return { ok: true, trustTool: dto.trustTool ?? false };
+  }
+
+  /**
+   * R4 双人审批：待审批列表（管理员审批页）
+   *
+   * AW-2 second half: reading the queue is judged `read ApprovalQueue`. Approving / deciding /
+   * retrying execution stay `manage all` below — an auditor reads the queue, it does not resolve it.
+   *
+   * AW-2 续：读队列判 `read ApprovalQueue`。批准 / 裁决 / 重试执行仍是下面的 `manage all` ——
+   * 审计读者**读队列**，不**处理队列**。
+   */
+  @Get('confirmations/pending')
+  @CheckPolicies((ability) => ability.can('read', 'ApprovalQueue'))
+  @ApiOperation({ summary: 'R4 待人工审批列表（管理员）' })
+  async pendingApprovals() {
+    return this.r4Approval.listPendingApprovals();
+  }
+
+  /**
+   * R4 双人审批：已审批历史（管理员审批页）
+   *
+   * Same read as `pending` — it is the queue's other half, so it shares `read ApprovalQueue`.
+   *
+   * 与 `pending` 同属队列的读侧，故共用 `read ApprovalQueue`。
+   */
+  @Get('confirmations/decided')
+  @CheckPolicies((ability) => ability.can('read', 'ApprovalQueue'))
+  @ApiOperation({ summary: 'R4 已审批历史（管理员）' })
+  async decidedApprovals() {
+    return this.r4Approval.listDecidedApprovals();
+  }
+
+  /**
+   * R4 双人审批：approver 决策（管理员）——approve 后以 operator 维度执行工具
+   */
+  @Post('confirmations/:token/approve-by')
+  @CheckPolicies((ability) => ability.can('manage', 'all'))
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'R4 审批人决策（管理员）' })
+  async decideApproval(
+    @Param('token') token: string,
+    @Body() dto: ApproveDecisionDto,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    const res = await this.r4Approval.decideApproval(token, String(user.sub), dto.decision);
+    if (!res.ok) {
+      throw new NotFoundException(res.message ?? '审批请求不存在或已决策');
+    }
+    return res;
+  }
+
+  /**
+   * P2：重试一条「已批准但未成功执行」的确认（管理员审批页）。
+   *
+   * 不加 `@SkipAudit()`：这是对真实业务动作的**再次执行**，必须留痕（tool_call 审计行由写管道自己落）。
+   * 不加 `@SkipThrottle()`：这是能触发写操作的端点，走全局限流。
+   * 拒绝原因由 service 给出：不存在 → 404；仍在执行 / 状态不允许 / 已成功 → 409。
+   *
+   * P2 retry entry for an approved-but-not-succeeded confirmation. Not audit-skipped (it re-runs a
+   * real business action) and not throttle-skipped (it can write).
+   */
+  @Post('confirmations/:token/retry-execution')
+  @CheckPolicies((ability) => ability.can('manage', 'all'))
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: '重试确认的执行（管理员）' })
+  async retryApprovalExecution(@Param('token') token: string) {
+    const res = await this.r4Approval.retryExecution(token);
+    if (!res.ok) {
+      if (res.reason === 'not_found') throw new NotFoundException('审批请求不存在');
+      throw new ConflictException(res.message ?? '该确认当前不可重试');
+    }
+    return res;
+  }
+
+  /**
+   * ARC-6：**确认**一条「声明与持有不一致」的争议（管理台）。
+   *
+   * 争议标记此前**只写不清** ⇒ 一个「声明变少」的重试就能把组**永久**读成未完成。确认**解除「未了结」**
+   * 而**证据原样保留**（另记确认人与时刻）—— 它不假装问题被修好（缺失成员按构造补不上），只记录「有人看过了」。
+   *
+   * 行不存在 → 404；该行**没有争议**（无从确认）→ 409。
+   *
+   * Acknowledge a dispute raised by the declaration/holding disagreement: lifts the "unsettled" verdict
+   * while keeping the evidence as it is, recording who looked and when. 404 when the row is missing,
+   * 409 when there is no dispute to acknowledge.
+   */
+  @Post('tool-effects/:id/acknowledge-dispute')
+  @CheckPolicies((ability) => ability.can('manage', 'all'))
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: '确认补偿组的「声明与持有不一致」争议（管理员，ARC-6）' })
+  async acknowledgeToolEffectDispute(
+    @Param('id', ParseIntPipe) id: number,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    const res = await this.toolEffectsService.acknowledgeDispute(id, String(user.sub));
+    if (!res.ok) {
+      if (res.reason === 'not_found') throw new NotFoundException('副作用记录不存在');
+      throw new ConflictException('该行没有可确认的争议');
+    }
+    return res;
+  }
+
+  /**
+   * 清除当前用户的长期记忆（隐私）
+   */
+  @Delete('memory')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: '清除用户长期记忆' })
+  async clearMemory(@CurrentUser() user: JwtPayload) {
+    await this.memoriesService.deleteAllForUser(String(user.sub));
+    return null;
+  }
+
+  /**
+   * 获取当前用户的对话历史列表
+   */
+  @Get('conversations')
+  @ApiOperation({ summary: '获取对话历史列表' })
+  async getConversations(@CurrentUser() user: JwtPayload) {
+    return this.conversationService.getUserConversations(String(user.sub));
+  }
+
+  /**
+   * 获取单个对话的完整消息（用于继续对话）
+   */
+  @Get('conversations/:id')
+  @ApiOperation({ summary: '获取单个对话完整消息' })
+  async getConversation(
+    @Param('id') id: string,
+    @CurrentUser() user: JwtPayload,
+    @CurrentAbility() ability: AppAbility,
+  ) {
+    return this.conversationService.getConversation(id, String(user.sub), ability);
+  }
+
+  /**
+   * AU-4（§22.19）：会话**元数据**（不含任何消息正文）——AI 审计行「一跳看对话」的第一步。
+   * 「先引用、后正文」要在**服务端**成立（护栏②），否则只是 UI 层装饰：元数据由本端点单独给出，
+   * 正文须再显式请求 `:id`。权限与 `:id` 同源（admin 或 owner），无新增鉴权分支。
+   */
+  @Get('conversations/:id/meta')
+  @ApiOperation({ summary: '会话元数据（AU-4 下钻第一步，不含消息正文）' })
+  async getConversationMeta(
+    @Param('id') id: string,
+    @CurrentUser() user: JwtPayload,
+    @CurrentAbility() ability: AppAbility,
+  ) {
+    return this.conversationService.getConversationMeta(id, String(user.sub), ability);
+  }
+
+  /**
+   * P0-14 对话执行轨迹（用户可见）：工具调用 / 确认决策 / 副作用 / 结果
+   */
+  @Get('conversations/:id/trace')
+  @ApiOperation({ summary: '对话执行轨迹（工具调用/确认/副作用，本人）' })
+  async getConversationTrace(
+    @Param('id') id: string,
+    @CurrentUser() user: JwtPayload,
+    @CurrentAbility() ability: AppAbility,
+  ) {
+    return this.decisionTraceService.getConversationTrace(id, String(user.sub), ability);
+  }
+
+  /**
+   * 删除指定对话
+   */
+  @Delete('conversations/:id')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: '删除指定对话' })
+  async deleteConversation(
+    @Param('id') id: string,
+    @CurrentUser() user: JwtPayload,
+    @CurrentAbility() ability: AppAbility,
+  ) {
+    await this.conversationService.deleteConversation(id, String(user.sub), ability);
+    return null;
+  }
+
+  /**
+   * 工作账本：重命名会话。
+   *
+   * 权限与 `:id` 同源（本人走 owner 规则、管理员走 manage-all），故**不新增鉴权分支**；
+   * 空串 = 清除标题（前端回退到按首条消息派生的预览）。
+   */
+  @Patch('conversations/:id')
+  @ApiOperation({ summary: '重命名会话（工作账本，本人或管理员）' })
+  async renameConversation(
+    @Param('id') id: string,
+    @Body() dto: RenameConversationDto,
+    @CurrentUser() user: JwtPayload,
+    @CurrentAbility() ability: AppAbility,
+  ) {
+    return this.conversationService.renameConversation(
+      id,
+      String(user.sub),
+      ability,
+      dto.title,
+    );
+  }
+
+  /**
+   * 清空当前用户的所有对话
+   */
+  @Delete('conversations')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: '清空所有对话' })
+  async clearConversations(@CurrentUser() user: JwtPayload) {
+    await this.conversationService.deleteAllUserConversations(String(user.sub));
+    return null;
+  }
+
+  /**
+   * HS-2 工具清单（管理台可见）：展示工具与权限元数据，便于审计/治理
+   *
+   * AW-2 second half: judged `read ToolInventory` rather than `manage all` — an auditor has to read
+   * what the agent can call. `manage all` implies `read`, so admins are unaffected and a plain user
+   * still fails.
+   *
+   * AW-2 续：判 `read ToolInventory` 而不是 `manage all` —— 审计读者要读得了「Agent 能调用什么」。
+   * `manage all` 蕴含 `read`，故管理员不受影响、普通用户照旧过不去。
+   */
+  @Get('tools')
+  @CheckPolicies((ability) => ability.can('read', 'ToolInventory'))
+  @ApiOperation({ summary: 'AI 工具清单与权限（管理员）' })
+  getTools() {
+    return this.toolExposure.getToolInventory();
+  }
+
+  /**
+   * B-proxy 外部系统（Java 集成）接入状态（管理台监控中心）：
+   * 读 ai_proxy_tools baseUrl → 拉取 Java example /keelbase/status 健康度面板。
+   */
+  @Get('proxy/integrations/status')
+  @CheckPolicies((ability) => ability.can('manage', 'all'))
+  @ApiOperation({ summary: '外部系统（Java 集成）接入状态（管理员）' })
+  getProxyIntegrationStatus() {
+    return this.toolExposure.getProxyIntegrationStatus();
+  }
+
+  /** Trust 沙盘（internal-roadmap §internal.15 可视化 P0）：场景清单 */
+  @Get('trust-sandbox/scenarios')
+  @ApiOperation({ summary: 'Trust 沙盘：场景清单（本人）' })
+  getTrustSandboxScenarios() {
+    return this.trustSandbox.scenarios;
+  }
+
+  /** Trust 沙盘：工作台一键重放 Trust 六场景（本人身份，确定性 demo provider） */
+  @Post('trust-sandbox/run/:scenarioId')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Trust 沙盘：运行场景（本人）' })
+  async runTrustSandbox(
+    @Param('scenarioId') scenarioId: string,
+    @CurrentUser() user: JwtPayload,
+    // 1.0.8 deferred：s5 撤销命中真实效果须显式 confirm=1（沙盘不静默撤销真实 AI 副作用）
+    @Query('confirm') confirm?: string,
+  ) {
+    return actorContext.run({ sessionId: user.sessionId, username: user.username, source: 'sandbox' }, () =>
+      this.trustSandbox.run(scenarioId, String(user.sub), {
+        confirm: confirm === '1',
+      }),
+    );
+  }
+
+  /** P0-2 旅程一键连跑：Ask→人工确认→越权拒绝→高风险阻断（一次返回四步，确定性 demo provider） */
+  @Post('trust-sandbox/journey')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Trust 沙盘：3 分钟旅程一键连跑（本人）' })
+  async runTrustSandboxJourney(@CurrentUser() user: JwtPayload) {
+    return actorContext.run({ sessionId: user.sessionId, username: user.username, source: 'sandbox' }, () =>
+      this.trustSandbox.journey(String(user.sub)),
+    );
+  }
+
+  /** P2 ④ 沙盘数据自清理（手动按钮）：删本人沙盘合成客户/订单 + bob 演示账号，保留证据与真实副作用 */
+  @Post('trust-sandbox/cleanup')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Trust 沙盘：清理本次演示数据（本人）' })
+  async cleanupTrustSandbox(@CurrentUser() user: JwtPayload) {
+    return actorContext.run({ sessionId: user.sessionId, username: user.username, source: 'sandbox' }, () =>
+      this.trustSandbox.cleanup(String(user.sub), user.role === 'admin'),
+    );
+  }
+
+  /** P2 ③ 旅程完成计数上报（跨访客按北京日聚合到 settings） */
+  @Post('trust-sandbox/journey/complete')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Trust 沙盘：记一次旅程完成（本人）' })
+  async completeTrustSandboxJourney(@CurrentUser() user: JwtPayload) {
+    await actorContext.run({ sessionId: user.sessionId, username: user.username, source: 'sandbox' }, () =>
+      this.trustSandbox.recordJourneyCompleted(String(user.sub)),
+    );
+    return { ok: true };
+  }
+
+  /** P2 ③ 旅程完成统计（今日 + 累计，跨访客） */
+  @Get('trust-sandbox/journey/stats')
+  @ApiOperation({ summary: 'Trust 沙盘：旅程完成统计' })
+  getTrustSandboxJourneyStats() {
+    return this.trustSandbox.journeyStats();
+  }
+
+  /**
+   * HS-3 AI 副作用记录（管理台可见）：AI 创建的 event/todo 清单，可定位并撤销
+   */
+  @Get('tool-effects')
+  @CheckPolicies((ability) => ability.can('manage', 'all'))
+  @ApiOperation({
+    summary:
+      'AI 写操作副作用记录（管理员，可按 userId 过滤；stale=true 只看陈旧未了结，并附带卡住的占位行）',
+  })
+  @ApiQuery({
+    name: 'stale',
+    required: false,
+    description:
+      'REV-2：只看 compensating 超过阈值分钟未了结的行；并附带 `staleClaims`——卡住的**占位行**（崩溃残留 / 外部写失败），同一阈值',
+  })
+  getToolEffects(
+    @Query('userId', new DefaultValuePipe(undefined)) userId?: number,
+    @Query('page', new DefaultValuePipe(1), ParseIntPipe) page?: number,
+    @Query('limit', new DefaultValuePipe(20), ParseIntPipe) limit?: number,
+    @Query('stale') stale?: string,
+  ) {
+    return this.toolEffectsService.list({
+      userId: userId !== undefined ? Number(userId) : undefined,
+      page,
+      limit,
+      stale: stale === 'true',
+    });
+  }
+
+  /**
+   * REV-11: claim a stuck compensation — record **who** took it on. Admin surface, so the taking party
+   * is the admin who called it.
+   *
+   * Claiming changes nothing about the compensation itself: it does not move `revoke_status`, does not
+   * touch the target, and does not assert the outcome. It only makes "someone is looking" a row instead
+   * of an assumption. Refusals are reported by kind (`not_stale` / `already_claimed` / `not_found`)
+   * rather than as one false, because they mean different things to whoever is working the list.
+   *
+   * REV-11：认领一条卡住的补偿 —— 记下**谁**接了过去。管理端面，故接手方就是发起调用的管理员。
+   *
+   * 认领不改动补偿本身：不移 `revoke_status`、不碰目标、不断言结果。它只把「有人在看」变成一行记录，
+   * 而不是一个假设。拒绝按种类报出（`not_stale` / `already_claimed` / `not_found`），而不是一个 false，
+   * 因为对处理这张列表的人而言它们含义不同。
+   */
+  @Post('tool-effects/:id/claim')
+  @CheckPolicies((ability) => ability.can('manage', 'all'))
+  @ApiOperation({ summary: '认领滞留的 compensating 副作用（REV-11，管理员）' })
+  async claimToolEffect(@Param('id', ParseIntPipe) id: number, @CurrentUser() user: JwtPayload) {
+    return this.toolEffectsService.claim(id, String(user.sub));
+  }
+
+  /**
+   * G-3（§internal.17 ① G-3）：副作用哈希链完整性校验（admin；历史 null 行不在链内，仅校验新链化行）。
+   */
+  @Get('tool-effects/verify')
+  @CheckPolicies((ability) => ability.can('manage', 'all'))
+  @ApiOperation({ summary: 'AI 副作用哈希链校验（admin，G-3）' })
+  verifySideEffects() {
+    return this.toolEffectsService.verifySideEffectChain();
+  }
+
+  /**
+   * REV-3 检出（docs/cascade-compensation.spec.md §4.2）：同一业务对象横跨多个补偿组 = 一次动作被拆成两组。
+   * 两组各自内部自洽 → 唯一冲突不触发、幂等回放不执行、别处毫无异常信号；本端点让分裂**可见**。
+   */
+  @Get('tool-effects/splits')
+  @CheckPolicies((ability) => ability.can('manage', 'all'))
+  @ApiOperation({ summary: '补偿组过度分裂检出（admin，REV-3）：同一业务对象横跨多个组' })
+  @ApiQuery({ name: 'limit', required: false, description: '最多返回多少条重叠（默认且上限 100）' })
+  getSplitGroups(@Query('limit') limit?: string) {
+    const parsed = Number(limit);
+    return this.toolEffectsService.findSplitGroups(Number.isFinite(parsed) ? parsed : undefined);
+  }
+
+  /**
+   * B4 治理可视化：给定业务动作（resultType+resultId，如 crm_task:42）→ 反查 AI 副作用 + 决策轨迹
+   * （决策轨迹 / 权限依据 / 确认 / 审计，供前端「透过 AI CRM 活展示」；本人或管理员）
+   */
+  @Get('governance/action/:resultType/:resultId')
+  @ApiOperation({ summary: '业务动作治理视图：AI 副作用 + 决策轨迹（B4）' })
+  async governanceAction(
+    @Param('resultType') resultType: string,
+    @Param('resultId', ParseIntPipe) resultId: number,
+    @CurrentUser() user: JwtPayload,
+    @CurrentAbility() ability: AppAbility,
+  ) {
+    // A8: a non-admin's lookup is narrowed to that user, because `resultType+resultId` is not unique
+    // by itself for result types with no local entity. Narrowing makes "exists but is not yours" an
+    // honest 404 rather than a 403 — a 403 confirms the row exists, a 404 does not.
+    //
+    // A8：非管理员的查询按用户收窄 —— `resultType+resultId` 对无本地实体的类型不天然唯一。
+    // 收窄后「存在但不属于你」如实落 404 而非 403：403 确认该行存在，404 不确认。
+    const isAdmin = ability.can('manage', 'all');
+    const effect = await this.toolEffectsService.findByTarget(
+      resultType,
+      resultId,
+      isAdmin ? undefined : String(user.sub),
+    );
+    if (!effect) throw new NotFoundException('AI 副作用记录不存在');
+    let trace: DecisionTrace | null = null;
+    if (effect.conversationId) {
+      try {
+        trace = await this.decisionTraceService.getConversationTrace(effect.conversationId, String(user.sub), ability);
+      } catch {
+        // conversation 不存在（如脚本/外部直写副作用）→ trace 容错为 null，effect 仍返回
+        trace = null;
+      }
+    }
+    const target = await this.toolEffectsService.describeTarget(resultType, resultId);
+    // 级联补偿（docs/cascade-compensation.spec.md §7）：组大小供 A-3 显示「已撤销 N 条（级联）」
+    const cascadeSize = effect.compensationGroup
+      ? (await this.toolEffectsService.listGroup(effect.compensationGroup)).length
+      : 1;
+    return {
+      // D1 Action Detail 七段数据（Who/When/What/Result/Side Effects 后端齐备；Why 在 trace；Integrity 走哈希链 verify）
+      // A-3 生命周期：targetSoftDeleted 供前端推导「已撤销」态（撤销 = 目标软删）
+      effect: {
+        id: effect.id,
+        userId: effect.userId, // Who
+        toolName: effect.toolName, // What
+        argsHash: effect.argsHash,
+        conversationId: effect.conversationId,
+        resultType: effect.resultType, // Side Effects
+        resultId: effect.resultId,
+        createdAt: effect.createdAt, // When
+        targetExists: target.targetExists,
+        targetSoftDeleted: target.targetSoftDeleted,
+        targetTitle: target.targetTitle,
+        // 级联补偿 + A-3 恢复态（服务端单一权威口径，前端不各自复制判定）
+        revokeStatus: effect.revokeStatus ?? null,
+        compensationGroup: effect.compensationGroup ?? null,
+        parentEffectId: effect.parentEffectId ?? null,
+        cascadeSize,
+        restored: this.toolEffectsService.isRestored(effect, target.targetSoftDeleted),
+      },
+      trace,
+    };
+  }
+
+  /**
+   * ① 证据根（§internal.17 ①，docs/evidence-root.spec.md）：单条 Business Action 跨链证据根
+   * keelbase-audit-evidence/4（含覆盖声明；授权快照含 policy.revision + Decision Evidence + AI/operation 链行 + 副作用 + 根锚）。
+   * 本人或管理员；无副作用 404、非本人非 admin 403。
+   */
+  @Get('governance/evidence-root/:resultType/:resultId')
+  @ApiOperation({ summary: '业务动作证据根（AUDIT-ID，keelbase-audit-evidence/4，跨链离线验证）' })
+  async evidenceRoot(
+    @Param('resultType') resultType: string,
+    @Param('resultId', ParseIntPipe) resultId: number,
+    @CurrentUser() user: JwtPayload,
+    @CurrentAbility() ability: AppAbility,
+  ) {
+    return this.auditEvidence.getEvidenceRoot(resultType, resultId, String(user.sub), ability.can('manage', 'all'));
+  }
+
+  /**
+   * §internal.16 A-2 业务实体行为史：按业务对象（resultType+resultId）聚合跨来源行为史
+   * （AI 副作用 + AI 决策轨迹 + REST 写操作）。admin 或实体所有者。
+   */
+  @Get('governance/entity/:resultType/:resultId')
+  @ApiOperation({ summary: '业务实体行为史（Business History，§internal.16 A-2）' })
+  async businessHistory(
+    @Param('resultType') resultType: string,
+    @Param('resultId', ParseIntPipe) resultId: number,
+    @CurrentUser() user: JwtPayload,
+    @CurrentAbility() ability: AppAbility,
+  ) {
+    return this.businessHistoryService.historyForEntity(
+      resultType,
+      resultId,
+      String(user.sub),
+      ability.can('manage', 'all'),
+    );
+  }
+
+  /**
+   * D2-1d 治理策略（admin）：读当前策略（工具开关/确认/角色白名单/审计粒度），策略中心实时生效。
+   *
+   * AW-2 second half: the read is judged `read GovernancePolicy`. The write below (`PUT`) and
+   * `apply-preset` remain `manage all` — an auditor reviews the rule set, it does not rule.
+   *
+   * AW-2 续：读判 `read GovernancePolicy`。下面的写（`PUT`）与 `apply-preset` 仍是 `manage all` ——
+   * 审计读者**复核**规则集，不**制定**规则集。
+   */
+  @Get('governance/policy')
+  @CheckPolicies((ability) => ability.can('read', 'GovernancePolicy'))
+  @ApiOperation({ summary: '治理策略（admin）' })
+  async getGovernancePolicy(): Promise<GovernancePolicy> {
+    return this.governancePolicy.getPolicy();
+  }
+
+  /**
+   * P-③（§internal.17 ① P-③）：治理策略历史快照列表（admin，供「当时哪版规则」查看/回放比对）。
+   */
+  @Get('governance/policy/history')
+  @CheckPolicies((ability) => ability.can('read', 'GovernancePolicy'))
+  @ApiOperation({ summary: '治理策略历史列表（admin，P-③）' })
+  async getPolicyHistory(
+    @Query('limit', new DefaultValuePipe(50), ParseIntPipe) limit?: number,
+  ) {
+    return this.governancePolicy.getPolicyRevisionHistory(limit);
+  }
+
+  /**
+   * P-③（§internal.17 ① P-③）：单版本策略快照（admin，回放/人读比对）。
+   */
+  @Get('governance/policy/history/:revision')
+  @CheckPolicies((ability) => ability.can('read', 'GovernancePolicy'))
+  @ApiOperation({ summary: '治理策略历史快照（admin，P-③）' })
+  async getPolicyHistoryRevision(@Param('revision') revision: string) {
+    const snap = await this.governancePolicy.getPolicySnapshotByRevision(revision);
+    if (!snap) throw new NotFoundException('该策略版本不存在');
+    return snap;
+  }
+
+  /**
+   * D2-1d 治理策略（admin）：写策略（自有表 ai_governance_policy），实时生效，无需发版。
+   */
+  @Put('governance/policy')
+  @CheckPolicies((ability) => ability.can('manage', 'all'))
+  @ApiOperation({ summary: '更新治理策略（admin，实时生效）' })
+  async setGovernancePolicy(@Body() dto: GovernancePolicy): Promise<GovernancePolicy> {
+    return this.governancePolicy.setPolicy(dto);
+  }
+
+  /**
+   * §internal.15 策略模板库（admin）：三档预设（金融/政务/通用），供管理台一键导入，联动信创「开箱合规」。
+   */
+  @Get('governance/policy/presets')
+  @CheckPolicies((ability) => ability.can('manage', 'all'))
+  @ApiOperation({ summary: '治理策略预设模板（admin，金融/政务/通用）' })
+  getPolicyPresets() {
+    return this.governancePolicy.getPresets();
+  }
+
+  /**
+   * §internal.15 策略模板库（admin）：一键应用预设，写 ai_governance_policy 实时生效。
+   */
+  @Post('governance/policy/apply-preset')
+  @CheckPolicies((ability) => ability.can('manage', 'all'))
+  @ApiOperation({ summary: '应用治理策略预设（admin，实时生效）' })
+  async applyPolicyPreset(@Body('presetId') presetId: string): Promise<GovernancePolicy> {
+    return this.governancePolicy.applyPreset(presetId);
+  }
+
+  /**
+   * HS-3 撤销 AI 副作用：软删对应 event/todo（可经 RG-3 回收站恢复）
+   */
+  @Delete('tool-effects/:id')
+  @CheckPolicies((ability) => ability.can('manage', 'all'))
+  @ApiOperation({ summary: '撤销 AI 创建的事件/待办（管理员，软删可恢复）' })
+  async revokeToolEffect(@Param('id', ParseIntPipe) id: number) {
+    const result = await this.toolEffectsService.revoke(id);
+    if (!result) throw new NotFoundException('副作用记录不存在');
+    return result;
+  }
+
+  /**
+   * G1（docs/revoke-contract.spec.md §3 Case B / §4 G1）：批量撤销——一键撤销某会话（?conversationId=）
+   * 或某次 run 一次性授权（?runId=）产生的全部 AI 写副作用（本地软删可回收站恢复 / B 路径外部走补偿），
+   * 返回逐条+汇总。二选一，管理员视角任意作用域。
+   */
+  @Delete('tool-effects')
+  @CheckPolicies((ability) => ability.can('manage', 'all'))
+  @ApiOperation({ summary: '撤销某会话/某次 run 的全部 AI 副作用（管理员，批量，G1）' })
+  async revokeConversationEffects(
+    @Query('conversationId') conversationId?: string,
+    @Query('runId') runId?: string,
+  ) {
+    if (runId) return this.toolEffectsService.revokeRun(runId);
+    if (!conversationId) throw new BadRequestException('conversationId 或 runId 必填');
+    return this.toolEffectsService.revokeConversation(conversationId);
+  }
+
+  /**
+   * AI Action Center（§internal.17 北极星用户侧，docs/ai-action-center.spec.md）：本人 AI 写副作用清单。
+   * 本人作用域（service listOwned where userId）；无 admin 策略；数据最小化不回显 args/快照。
+   */
+  @Get('my/tool-effects')
+  @ApiOperation({ summary: '我的 AI 写副作用清单（本人，AI Action Center）' })
+  async listMyToolEffects(
+    @CurrentUser() user: JwtPayload,
+    @Query('page', new DefaultValuePipe(1), ParseIntPipe) page?: number,
+    @Query('limit', new DefaultValuePipe(20), ParseIntPipe) limit?: number,
+  ) {
+    return this.toolEffectsService.listOwned(String(user.sub), { page, limit });
+  }
+
+  /**
+   * GA 待我确认中心（docs/ai-action-center.spec.md §9）：**本人**确认记录。
+   * 返回本人发起的全部确认（待裁决 / 已决策 / 已超时）；`pending` 项带离线窗口截止 `expiresAt`。
+   * 已超离线窗口的 pending 不返回——判据与维护任务一致，避免「显示待确认、点了必然失败」。
+   */
+  @Get('my/confirmations')
+  @ApiOperation({ summary: '本人确认记录（待我确认中心，GA）' })
+  async listMyConfirmations(@CurrentUser() user: JwtPayload, @Query() query: MyConfirmationQueryDto) {
+    return this.myConfirmationService.list(String(user.sub), query.status ? { status: query.status } : {});
+  }
+
+  /**
+   * GA：**离线裁决**本人确认（对话之外，Action Center）。
+   * 幂等与越权由服务层的条件更新把关（重复点击 / 与对话内并发 → 一律不执行工具）；
+   * 不可离线裁决者（他人 token、R4 待他人审批、run 整批、已决策）→ 404（不泄露存在性）。
+   */
+  @Post('my/confirmations/:token/decide')
+  @SkipAudit()
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: '离线裁决本人确认（待我确认中心，GA）' })
+  async decideMyConfirmation(
+    @Param('token') token: string,
+    @Body() dto: ConfirmDecisionDto,
+    @CurrentUser() user: JwtPayload,
+    @Headers('accept-language') acceptLanguage?: string,
+  ) {
+    const res = await this.myConfirmationService.decide(token, String(user.sub), dto.decision);
+    if (!res.ok) {
+      // Same shape as the in-conversation 404: why it cannot be decided + how to recover.
+      // 与对话内确认 404 同形：说明为何不可裁决 + 恢复动作。
+      const lang = pickLanguageFromHeader(acceptLanguage);
+      throw new NotFoundException({
+        message:
+          lang === 'zh'
+            ? '确认请求不存在、已决策或不可离线裁决'
+            : 'Confirmation request not found, already decided, or not decidable offline',
+        explanation: buildDenialExplanation('confirmation_invalid', undefined, lang),
+      });
+    }
+    return res;
+  }
+
+  /**
+   * P0-15 用户侧撤销：本人撤销自己的 AI 副作用（软删可经 RG-3 回收站恢复）。
+   * 所有权校验在 service（effect.userId === 当前用户），非本人/不存在 → 404。
+   */
+  @Delete('my/tool-effects/:id')
+  @ApiOperation({ summary: '撤销本人 AI 创建的记录（本人，软删可恢复，P0-15）' })
+  async revokeMyToolEffect(
+    @Param('id', ParseIntPipe) id: number,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    const result = await this.toolEffectsService.revokeOwned(id, String(user.sub));
+    if (!result) throw new NotFoundException('副作用记录不存在');
+    return result;
+  }
+
+  /**
+   * G1 用户侧批量撤销（AI Action Center 本人作用域）：一键撤销本人在某会话（?conversationId=）
+   * 或某次 run（?runId=）产生的全部 AI 写副作用。
+   * ownerId 过滤在 service（只撤 effect.userId === 当前用户），非本人效果不在作用域 → 结果为空集不算越权。
+   */
+  @Delete('my/tool-effects')
+  @ApiOperation({ summary: '撤销本人在某会话/某次 run 的全部 AI 副作用（批量，G1）' })
+  async revokeMyConversationEffects(
+    @CurrentUser() user: JwtPayload,
+    @Query('conversationId') conversationId?: string,
+    @Query('runId') runId?: string,
+  ) {
+    const ownerId = String(user.sub);
+    if (runId) return this.toolEffectsService.revokeRun(runId, { ownerId });
+    if (!conversationId) throw new BadRequestException('conversationId 或 runId 必填');
+    return this.toolEffectsService.revokeConversation(conversationId, { ownerId });
+  }
+}

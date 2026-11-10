@@ -1,0 +1,29 @@
+version: '3.8'
+
+# 生产环境覆盖配置
+# 要求:
+#   1. 生成 TLS 证书到 ./certs/server.crt 和 ./certs/server.key
+#   2. 创建 ./webroot 目录（certbot webroot 续期的挑战应答目录）
+#   3. 运行: docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+# 注意: server 的 CORS_ORIGINS 需显式传真实前端源，如 CORS_ORIGINS=https://yourdomain.com
+
+services:
+  server:
+    environment:
+      - NODE_ENV=production
+      - CORS_ORIGINS=${CORS_ORIGINS:-https://front.app}
+    restart: always
+
+  web:
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      # 路径必须是 http.d/ 而非 conf.d/：基座是 Alpine 的 nginx 包，它的 nginx.conf 把
+      # conf.d 包含在 root 上下文（server{} 放那里会报错），server 块只认 http.d/
+      - ./nginx.https.conf:/etc/nginx/http.d/default.conf:ro
+      - ./certs/server.crt:/etc/ssl/certs/server.crt:ro
+      - ./certs/server.key:/etc/ssl/certs/server.key:ro
+      - ./webroot:/var/www/certbot:ro
+      - ./demo:/usr/share/nginx/html/demo:ro   # 官方演示视频静态资产（nginx /demo location）
+    restart: always

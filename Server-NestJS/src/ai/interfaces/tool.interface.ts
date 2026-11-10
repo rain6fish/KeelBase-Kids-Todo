@@ -1,0 +1,254 @@
+// SPDX-License-Identifier: Apache-2.0
+
+/**
+ * Tool（工具/函数调用）相关接口
+ *
+ * ToolDefinition 是传给 LLM 的 JSON Schema 格式，
+ * 也用于 Provider 层拼接 API 请求体。
+ */
+
+import { LlmUsage } from '../llm-usage';
+import type { DenialCause } from '../../common/errors/denial-guidance';
+
+/**
+ * One human-readable line about a tool call, addressed to whichever renderer will show it.
+ *
+ * The server used to build the sentence itself, in Chinese, and four surfaces render it **verbatim**
+ * — so the console showed Chinese in an English interface, which its bilingual red line forbids. The
+ * server now says *what* to say (`key` + `params`) and carries an English `fallback`; each renderer
+ * resolves the key in its own dictionary, and one that has no entry interpolates the fallback.
+ * Placeholders in `fallback` are `{name}`, matching the keys of `params`.
+ *
+ * 关于一次工具调用的一行人读文案，交给要显示它的那一端。
+ *
+ * 服务端过去自己把句子拼出来（中文），而四个面**原样渲染** —— 于是英文界面里显示中文，违反管理台
+ * 的双语红线。现在服务端只说**说什么**（`key` + `params`）并带一份英文 `fallback`；各端拿 key 去
+ * 自己的字典解析，没有条目的端就插值兜底。`fallback` 里的占位符写成 `{name}`，与 `params` 的键同名。
+ */
+export interface PresentationText {
+  /** 语义 key（各端 i18n 用），如 `ai.tool.createEvent` / `ai.present.write.createEvent` */
+  key: string;
+  /** 英文兜底（该端没有这条 i18n 时显示，占位符按 `params` 插值） */
+  fallback: string;
+  /** 插值参数；无参数的文案省略 */
+  params?: Record<string, string>;
+}
+
+/** 工具定义（传给 LLM 的 JSON Schema） */
+export interface ToolDefinition {
+  type: 'function';
+  function: {
+    name: string;
+    description: string;
+    parameters: Record<string, unknown>;
+  };
+}
+
+/** 工具参数定义 */
+export interface ToolParameter {
+  name: string;
+  type: 'string' | 'number' | 'boolean' | 'array' | 'object';
+  description: string;
+  required: boolean;
+  enum?: string[];
+}
+
+/** 工具执行结果 */
+export interface ToolResult {
+  success: boolean;
+  data?: unknown;
+  error?: string;
+  /**
+   * 工具**内部自行调用 LLM** 时的用量（多数工具没有）。
+   * 调用方把它记到该工具的 `tool_call` 审计行上——工具的开销记在工具自己那行，不混进对话行。
+   * ⚠ 不得进入 LLM 上下文：序列化 tool 消息前必须先剥离（见 ToolPresentationService.truncateToolResult）。
+   */
+  usage?: LlmUsage;
+}
+
+/**
+ * 工具风险等级（W5 Risk-based Tool Contract，评审二 §7）。
+ * 把工具执行从简单 Read/Write 升级为风险分级，对应执行策略：
+ *   R0 Informational → auto；R1 Read → auto；R2 Low-risk Write → policy（治理决定）；
+ *   R3 Business-sensitive Write → confirmation；R4 High-impact Action → human_approval；
+ *   R5 Irreversible / External Action → block（阻断）。
+ * 仅服务端关切，不暴露给 LLM。
+ */
+export type ToolRiskLevel = 'R0' | 'R1' | 'R2' | 'R3' | 'R4' | 'R5';
+
+export const RISK_STRATEGY: Record<ToolRiskLevel, string> = {
+  R0: 'auto',
+  R1: 'auto',
+  R2: 'policy',
+  R3: 'confirmation',
+  R4: 'human_approval',
+  R5: 'block',
+};
+
+/**
+ * 只读风险级（R0 Informational / R1 Read / R2 Low-risk Write）。
+ * MCP **导出侧** `annotations.readOnlyHint` 与**导入侧** `readOnly` 共用同一判据——
+ * 单一真源，防两处判定漂移（CE-2 PC-5：导入/导出对称）。
+ */
+export const READ_ONLY_RISK_LEVELS: readonly string[] = ['R0', 'R1', 'R2'];
+
+/**
+ * 解析工具风险级：显式声明优先；否则按既有语义派生——
+ * requiresConfirmation 写工具 → R3（业务敏感写），读工具 → R1（读）。
+ */
+export function resolveRiskLevel(
+  tool: Pick<AiTool, 'riskLevel' | 'requiresConfirmation'>,
+): ToolRiskLevel {
+  if (tool.riskLevel) return tool.riskLevel;
+  return tool.requiresConfirmation ? 'R3' : 'R1';
+}
+
+/**
+ * The "semantic write" predicate, single-sourced: a confirmation write, or risk R3/R4.
+ * Two consumers: the revokeClass gate in `ToolRegistry.register`, and the business-event
+ * assertion in the tool-metadata completeness gate. Out by design: R0–R2 (automatic /
+ * low-risk, see `READ_ONLY_RISK_LEVELS`) and R5 (blocked outright — it never runs).
+ *
+ * 「写语义」判据（单一真源）：确认写（`requiresConfirmation`）或风险级 **R3/R4**。
+ * 两处消费：`ToolRegistry.register` 的 revokeClass 闸 · 工具元数据完备性闸的「业务事件」断言。
+ * 边界（有意，与风险模型一致）：**R0–R2** 是自动/低风险类（见 `READ_ONLY_RISK_LEVELS`）、
+ * **R5** 恒阻断（永不执行）—— 都不在此列。
+ */
+export function isSemanticWrite(
+  tool: Pick<AiTool, 'requiresConfirmation' | 'riskLevel'>,
+): boolean {
+  const risk = resolveRiskLevel(tool);
+  return tool.requiresConfirmation === true || risk === 'R3' || risk === 'R4';
+}
+
+/**
+ * 副作用撤销能力分档（KB-6，语义源 docs/protocol-trust-proof-card.spec.md R9 / failure-path FP-3·FP-10）：
+ *   none              — 不可撤 / 外部未知（前端不显示撤销钮，不称"可撤销"）
+ *   local_compensate  — 本地软删补偿（自身副作用，可经 RG-3 回收站恢复）
+ *   governed_external — 受治理外部补偿（调目标系统补偿端点；"已请求补偿/结果未知"，禁止显示 revoked）
+ *   transactional     — 目标暴露可回滚接口、目标事务内回滚（现仅枚举预留，REST 代理不用）
+ * 与 run-level（KB-5）风险级/确认无关；仅服务端关切，不暴露给 LLM。
+ */
+// KB-6's single source now lives in governance-shared (S4-H4 C decision D5) so the shared side never
+// imports a value from this directory; it is re-exported here to keep every existing importer unchanged.
+// KB-6 的单源现住 governance-shared（S4-H4 C 决策 D5），共享侧因此不再从本目录取一个值；在此再导出，
+// 使既有 import 全部保持不变。
+import type { RevokeClass } from '../../governance-shared/services/revoke-class';
+export type { RevokeClass } from '../../governance-shared/services/revoke-class';
+export { resolveRevokeClass } from '../../governance-shared/services/revoke-class';
+
+/**
+ * Explainable Authorization（W5-⑦，评审四）：单条授权依据。
+ * 供 tool_start / confirmation_request 事件携带，前端渲染「为何允许 / 为何需确认」。
+ */
+export interface AuthorizationCheck {
+  name: string;
+  ok: boolean;
+  note?: string;
+}
+
+/** §internal.17③ Policy Evidence：授权时点生效的治理策略内容指纹（policy 版本）。 */
+export interface PolicyEvidence {
+  revision: string;
+  updatedAt?: string | null;
+}
+
+export interface AuthorizationReasons {
+  tool: string;
+  riskLevel: ToolRiskLevel;
+  riskStrategy: string;
+  requiresConfirmation: boolean;
+  checks: AuthorizationCheck[];
+  /** §internal.17③ 决策可复现：授权快照携带当时策略版本（内容指纹 revision：同内容恒同号、变更必变号；updatedAt 供人读）。 */
+  policy?: PolicyEvidence;
+}
+
+/**
+ * 授权拒绝（W5-⑦，评审四 §五 Why blocked）：工具被门控拒绝时抛出的结构化错误。
+ * 携带失败的检查清单，供 tool_end / 审计展示「为何阻止」。
+ * message 保持原拒绝文案（兼容既有 toThrow 断言）。
+ */
+export class AuthorizationDeniedError extends Error {
+  /**
+   * `denial` carries the language-agnostic kind + params for the shared `explanation` object.
+   * It is optional so existing throw sites that already say enough (`reasons`) keep working
+   * unchanged; the response boundary simply omits the explanation when it is absent.
+   *
+   * `denial` 携带共享 `explanation` 所需的「语言无关类别 + 参数」。它是可选的：已经说清楚的既有
+   * 抛出点（`reasons`）无需改动；响应边界在缺席时省略 explanation。
+   */
+  constructor(
+    message: string,
+    public readonly reasons: AuthorizationCheck[],
+    public readonly denial?: DenialCause,
+  ) {
+    super(message);
+    this.name = 'AuthorizationDeniedError';
+  }
+}
+
+/**
+ * 确认卡影响预览（§22.17 ④「级联撤销 / 业务补偿」的影响预览切片；spec docs/impact-preview.spec.md）。
+ * 写工具执行前告知将执行几个写动作、涉及哪些对象类型。**估计值，非承诺**。
+ * 对象类型取自副作用登记同一单源（`writeEffectTypeFor`），推导见 `src/ai/tool-effects/write-impact.ts`。
+ */
+export interface ConfirmationImpactTarget {
+  resultType: string;
+  count: number;
+}
+
+export interface ConfirmationImpact {
+  /** 写动作数；恒等于 targets 各 count 之和 */
+  actions: number;
+  targets: ConfirmationImpactTarget[];
+}
+
+/**
+ * 工具权限元数据（HS-2）：AI 执行工具前的门控依据。
+ * 仅服务端关切，不暴露给 LLM。
+ */
+export interface ToolPermissions {
+  /** 需已验证邮箱才能调用（对齐 HTTP 层 EmailVerificationGuard 的写操作语义） */
+  requireVerifiedEmail?: boolean;
+  /** 受特性开关约束：flag 关闭时工具不可调（对齐 PL-8 @FeatureFlag） */
+  featureFlag?: string;
+  /** 仅管理员可调 */
+  adminOnly?: boolean;
+}
+
+/** 工具接口 */
+export interface AiTool {
+  readonly name: string;
+  readonly description: string;
+  readonly parameters: ToolParameter[];
+
+  /** 写操作标记：为 true 时需人工确认后才执行（仅服务端关切，不暴露给 LLM） */
+  readonly requiresConfirmation?: boolean;
+
+  /** 风险等级（W5）：显式声明优先，未声明时由 requiresConfirmation 派生（R3/R1）。R5 = 阻断。 */
+  readonly riskLevel?: ToolRiskLevel;
+
+  /**
+   * 副作用撤销能力档位（KB-6）：未声明由 resolveRevokeClass 派生（确认写→local_compensate）。
+   * 写工具若确无本地软删目标（外部/不可撤），须显式声明 none 或 governed_external，避免误报"可撤销"。
+   */
+  readonly revokeClass?: RevokeClass;
+
+  /**
+   * 工具的目的地标识（授权时的约束面，AUTHZ-1）：写落到哪个系统。缺省 = 本地运行时（`local`）。
+   * B 路径 ProxyTool 声明目标系统 audience（取自 Settings `ai_proxy_tools.audience`）；
+   * 外部 MCP 工具的目的地由工具名键 `mcp_<server>_<tool>` 承载，不需在此声明。
+   * 确认 artifact 在签发时记下它、在执行时拿它与当前目的地比对 → 跨目标复用被拒（见 `tools/tool-destination.ts`）。
+   * 仅服务端关切，不暴露给 LLM。
+   */
+  readonly audience?: string;
+
+  /** 权限元数据（HS-2）：未声明则默认允许（数据隔离已由 execute 的 userId 保证） */
+  readonly permissions?: ToolPermissions;
+
+  /** 获取 LLM 可识别的工具定义（JSON Schema） */
+  toToolDefinition(): ToolDefinition;
+
+  /** 执行工具 */
+  execute(args: Record<string, unknown>, userId: string): Promise<ToolResult>;
+}

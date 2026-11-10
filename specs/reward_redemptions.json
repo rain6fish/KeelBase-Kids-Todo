@@ -1,0 +1,14 @@
+{
+  "module": "reward_redemptions",
+  "label": "兑换记录",
+  "fields": [
+    { "name": "rewardId", "type": "ref", "target": "rewards", "display": "title", "label": "奖励", "required": true },
+    { "name": "pointsSpent", "type": "int", "label": "消耗积分", "required": true },
+    { "name": "isCancelled", "type": "bool", "label": "已取消" },
+    { "name": "note", "type": "text", "label": "备注" }
+  ],
+  "aiTools": {
+    "query": true,
+    "create": { "riskLevel": "R3", "requiresConfirmation": true }
+  }
+}

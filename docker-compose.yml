@@ -1,0 +1,170 @@
+﻿version: '3.8'
+
+services:
+  postgres:
+    # Without this, one daemon restart or host reboot leaves the database stopped and both demo
+    # deployments dead until someone starts it by hand (2026-10-12, on the demo host).
+    # 没有它，一次 daemon 重启或宿主重启就会把库留在停止状态，两个 demo 部署全停，直到有人手工起它。
+    restart: unless-stopped
+    # pgvector 官方镜像（含 pgvector 扩展，用于 RAG 向量检索 AI-5）
+    image: pgvector/pgvector:pg17
+    # 从 .env.production 读 POSTGRES_DB/POSTGRES_USER/POSTGRES_PASSWORD（与 server 的 DB_* 同步）
+    env_file:
+      - ./Server-NestJS/.env.production
+    # 不暴露宿主机端口（仅容器内网被 server 访问）；调试需直连时用 `docker compose run -p 5432:5432 postgres`
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    # Same reason as postgres above. / 与上面的 postgres 同一条理由。
+    restart: unless-stopped
+    image: redis:7-alpine
+    # loopback-only 暴露：仅本机 localhost:6379（本地宿主开发 server/e2e 需连 Redis）。
+    # 容器内 server 仍走内部网络 redis://redis:6379；生产不绑 0.0.0.0，避免外网暴露。
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: server
+      args:
+        # node-gyp headers 下载源：中国区构建设 NODE_HEADERS_MIRROR=https://registry.npmmirror.com/-/binary/node
+        NODE_HEADERS_MIRROR: ${NODE_HEADERS_MIRROR:-https://nodejs.org/dist}
+    ports:
+      - "3000:3000"
+    # 持久化 /app/server/data（登录统计 login-stats.log、uploads 等）——容器重建（升级）不丢；reset 清库不碰文件
+    volumes:
+      - server-data:/app/server/data
+    # 密钥/密码从 .env.production 注入（deploy.sh / experience.sh 会生成随机密钥）。
+    # 容器内 ENCRYPTION_KEY 等缺失时，NestJS 配置校验会失败——因此启动前必须先有该文件。
+    env_file:
+      - ./Server-NestJS/.env.production
+    environment:
+      - PORT=3000
+      - DB_TYPE=postgres
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - REDIS_URL=redis://redis:6379
+      - CACHE_ENABLED=true
+      # 本编排自带 redis 服务（depends_on 健康检查），故显式开启队列；默认关闭是为「零配置无 Redis」场景
+      - QUEUE_ENABLED=true
+      # P1-3：本地模型编排（--profile private-ai 起 ollama 后生效；AI_PROVIDER=ollama 全走本地，数据不出域）
+      - OLLAMA_BASE_URL=http://ollama:11434
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/api/v1/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: web
+    ports:
+      - "80:80"
+    depends_on:
+      server:
+        condition: service_healthy
+
+  # ---- D2-5 独立治理控制平面（可选编排）----
+  # 业务系统（server）配 GOVERNANCE_URL=http://governance:3100 + GOVERNANCE_API_KEY 后，
+  # AI 审计/副作用双写上报治理台；治理台连独立治理库（postgres 的 governance 库）。
+  # 治理库自动建表（GovernanceDataSource synchronize）；独立容器，与业务 server 解耦部署。
+  governance:
+    # Same reason as postgres above. / 与上面的 postgres 同一条理由。
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: server
+    command: ["node", "dist/governance/main"]
+    ports:
+      - "3100:3100"
+    env_file:
+      - ./Server-NestJS/.env.production
+    environment:
+      - PORT=3100
+      - DB_TYPE=postgres
+      - GOVERNANCE_DB_HOST=postgres
+      - GOVERNANCE_DB_PORT=5432
+      - GOVERNANCE_DB_NAME=governance
+      - GOVERNANCE_TARGET_URL=http://server:3000
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3100/api/v1/ai/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  # ---- S-1/S-2 治理 sidecar（零代码接入，可选编排）----
+  # 业务系统 LLM base_url → http://sidecar:3200/v1 即零代码接入治理台（审计 + 工具门控）。
+  # 配 SIDECAR_UPSTREAM_URL/KEY（转发真实 LLM，env 覆盖）+ GOVERNANCE_URL=http://governance:3100（同一治理台）；
+  # SIDECAR_TOOLS 为工具风险级清单（默认空→全 R1 自动）。依赖 governance 健康后启动。
+  sidecar:
+    # Same reason as postgres above. / 与上面的 postgres 同一条理由。
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: server
+    command: ["node", "dist/governance-sidecar/main"]
+    ports:
+      - "3200:3200"
+    env_file:
+      - ./Server-NestJS/.env.production
+    environment:
+      - SIDECAR_PORT=3200
+      - SIDECAR_UPSTREAM_URL=${SIDECAR_UPSTREAM_URL:-https://api.deepseek.com}
+      - SIDECAR_UPSTREAM_KEY=${SIDECAR_UPSTREAM_KEY:-}
+      - GOVERNANCE_URL=http://governance:3100
+      - SIDECAR_TOOLS=${SIDECAR_TOOLS:-[]}
+      - SIDECAR_DEFAULT_TOOL_RISK=${SIDECAR_DEFAULT_TOOL_RISK:-R1}
+      - SIDECAR_CONFIRM_TTL_SECONDS=${SIDECAR_CONFIRM_TTL_SECONDS:-300}
+      - SIDECAR_POLICY_REFRESH_SECONDS=${SIDECAR_POLICY_REFRESH_SECONDS:-60}
+    depends_on:
+      governance:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3200/v1/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  # ---- P1-3 私有化 AI：本地模型（可选编排，--profile private-ai 启用）----
+  # 验证者 `docker compose --profile private-ai up -d ollama` 一键起本地模型；
+  # 后端配 OLLAMA_BASE_URL=http://ollama:11434 + AI_PROVIDER=ollama 即全走本地（数据不出域）。
+  # 注意：中国网络拉 Docker Hub ollama 镜像可能受限；也可用宿主机原生 Ollama
+  #       （OLLAMA_BASE_URL=http://host.docker.internal:11434 指向宿主，见 verify-private-ai.sh）。
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["private-ai"]
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+
+volumes:
+  pgdata:
+  server-data:
+  ollama-data:

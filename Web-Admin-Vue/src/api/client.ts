@@ -1,0 +1,212 @@
+// SPDX-License-Identifier: Apache-2.0
+
+import axios, { type AxiosInstance, type AxiosRequestConfig, type InternalAxiosRequestConfig } from 'axios'
+import { API_BASE_URL, API_TIMEOUT, GOVERNANCE_BASE_URL } from '@/utils/constants'
+import { storage } from '@/utils/storage'
+import { unwrapEnvelope, readErrorBody, deniedByOf, type NormalizedErrorBody } from './envelope'
+import { t } from '@/i18n'
+import { refreshAccessToken } from './session'
+
+const PUBLIC_ENDPOINTS = ['/auth/login', '/auth/refresh']
+
+let onAuthFailure: (() => void) | null = null
+
+/** 注入「刷新失败登出」回调（router guards / auth store 设置） */
+export function setOnAuthFailure(callback: () => void) {
+  onAuthFailure = callback
+}
+
+function isPublicEndpoint(path: string): boolean {
+  return PUBLIC_ENDPOINTS.some((ep) => path.includes(ep))
+}
+
+export class ApiError extends Error {
+  statusCode: number
+  errorCode?: string
+  /** NC-2：为什么（后端按 Accept-Language 返回，缺省无） */
+  reason?: string
+  /** NC-2：影响 */
+  impact?: string
+  /** NC-2：下一步怎么办 */
+  nextStep?: string
+
+  constructor(message: string, statusCode: number, errorCode?: string) {
+    super(message)
+    this.statusCode = statusCode
+    this.errorCode = errorCode
+  }
+}
+
+/** NC-2：错误带可执行指引（reason/impact/nextStep 任一存在）→ 前端走错误卡而非单句 toast */
+export function isActionableApiError(err: unknown): boolean {
+  return err instanceof ApiError && !!(err.reason || err.impact || err.nextStep)
+}
+
+/** 后端业务错误码判断：写操作邮箱未验证 403 */
+export function isEmailNotVerified(err: unknown): boolean {
+  return err instanceof ApiError && err.errorCode === 'EMAIL_NOT_VERIFIED'
+}
+
+const instance: AxiosInstance = axios.create({
+  baseURL: API_BASE_URL,
+  timeout: API_TIMEOUT,
+})
+
+instance.interceptors.request.use((config: InternalAxiosRequestConfig) => {
+  // NC-2：让后端按用户语言返回 message/reason/impact/nextStep（后端 Accept-Language 协商）
+  const locale = typeof localStorage !== 'undefined' ? localStorage.getItem('locale') : null
+  config.headers['Accept-Language'] = locale === 'zh' ? 'zh-CN' : 'en-US'
+  if (!isPublicEndpoint(config.url ?? '')) {
+    const { accessToken } = storage.readTokens()
+    if (accessToken) {
+      config.headers.Authorization = `Bearer ${accessToken}`
+    }
+  }
+  return config
+})
+
+instance.interceptors.response.use(
+  (response) => {
+    // 统一解包 { code, message, data, timestamp }：HTTP 2xx + code 0 → data（契约见 envelope.ts）
+    return unwrapEnvelope(response.data) as never
+  },
+  async (error) => {
+    const config = error.config as (AxiosRequestConfig & { _retry?: boolean }) | undefined
+    const status = error.response?.status as number | undefined
+    const path = config?.url ?? ''
+
+    // 401 且非公开端点 → 刷新一次重试
+    if (status === 401 && config && !config._retry && !isPublicEndpoint(path)) {
+      config._retry = true
+      const refreshed = await refreshAccessToken()
+      if (refreshed) {
+        const { accessToken } = storage.readTokens()
+        config.headers = { ...(config.headers ?? {}), Authorization: `Bearer ${accessToken}` }
+        try {
+          return await instance(config)
+        } catch (retryErr) {
+          // 重试仍失败（可能是刷新后新 401）
+          if ((retryErr as { response?: { status?: number } })?.response?.status === 401) {
+            storage.clearTokens()
+            onAuthFailure?.()
+          }
+          throw normalizeError(retryErr)
+        }
+      }
+      storage.clearTokens()
+      onAuthFailure?.()
+    }
+
+    return Promise.reject(normalizeError(error))
+  },
+)
+
+/** E-3 可行动错误提示：403 拒绝原因（Explainable Authz deniedBy）→ 「怎么办」引导 */
+function guidanceFor(deniedBy?: string): string {
+  const key =
+    deniedBy === 'casl'
+      ? 'errorGuidanceCasl'
+      : deniedBy === 'risk_policy'
+        ? 'errorGuidanceRiskPolicy'
+        : deniedBy === 'user_scoped'
+          ? 'errorGuidanceUserScoped'
+          : 'errorGuidanceDefault'
+  return ` · ${t(key)}`
+}
+
+/** `explanation` 是 403 / 确认 404 共用的拒绝指引（object 形）；老服务端可能是纯文本 */
+function explanationField(
+  explanation: NormalizedErrorBody['explanation'],
+  name: string,
+): string | undefined {
+  if (!explanation || typeof explanation !== 'object') return undefined
+  const value = (explanation as Record<string, unknown>)[name]
+  return typeof value === 'string' ? value : undefined
+}
+
+/** 把 axios 异常归一为 `ApiError`（导出供单测直接验证指引落地） */
+export function normalizeError(error: unknown): ApiError {
+  if (error instanceof ApiError) return error
+  const axiosErr = error as { response?: { status?: number; data?: unknown }; message?: string }
+  const status = axiosErr.response?.status ?? 0
+  const data = readErrorBody(axiosErr.response?.data)
+  let message =
+    data.message || (status === 0 ? 'Network error' : `Request failed with status ${status}`)
+  // Trust-grade errors：403 / 确认 404 的 `explanation` 自带「为什么 + 怎么解决」；
+  // 有它就不再追加泛化引导，避免同一句话出现两遍。
+  //
+  // The 403 / confirmation-404 `explanation` already carries why + next step; when present we skip
+  // the generic guidance so the same sentence does not appear twice.
+  const explanationReason = explanationField(data.explanation, 'reason')
+  const explanationNextStep = explanationField(data.explanation, 'nextStep')
+  if (status === 403 && !explanationNextStep) {
+    message += guidanceFor(deniedByOf(data.explanation))
+  }
+  const err = new ApiError(message, status, data.errorCode)
+  // NC-2：透传后端可执行指引（reason/impact/nextStep）；403/404 的指引在 `explanation` 里。
+  // NC-2: pass the backend's actionable guidance through; for 403/404 it lives in `explanation`.
+  err.reason = data.reason ?? explanationReason
+  err.impact = data.impact
+  err.nextStep = data.nextStep ?? explanationNextStep
+  return err
+}
+
+/** 与旧 api 封装对齐的调用面：get/post/patch/delete */
+export const api = {
+  get<T = unknown>(path: string, params?: Record<string, unknown>): Promise<T> {
+    return instance.get(path, { params }) as Promise<T>
+  },
+  post<T = unknown>(path: string, data?: unknown): Promise<T> {
+    return instance.post(path, data) as Promise<T>
+  },
+  put<T = unknown>(path: string, data?: unknown): Promise<T> {
+    return instance.put(path, data) as Promise<T>
+  },
+  patch<T = unknown>(path: string, data?: unknown): Promise<T> {
+    return instance.patch(path, data) as Promise<T>
+  },
+  delete<T = unknown>(path: string): Promise<T> {
+    return instance.delete(path) as Promise<T>
+  },
+}
+
+/**
+ * D2-5c 治理台专用 client：VITE_GOVERNANCE_URL 配置时治理端点指向独立治理控制平面；
+ * 未配置回落主应用（GOVERNANCE_BASE_URL = API_BASE_URL，行为不变）。
+ * 治理台认证用共享 admin JWT（与主应用同 JWT_SECRET）；治理台无 refresh 端点，不做 401 刷新。
+ */
+const governanceInstance: AxiosInstance = axios.create({
+  baseURL: GOVERNANCE_BASE_URL,
+  timeout: API_TIMEOUT,
+})
+
+governanceInstance.interceptors.request.use((config: InternalAxiosRequestConfig) => {
+  const { accessToken } = storage.readTokens()
+  if (accessToken) {
+    config.headers.Authorization = `Bearer ${accessToken}`
+  }
+  return config
+})
+
+governanceInstance.interceptors.response.use(
+  (response) => unwrapEnvelope(response.data) as never,
+  (error) => Promise.reject(normalizeError(error)),
+)
+
+/** D2-5c 治理台 client：与 api 同调用面（解包 data），VITE_GOVERNANCE_URL 未配置回落主应用 */
+export const governanceApi = {
+  get<T = unknown>(path: string, params?: Record<string, unknown>): Promise<T> {
+    return governanceInstance.get(path, { params }) as Promise<T>
+  },
+  post<T = unknown>(path: string, data?: unknown): Promise<T> {
+    return governanceInstance.post(path, data) as Promise<T>
+  },
+  put<T = unknown>(path: string, data?: unknown): Promise<T> {
+    return governanceInstance.put(path, data) as Promise<T>
+  },
+  delete<T = unknown>(path: string): Promise<T> {
+    return governanceInstance.delete(path) as Promise<T>
+  },
+}
+
+export default instance

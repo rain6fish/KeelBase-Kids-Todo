@@ -1,0 +1,71 @@
+{
+  "name": "keelbase",
+  "version": "1.3.0",
+  "description": "KeelBase CLI — 按基座约定生成业务模块（EASY-2 开发期 AI）。`npx keelbase init` 对话式/自然语言生成全栈 CRUD 模块（NestJS + Flutter）。",
+  "type": "module",
+  "bin": {
+    "keelbase": "./scripts/keelbase-init.mjs"
+  },
+  "files": [
+    "scripts/generator",
+    "scripts/keelbase-init.mjs",
+    "scripts/keelbase-inspect.mjs",
+    "scripts/keelbase-doctor.mjs"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "keywords": [
+    "keelbase",
+    "nestjs",
+    "flutter",
+    "scaffold",
+    "cli",
+    "crud",
+    "ai"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rain6fish/KeelBase.git"
+  },
+  "scripts": {
+    "preflight": "node scripts/keelbase-doctor.mjs --env",
+    "prereqs": "node scripts/prereqs.mjs",
+    "cli:test": "node --test \"scripts/*.test.mjs\"",
+    "review:ocr": "node scripts/ocr-release-review.mjs",
+    "spec:check": "node scripts/check-business-specs.mjs",
+    "check:app-model": "node scripts/check-app-model.mjs",
+    "check:boundary": "node scripts/check-core-boundary.mjs",
+    "check:frontend-boundary": "node scripts/check-frontend-boundary.mjs",
+    "check:governance-imports": "node scripts/check-governance-imports.mjs",
+    "check:java-vectors": "node scripts/check-java-vector-sync.mjs",
+    "check:coverage-gaps": "node scripts/check-coverage-gaps-sync.mjs",
+    "check:mobile-preview": "node scripts/check-mobile-preview.mjs",
+    "check:version-parity": "node scripts/check-version-parity.mjs",
+    "check:test-types": "node scripts/check-test-types.mjs",
+    "check:audit-awaited": "node scripts/check-audit-writes-awaited.mjs",
+    "check:audit-write-points": "node scripts/check-audit-write-points.mjs",
+    "check:entity-migrations": "node scripts/check-entity-migrations.mjs",
+    "check:tool-labels": "node scripts/check-tool-label-parity.mjs",
+    "check:audit-vocabulary": "node scripts/check-audit-vocabulary.mjs",
+    "check:generated-samples": "node scripts/check-generated-samples.mjs",
+    "check:contract-matrix": "node scripts/check-contract-matrix.mjs",
+    "check:env-example": "node scripts/check-env-example.mjs",
+    "check:readme-parity": "node scripts/check-readme-parity.mjs",
+    "check:admin-pages": "node scripts/check-admin-pages.mjs",
+    "check:family-block": "node scripts/check-family-block.mjs",
+    "check:app-wiring": "node scripts/check-app-wiring.mjs",
+    "check:evidence-canonical": "node Server-NestJS/scripts/check-evidence-canonical.mjs",
+    "check:semantic-single-source": "node Server-NestJS/scripts/check-semantic-single-source.mjs --base origin/main --worktree",
+    "check:terminology": "node Server-NestJS/scripts/check-protocol-language.mjs",
+    "check:navigation-parity": "node scripts/check-navigation-parity.mjs",
+    "check:protocol-vectors": "node scripts/require-contract-submodule.mjs && node Server-NestJS/scripts/generate-protocol-vectors.mjs --check",
+    "check:keelbase-init": "node scripts/keelbase-init.mjs inspect && node scripts/keelbase-init.mjs doctor",
+    "check:gates-wired": "node scripts/check-gates-wired.mjs",
+    "check:all": "node scripts/check-all.mjs"
+  },
+  "devDependencies": {
+    "autocannon": "^8.0.0"
+  }
+}

@@ -1,0 +1,935 @@
+# KeelBase CI（GitHub Actions，仓库镜像到 GitHub 后触发）
+# 测试密钥在运行时用 openssl rand 随机生成，不入库、不落盘，避免公开仓库泄露。
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  NODE_VERSION: '22'
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Server-NestJS
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: Server-NestJS/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+
+  # 密钥泄漏扫描（gitleaks）：防真实密钥/令牌/私钥入库。
+  # demo 凭据（README/docs 中故意公开的演示账号）在 .gitleaks.toml 白名单内，属预期。
+  # 用 gitleaks/gitleaks-action@v3（Node 24 运行时 + 预编译二进制）替代 v8.x action——
+  # 旧 action 每次从源码 Docker 构建（git describe --tags 无 tag 时报 128），GitHub 换 runner 后持续失败。
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+          fetch-depth: 0
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .gitleaks.toml
+          GITLEAKS_ENABLE_COMMENTS: "false"
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
+
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Server-NestJS
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: Server-NestJS/package-lock.json
+      - run: npm ci
+      - name: 生成随机测试密钥
+        run: |
+          echo "ENCRYPTION_KEY=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+          echo "ENCRYPTION_HMAC_KEY=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+          echo "JWT_SECRET=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+          echo "JWT_REFRESH_SECRET=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+      # 装配冒烟（C-6）：三个进程入口模块各实例化一次。单列一步，红了直接指着哪个 provider 缺；
+      # 本地 `npm run check:all` 跑同一道门禁，故这类断裂（构造器加了依赖、模块没补 provider）在推之前
+      # 就看得见，而不是只在这条 CI 的单测 job 里。
+      - name: 装配冒烟（AppModule / GovernanceModule / SidecarModule 实例化）
+        working-directory: .
+        run: npm run check:app-wiring
+      - run: npm run test:cov
+        env:
+          ENCRYPTION_KEY: ${{ env.ENCRYPTION_KEY }}
+          ENCRYPTION_HMAC_KEY: ${{ env.ENCRYPTION_HMAC_KEY }}
+      # 覆盖率产物公开上传：第三方/选型核查可下载真实覆盖率（lcov），打破「覆盖率 0%」测量缺口
+      - name: 上传后端覆盖率报告（lcov）
+        uses: actions/upload-artifact@v5
+        with:
+          name: coverage-backend
+          path: Server-NestJS/coverage/lcov.info
+          if-no-files-found: warn
+      - run: npm run test:e2e
+        env:
+          NODE_ENV: test
+          JWT_SECRET: ${{ env.JWT_SECRET }}
+          JWT_REFRESH_SECRET: ${{ env.JWT_REFRESH_SECRET }}
+          ENCRYPTION_KEY: ${{ env.ENCRYPTION_KEY }}
+          ENCRYPTION_HMAC_KEY: ${{ env.ENCRYPTION_HMAC_KEY }}
+          DB_TYPE: sqlite
+          DB_PATH: ./data/test.sqlite
+
+  migration-consistency:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Server-NestJS
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: Server-NestJS/package-lock.json
+      - run: npm ci
+      # 用已提交迁移建库，再生成对比：实体与迁移一致 → "No changes" 退出码非零但无文件 → 通过
+      - name: 校验迁移与实体一致
+        run: |
+          rm -f ./data/consistency.sqlite
+          export DB_PATH=./data/consistency.sqlite
+          export ENCRYPTION_KEY=$(openssl rand -hex 32)
+          export ENCRYPTION_HMAC_KEY=$(openssl rand -hex 32)
+          npm run migration:run
+          # typeorm migration:generate 对「无变化」返回退出码 1；bash -e 下命令替换失败会直接中止，
+          # 需 || true 让其非致命，再由下方 if ls 判断是否真产生漂移文件。
+          OUTPUT=$(npm run migration:generate -- src/migrations/_ConsistencyCheck 2>&1 || true)
+          echo "$OUTPUT"
+          if ls src/migrations/*_ConsistencyCheck* 2>/dev/null; then
+            echo "::error::实体新增了未迁移的变更，请运行 migration:generate 提交迁移"
+            exit 1
+          fi
+
+  # postgres 迁移一致性（roadmap 未做项）：真实 pgvector/pg17 上全量白名单迁移跑通 +
+  # 实体↔迁移无漂移。防 postgres 方言回归——如 sqlite-only 迁移误入 postgres 白名单
+  # 导致 AUTOINCREMENT 语法失败（曾由 80528d0 修复，需 CI 持续拦截）。
+  migration-consistency-postgres:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Server-NestJS
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: keelbase_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: Server-NestJS/package-lock.json
+      - run: npm ci
+      - name: postgres 全量迁移跑通 + 一致性
+        env:
+          DB_TYPE: postgres
+          DB_HOST: localhost
+          DB_PORT: 5432
+          DB_USER: postgres
+          DB_PASSWORD: postgres
+          DB_NAME: keelbase_ci
+        # 复用 scripts/check-pg-migration-consistency.mjs（本地 npm run migration:consistency:pg 同源，
+        # 消除 CI/本地两处逻辑漂移——sqlite 绿不代表 pg 无漂移，本脚本是 pg 方言防线）
+        run: node scripts/check-pg-migration-consistency.mjs
+
+  # An entity whose table no migration creates. The `migration-consistency` jobs above do catch this,
+  # but they need a database and they run after the push — which is how the two modules from `c81232a0`
+  # left main red for about ten hours. This one is static (the tables are in the migrations' SQL), so it
+  # also runs in `npm run check:all`, which is the look taken *before* the push.
+  #
+  # 实体有表、却没有任何迁移建它。上面两个 `migration-consistency` job 确实会逮到，但它们要数据库，
+  # 而且在**推送之后**才跑 —— `c81232a0` 那两个模块就是这样让 main 红了约十小时。这一道是静态的
+  # （建了哪些表就在迁移的 SQL 里），因此也进得了 `npm run check:all`，那是**推送之前**看的那一眼。
+  entity-migrations:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - run: node scripts/check-entity-migrations.mjs
+
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Server-NestJS
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: Server-NestJS/package-lock.json
+      - run: npm ci
+      - run: npm run build
+
+  # 测试类型棘轮（scripts/check-test-types.mjs）：生产类型已由上面的 build job 守着
+  # （tsconfig.build.json 排除 spec），但**测试文件从来没被类型检查过**——ts-jest 只转译、不做诊断，
+  # 于是错误静默累积（实测 214 个，其中 TS2339/TS2345 正标记「测试与接口已对不上」）。
+  # 本 job 只要求「不再变多」：把不可见的变可见，而不逼着现在做一次 200 处的大扫除。
+  # 数目降下来时，把脚本里的 BASELINE 调小即锁住改善。
+  test-types:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: Server-NestJS/package-lock.json
+      - run: cd Server-NestJS && npm ci
+      - run: node scripts/check-test-types.mjs
+
+  # 架构边界门禁（docs/architecture-boundary.md）：
+  #   core-boundary      = Core 无 UI 框架依赖、无前端代码引用；
+  #   frontend-boundary  = Frontend→Runtime 反向（FE-1-repo / ADR-0002 Rev-8）——前端/旗舰/模板无跨仓 import、无 runtime 身份分支；
+  #   governance-imports = 治理台对 src/ai 的 import 棘轮（S4-H4-C 清零路上不许新增，基线见脚本）。
+  # Architecture boundary gates: the governance→ai import ratchet rides here — it fails on any new
+  # `../ai` import under src/governance, and only hints when one disappears.
+  core-boundary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - run: node scripts/check-core-boundary.mjs
+      - run: node scripts/check-frontend-boundary.mjs
+      - run: node scripts/check-governance-imports.mjs
+
+  # 导航对账门（CE-2 缺口 PC-6，零依赖 node 内置）：后端 AI 导航映射 ↔ 客户端路由双向对账——
+  # 无死链（后端 route 必须存在于客户端路由）+ 无孤页（客户端顶层页须可 AI 导航或显式 ALLOWLIST）。
+  # 四源：admin-pages.ts / Web-Admin-Vue routes.ts / navigate-page.tool.ts / Flutter app_router.dart。
+  navigation-parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - run: node scripts/check-navigation-parity.mjs
+
+  # 工具标签对账门（零依赖 node 内置）：单一真源 = 后端 src/ai/audit/tool-metadata.ts。
+  # 单向：后端可能发的 `ai.tool.*` key，管理台 zh/en 两字典都必须有（多余的 key 允许 ——
+  # 外部系统（B 路径代理 / Java 参考工具）的名字不在本仓注册，给它们配标签是对的）；
+  # 并检 zh/en 同键集。此前漂移过：字典给四个不存在的工具留了标签，12 个真工具一条都没有。
+  tool-label-parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - run: node scripts/check-tool-label-parity.mjs
+
+  # 审计词汇门（零依赖 node 内置）：让一条审计记录读成一句话的**另外三个环节**（`tool-label-parity`
+  # 守的是「元数据 → 字典」那一个方向）。① 注册工具 → 元数据；② `AuditEntry.action` 取值 → 动作标签；
+  # ③ 动作标签 key → 管理台 zh/en 两字典。**为什么加**：2026-10-16 量出六个**生成模块**的工具注册了、
+  # 在 `/ai/tools` 里看得见、却一条业务标签都没有（`effect_revoke` 同理），而**两处都不红任何闸** ——
+  # 因为没人守这两个方向。fail-closed：解析出空集是错误，不是「更小的表」。
+  audit-vocabulary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - run: node scripts/check-audit-vocabulary.mjs
+
+  # 版本对账门（零依赖 node 内置）：产品版本单一真源 = 根 package.json。发版线成员（根 / Server-NestJS）
+  # 须等于它；各 lockfile 根版本字段跟随其自身清单；前端显示版本常量跟随产品版本。
+  # 并**直检**两个运行时权威源（生成器 provenance / 后端 /app/version）必在发版线成员内——
+  # 防「权威源停更 → 生成物错版 + 自比成假绿」。三端前端清单版本已松绑、各自持版。
+  version-parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - run: node scripts/check-version-parity.mjs
+
+  # A committed sample must still be what the generator produces from its spec. A fix applied to the
+  # generated artifact instead of the template looks right and passes the tests, then the next
+  # regeneration drops it — which is how the runtime identity guard left `reports` once.
+  #
+  # 已检入的样例必须仍是生成器按其 spec 产出的样子。修法加在**生成物**而非**模板**上，看着对、测试也过，
+  # 而下一次重生成会把它丢掉 —— 运行时身份守卫正是这样从 `reports` 里走失过一次。
+  generated-samples:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - run: node scripts/check-generated-samples.mjs
+
+  # The compatibility matrix's `main` row names a contract version; nothing else reads it, so it rots
+  # when the submodule pin moves between releases. A pin ahead of its tag warns (the named version is
+  # still the newest released one); a named version that is not the pin's tag fails.
+  #
+  # 兼容矩阵的 `main` 行写着一个契约版本；没有别的东西读它，故 pin 在两次发版之间前进时它会悄悄烂掉。
+  # pin 领先 tag 只告警（写着的仍是最新已发布的版本）；写的版本根本不是 pin 的 tag 才失败。
+  contract-matrix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      # A tag's push can land after the pin's commit, and this run can start before the tag is visible:
+      # the gate then reads the previous release and calls a late release drift. Wait for the version
+      # the matrix names, then let the gate decide — the wait is bounded and advisory, and the gate
+      # below is unchanged. A stale matrix (the real failure on 2026-10-20) is not rescued by waiting:
+      # the tag was already visible there, and the gate must still say so.
+      #
+      # tag 的推送可能晚于 pin 的提交，而本 run 又可能早于 tag 可见：此时门禁读到的是上一个版本，把「发布
+      # 来晚了」判成漂移。先等矩阵写着的那个版本，再让门禁自己判 —— 等待有界、只是辅助，下面的门禁判据
+      # 一字未改。矩阵本身写旧了（2026-10-20 那次真正的红）**不是**等待能救的：当时 tag 已经可见，门禁
+      # 仍须照报。
+      - name: Wait for the contract tag the matrix names (bounded)
+        run: |
+          tag=$(grep -E 'KeelBase.*`main`' README.md | head -1 | grep -oE '\*\*v[0-9]+\.[0-9]+\.[0-9]+\*\*' | head -1 | tr -d '*')
+          if [ -z "$tag" ]; then
+            echo "No **vX.Y.Z** on the \`main\` row — the gate below reports it."
+            echo "\`main\` 行没有 **vX.Y.Z** —— 交给下面的门禁报。"
+            exit 0
+          fi
+          scripts/wait-for-contract-ref.sh --repo Server-NestJS/specs/protocol --ref "refs/tags/$tag" || true
+      - run: node scripts/check-contract-matrix.mjs
+
+  # Every environment variable the config schema declares must be in .env.example — a variable that
+  # exists only in the schema is one a new deploy never learns about (35 had drifted out by 2026-10-11).
+  #
+  # 配置 schema 声明的每个环境变量都必须在 .env.example 里 —— 只活在 schema 里的变量，新部署永远不会知道
+  # （2026-10-11 实测已漂出 35 个）。
+  env-example:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - run: node scripts/check-env-example.mjs
+
+  # The two READMEs are mirrors: they must link the same documents, and every link must resolve.
+  # The English one had quietly grown 11 links the Chinese one never got.
+  #
+  # 两版 README 是镜像：必须链同一批文档，且每条都要能解析。英文版曾悄悄长出中文版从没有的 11 条链接。
+  readme-parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - run: node scripts/check-readme-parity.mjs
+
+  # The "KeelBase family" section is one document written into several repositories' READMEs. This
+  # checks that this repository's copy still matches the source it was generated from, and that no
+  # copy anywhere in the family has been hand-edited. A sibling checkout that is absent is reported
+  # as skipped, never as a failure: CI checks out one repository, not the family.
+  #
+  # 「KeelBase 家族」段是一份文档、写进多个仓的 README。这里校验本仓那一份仍与生成它的来源一致，
+  # 并确认家族里任何一份都没被手改。未检出的兄弟仓如实报 skipped、不算失败——CI 只检出本仓。
+  family-block:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - run: node scripts/check-family-block.mjs
+      - run: node scripts/sync-family-block.mjs --check
+
+  # A gate nobody runs is worse than no gate: it reads as coverage and gives none. One was found in that
+  # state (check:java-vectors), already drifted red.
+  #
+  # 没人跑的门禁比没有门禁更糟：它读起来像覆盖、实际一点也没有。已逮到一道正在这个状态里
+  # （check:java-vectors），而且已经漂成红的了。
+  gates-wired:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - run: node scripts/check-gates-wired.mjs
+
+  # Every admin page in the tree must be named in the module map CLAUDE.md §13 carries — the page map an
+  # agent reads before touching the console. It had drifted to 19 entries against 41 view directories.
+  #
+  # 管理台每个页面都必须在 CLAUDE.md §13 那份页面地图里点名 —— 那是 agent 动控制台之前读的地图。它曾漂到
+  # 「19 条 vs 41 个 views 目录」。
+  admin-pages:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - run: node scripts/check-admin-pages.mjs
+
+  # Every AI-audit write point (`auditService.log` / `this.audit.log` under Server-NestJS/src) must
+  # answer its own `outcome`/`tool` — or say in writing why not (C-4). This is what keeps a new write
+  # point from quietly skipping the two off-chain attribution columns. Sibling of `check-audit-awaited`
+  # (does the write happen at all) and of `check-tool-labels` (the word tables); this one is about the
+  # columns being named at the call site.
+  #
+  # 每个 AI 审计写入点（Server-NestJS/src 下的 `auditService.log` / `this.audit.log`）都要答出自己的
+  # `outcome`/`tool` —— 或写明为何不答（C-4）。这正是不让新增写入点悄悄跳过那两列链外归因列的机制。
+  # 与 `check-audit-awaited`（写在不在）和 `check-tool-labels`（词表）同级；本闸管的是调用点上点不点名这两列。
+  audit-write-points:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - run: node scripts/check-audit-write-points.mjs
+
+  # The contract is not edited here. The protocol contract lives in rain6fish/keelbase-contract; this
+  # repository consumes it as a gitlink at Server-NestJS/specs/protocol. The gitlink is itself the
+  # guarantee: git cannot record a file inside a submodule entry, so that state has nothing to guard.
+  # What does need guarding is the state *without* that guarantee — if the path is not a gitlink at
+  # HEAD, the only proof that it was not edited is a diff against a usable base. With no usable base
+  # (new ref, or a base commit this clone does not have) the job used to print "skipping" and exit 0,
+  # i.e. it passed without proving anything; it now fails closed there. A red here means "cannot
+  # verify", not "edited" — the two cases print different messages.
+  # Evidence it is needed: within a day of the extraction the directory was edited three times in this
+  # repository (a sample token, the registry, and two objects to v2), all in good faith — the editors
+  # had no reason to read those as protocol changes.
+  #
+  # 契约不在本仓编辑。协议契约住在 rain6fish/keelbase-contract，本仓以 gitlink 消费它（Server-NestJS/specs/protocol）。
+  # gitlink 本身就是保证：git 无法在 submodule 条目里记录文件，所以那个状态本就没有可守的东西。
+  # 真正要守的是**没有**这层保证的状态 —— 若该路径在 HEAD 下不是 gitlink，唯一能证明它未被改动的，
+  # 是拿一个可用的基点做 diff。而过去在没有可用基点时（新 ref，或本克隆没有那个基点提交），本 job
+  # 打印「跳过」并 exit 0，等于什么都没证明就放行；现在这种情况一律 fail-closed 判红。
+  # 这里的红表示「无法核验」，不是「被改动」—— 两种情况打印的是不同的话。
+  # 需要它的实证：抽取后一天内本目录在主仓被改过三次（一个样例 token、registry、两个对象升 v2），
+  # **三次都是善意**——改的人没有理由把那些读成「协议变更」。
+  contract-not-edited-here:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+          fetch-depth: 0   # 需要 diff base
+      - name: specs/protocol must be consumed, never edited
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -euo pipefail
+          path=Server-NestJS/specs/protocol
+          mode=$(git ls-tree HEAD -- "$path" | awk '{print $2}')
+          if [ "$mode" = "commit" ]; then
+            echo "specs/protocol is a submodule here — the tree itself prevents edits; nothing to check."
+            echo "specs/protocol 在本仓是 submodule —— 结构本身即防住编辑，本门禁无事可做。"
+            exit 0
+          fi
+          # Not a submodule at HEAD: only a diff against a usable base can show it was not touched.
+          # 本仓 HEAD 下它不是 submodule：只有对着可用基点的 diff 才能证明它没被动过。
+          reason=""
+          if [ -z "${BASE_SHA:-}" ] || [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            reason="no diff base (new branch or first push)"
+          elif ! git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+            reason="diff base $BASE_SHA is not in this clone"
+          fi
+          if [ -n "$reason" ]; then
+            echo "::error::specs/protocol is not a submodule here — this run cannot prove it was not edited."
+            echo "本仓的 specs/protocol 不是 submodule —— 本次运行无法证明它未被改动。"
+            echo "Why / 原因: $reason"
+            echo "Consume the contract as a gitlink (see .gitmodules); if this ref predates the switch (a623345e), rebase it."
+            echo "请按 .gitmodules 以 gitlink 消费契约；若本 ref 早于 submodule 改造（a623345e），请先 rebase。"
+            exit 1
+          fi
+          changed=$(git diff --name-only "$BASE_SHA" HEAD -- "$path/")
+          if [ -n "$changed" ]; then
+            echo "::error::Server-NestJS/specs/protocol is not edited in this repository — the contract lives in rain6fish/keelbase-contract"
+            echo "本仓不得改动 Server-NestJS/specs/protocol —— 协议契约住在 rain6fish/keelbase-contract。"
+            echo "Change it there instead (additive rules: see that repository's README §Versioning), then advance the pin here."
+            echo "请在契约仓落地（加性规则见其 README §版本与演进），再来本仓把 pin 前进。"
+            echo "Files changed / 被改动的文件:"
+            echo "$changed"
+            exit 1
+          fi
+          echo "specs/protocol unchanged. / specs/protocol 未改动。"
+
+  # 治理协议语料漂移门禁（A1 / CE-1，零依赖 node 内置）：用本仓的生成器重算金样本，与已提交语料逐份 diff。
+  # 语义变更必须先落 specs/protocol 语料版本再改实现（CE-1 L3 单源规则），否则金样本 diff 红。
+  #
+  # 这里**不**跑 `verify-protocol-conformance.mjs`：它已随 runner 搬进契约仓，而契约仓自己的 CI 每次 push 都在
+  # 跑同一份 runner、对同一份语料 —— 再跑一遍判据不会多抓到什么（本 job 的 `--check` 绿 ⇒ 所钉语料 == 算法产出
+  # ⇒ 那套断言必绿）。生成器是**本仓独有**的（契约仓 CI 不跑它，它是语料的产出方），故这一步留在这里。
+  protocol-conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - run: node Server-NestJS/scripts/generate-protocol-vectors.mjs --check
+
+  # The sibling runtime's vendored vector corpus can fall behind silently, because neither
+  # repository's CI can see the other one: this repository carries the contract submodule at the
+  # version it consumes, while the Java repository compares its snapshot against the version *it*
+  # answers for. When the contract advances here and that pin stays put, both CIs stay green and
+  # nobody is told — which is how the drift this gate exists for went unseen on 2026-10-11. Checking
+  # the consumer out onto the same runner is the step that makes the lag say something.
+  #
+  # 同级运行时的 vendored 语料会**无声地**落后：两仓 CI 互相看不见对方 —— 本仓带着自己消费的那版契约
+  # submodule，Java 仓拿**它自己应答的那版**比它自己的快照。于是「契约在本仓前进了、那个 pin 还停在
+  # 原处」时两侧都是绿的、没人被告知 —— 2026-10-11 那次漂移正是这么没人看见的。把消费者检出到同一个
+  # runner 上，是让那次滞后开口说话的那一步。
+  #
+  # KeelBase4J is public, so the default token reads it; no secret is involved.
+  # KeelBase4J 是公开仓，默认 token 即可读出，不涉及任何密钥。
+  java-vector-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true          # 向量住在契约 submodule 里 / the vectors live in the contract submodule
+      - name: Check out the sibling runtime this gate compares against
+        uses: actions/checkout@v5
+        with:
+          repository: rain6fish/KeelBase4J
+          ref: main
+          path: java-repo
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      # The sibling is read at *its* main, which can still be receiving the vendored update this gate
+      # compares against — a push-order race, not drift (2026-10-20: run 39413671268 checked KeelBase4J
+      # out at 3e2f2f54, a main that predated the sync commit). Retry within a bounded budget,
+      # refetching main between attempts. Exit 1 (drift / coverage gap) is retried; exit 2 (broken
+      # checkout, unparseable schema) is not — that is a malfunction, not lateness. The comparison
+      # itself is unchanged, so genuine drift still exhausts the budget and fails. A lag longer than
+      # the budget is still red: this buys an in-flight push time, it does not stand in for ordering
+      # the sibling's push before this one.
+      #
+      # 同级运行时是按**它的** main 读的，而那份 vendored 更新可能还在推送途中 —— 这是推送顺序的竞态，
+      # 不是漂移（2026-10-20，run 39413671268 检出的 KeelBase4J main 是 3e2f2f54，早于同步提交）。判据
+      # 本身不变，只在有界预算内重试、每次重试前重取 main。退出码 1（漂移 / 覆盖缺口）重试；退出码 2（检出
+      # 损坏、schema 解析不了）不重试 —— 那是真故障，不是来晚了。真漂移仍会耗完预算后红。**超出预算的滞后
+      # 仍然红**：这里买到的只是「推送在途」的时间，不能替代「先推同级仓、再推本仓」的顺序。
+      - name: Compare against the sibling runtime (bounded wait for its main)
+        run: |
+          attempts=6
+          delay=20
+          attempt=1
+          while :; do
+            rc=0
+            node scripts/check-java-vector-sync.mjs --java java-repo || rc=$?
+            if [ "$rc" -eq 0 ]; then
+              # The second check rides on the same checkout: the coverage-gap registry's Java copy has
+              # the same failure mode (a vendored copy nobody compares).
+              # 第二道检查搭同一个 checkout：缺口登记表的 Java 副本有同样的失效模式（一份没人比对的副本）。
+              node scripts/check-coverage-gaps-sync.mjs --java java-repo || rc=$?
+              if [ "$rc" -eq 0 ]; then
+                exit 0
+              fi
+            fi
+            if [ "$rc" -ne 1 ]; then
+              exit "$rc"
+            fi
+            if [ "$attempt" -ge "$attempts" ]; then
+              exit 1
+            fi
+            echo "::warning::Sibling corpus not in agreement yet (attempt $attempt/$attempts) — refetching KeelBase4J main and retrying in ${delay}s."
+            echo "同级语料尚未一致（第 $attempt/$attempts 次）—— 重取 KeelBase4J main，${delay} 秒后重试。"
+            sleep "$delay"
+            git -C java-repo fetch --depth=1 origin main
+            git -C java-repo reset --hard FETCH_HEAD
+            attempt=$((attempt + 1))
+          done
+
+  # Full 剖面合规门禁（CE-1③ / JV-13）：F4 wire 形状 + F5 前端契约面（conformance-profile.md §2.2）。
+  # 此前这个判据只有一次性跑过——JV-13 用 verify-full-profile.mjs 量出 Java 距 Full 多远，但没有任何
+  # 门禁守着判据本身。本 job 起隔离后端（fresh sqlite + 确定性 env，端口 3401，不碰开发后端）→ 跑
+  # runner（本体在契约仓，经 submodule 取所钉那份）→ 停后端 → 透传退出码。
+  # 为什么值得单独一条：F4/F5 是「同一套前端接第二个 Runtime」的前提（ADR-0002 Rev-8 触发条件②）。
+  # 参考实现一旦让信封或能力面漂移，受损的不是它自己，而是**所有**指向它的前端与第二载体。
+  full-profile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: Server-NestJS/package-lock.json
+      - run: cd Server-NestJS && npm ci
+      - run: bash Server-NestJS/scripts/proof-full-profile.sh
+
+  # 术语单一真源闸（CE-1 C2，零依赖 node 内置，root 跑）：协议文档 + 对外文档无第二套表述/
+  # 过度承诺词（审计哈希链不承诺不可篡改/不可抵赖、≠ 区块链）。词表 = docs/manual/product-language.md
+  terminology-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - run: node Server-NestJS/scripts/check-protocol-language.mjs
+      # 证据根 v3 canonical 手写序防漂移（1.0.8 deferred 收敛）：导出侧(audit.service)与离线验证侧(verify-evidence.mjs)键序须一致
+      - run: node Server-NestJS/scripts/check-evidence-canonical.mjs
+
+  # 语义单源规则闸（CE-1 C1，硬门禁）：触及 tool/治理/审计/事件语义的实现改动须同批落 specs/protocol 或 schemas
+  # （「先落契约再改代码」）；无契约变更 → 红。纯重构/无契约影响 → 提交信息加 trailer [no-semantic-change] 显式豁免（评审可见）。
+  # 无可用 diff base（首推/shallow）→ 脚本自行跳过，不误伤。
+  semantic-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+          fetch-depth: 0   # 需要 diff base
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: 语义单源闸
+        # base：push 用 event.before；PR 用 base.sha（事件无 before → 回退会导致多提交 PR 误红）
+        run: node Server-NestJS/scripts/check-semantic-single-source.mjs --base "${{ github.event.pull_request.base.sha || github.event.before }}"
+
+  # 生成器/导入/映射 CLI 测试（零依赖 node:test，root 跑）——keelbase init 与 OpenAPI/Schema/Business Spec 导入防回归
+  cli-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      # 单一来源：与本地同跑 cli:test（新增生成器/导入测试挂 package.json 即可，不在 CI 硬编码）
+      - run: npm run cli:test
+      # Business Spec 门禁：.keelbase/business-spec/*.json 必须可映射且无告警（unmapped 是合法范围边界，不算失败）
+      - run: npm run spec:check
+      # Application Model 门禁（CE-2 PC-7）：specs/*.json + manifest + 模块生成证明须过各自 JSON Schema
+      - run: npm run check:app-model
+      # 移动预览挂载点门禁：Flutter web 挂在 /mobile，各构建点必须带 --base-href=/mobile/（否则页面停在 Loading）
+      - run: npm run check:mobile-preview
+      # Provenance：仓库自带 manifest，inspect 应识别为 KeelBase 应用并退出 0
+      - run: node scripts/keelbase-init.mjs inspect
+      # Provenance：doctor 四查（完整性/一致性/运行时/版本）应 PASS 退出 0
+      - run: node scripts/keelbase-init.mjs doctor
+
+  # 合成陌生人冒烟（W3 harness 进 CI）：keelbase init 生成模块 → 编译 → 测试（防生成器闭环回归）
+  stranger-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: Server-NestJS/package-lock.json
+      - run: cd Server-NestJS && npm ci
+      - name: keelbase init 生成 → 编译 → 测试（模拟陌生人 30min Build）
+        run: |
+          node scripts/keelbase-init.mjs --module cismoke --label CI冒烟 --fields title:string,content:text
+          cd Server-NestJS && npm run build && npm test -- cismoke
+
+  # S4 全链路验收（Consulting → Build 桥，docs/business-spec.md）：业务访谈产物（Business Spec）
+  # → business-spec.mjs 确定性映射 → 模块协议 → keelbase init --spec → 生成模块（后端+三前端+AI 工具）
+  # → 编译 → 生成模块单测 → 迁移自洽（首轮生成该模块迁移 → 应用 → 复生成 No changes）。
+  # 与 stranger-smoke 的区别：那条走 `--module/--fields` 捷径，本条走「访谈产物 → 协议 → 生成」的真实链路。
+  consulting-to-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: Server-NestJS/package-lock.json
+      - run: cd Server-NestJS && npm ci
+      # 脚本自带「脏树拒绝」守卫；CI 检出干净可直接跑
+      - run: bash scripts/verify-consulting-to-build.sh
+
+  # 供应链安全（评审三 §6）：依赖完整性 + 漏洞审计 + SBOM
+  supply-chain:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Server-NestJS
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: Server-NestJS/package-lock.json
+      # npm ci 即依赖完整性检查：lockfile 与 package.json 不一致会直接失败
+      - run: npm ci
+      # 生产依赖漏洞审计：high/critical 即失败（2026-08-20 已清零 4 个 high，含 @nestjs/swagger→js-yaml/fast-uri）
+      - name: 依赖漏洞审计
+        run: npm audit --omit=dev --audit-level=high
+      # SBOM（SPDX）生成并上传，供供应链核查（npm sbom 输出到 stdout，重定向落盘；--output 不写文件）
+      - name: 生成 SBOM
+        run: npm sbom --sbom-format spdx --omit=dev > sbom.spdx.json
+      - uses: actions/upload-artifact@v5
+        with:
+          name: keelbase-sbom
+          path: Server-NestJS/sbom.spdx.json
+          if-no-files-found: error
+
+  # 1.0 Release Gate（确定性模式，§7.3 Gate 3）：Gate1 Golden + Build + Trust + Private 一次证明
+  release-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: Server-NestJS/package-lock.json
+      - run: cd Server-NestJS && npm ci
+      - name: 生成随机测试密钥
+        run: |
+          echo "ENCRYPTION_KEY=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+          echo "ENCRYPTION_HMAC_KEY=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+          echo "JWT_SECRET=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+          echo "JWT_REFRESH_SECRET=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+      # 确定性五维 + Gate1（LLM 部分由 LLM_ENV=1 标注，云端跑见 docs/benchmark/）
+      - name: 运行 Release Gate（确定性）
+        run: ./scripts/release-gate.sh
+        env:
+          ENCRYPTION_KEY: ${{ env.ENCRYPTION_KEY }}
+          ENCRYPTION_HMAC_KEY: ${{ env.ENCRYPTION_HMAC_KEY }}
+          JWT_SECRET: ${{ env.JWT_SECRET }}
+          JWT_REFRESH_SECRET: ${{ env.JWT_REFRESH_SECRET }}
+          NODE_ENV: test
+
+  # Run/Adversarial 云端实证（§7.4 #2）：真实 LLM 对话（Run/Safety）+ 攻击集回归。
+  # 非阻塞标注——continue-on-error 让失败以警告呈现不 gate 流水线；缺 DEEPSEEK_API_KEY 时跳过。
+  # 注意：GitHub Actions 禁止在 if 条件里直接引用 secrets（会导致 workflow 解析失败），
+  # 因此 secret 经 job 级 env 透传，步骤 if 用 env.DEEPSEEK_API_KEY 判断。
+  run-adversarial:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    env:
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: Server-NestJS/package-lock.json
+      - run: cd Server-NestJS && npm ci
+      - name: Run/Adversarial 云端实证（自起隔离后端 + DeepSeek）
+        if: env.DEEPSEEK_API_KEY != ''
+        run: ./scripts/benchmark/run-adversarial.sh
+      - name: 缺 key 跳过标注
+        if: env.DEEPSEEK_API_KEY == ''
+        run: echo "DEEPSEEK_API_KEY 未配置——Run/Adversarial 跳过（配置 secrets 后自动启用）"
+      - uses: actions/upload-artifact@v5
+        if: env.DEEPSEEK_API_KEY != ''
+        with:
+          name: adversarial-reports
+          path: docs/benchmark/*.md
+          if-no-files-found: ignore
+
+  web-admin:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Web-Admin-Vue
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: Web-Admin-Vue/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      # 严格 lint（不带 --fix，避免 CI 悄悄改文件）；本地开发用 npm run lint 自动修复
+      - run: npx eslint . --ext .vue,.ts
+      # vitest + coverage 门槛（statements/branches/functions/lines ≥ 30/50/25/30，见 vitest.config.ts）
+      - run: npx vitest run --coverage
+      - name: 上传 Web 端覆盖率报告（lcov）
+        uses: actions/upload-artifact@v5
+        with:
+          name: coverage-web-admin
+          path: Web-Admin-Vue/coverage/lcov.info
+          if-no-files-found: warn
+      - run: npm run build
+
+  # React 管理台预览版（CLAUDE §13.1）：转正决策前补 CI——typecheck/lint/test/build 全绿，不 gate 主发布
+  web-admin-react:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Web-Admin-React
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: Web-Admin-React/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      # 严格 lint（不带 --fix，避免 CI 悄悄改文件；本地 npm run lint 自动修复）
+      - run: npx eslint .
+      - run: npm test
+      - run: npm run build
+
+  taro-build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Front-Taro
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: Front-Taro/package-lock.json
+      - run: npm ci
+      # Race guards (pure Node, seconds) — without this they have no regression protection.
+      # 竞态守卫（纯 Node、秒级）——不接 CI 等于没有回归保护。
+      - run: npm run test:race
+      - run: npm run build:h5
+      # H5 output must not keep bare process.env references (Taro replaces only keys listed in config.env).
+      # H5 产物不得残留裸 process.env（Taro 只替换 config.env 里列出的键）。
+      - run: npm run test:env
+      # N-1 weapp 构建防回归：build:weapp 已修复（a15c3eb），CI 常驻校验防退化（Taro CLI 构建小程序包无需微信开发者工具）
+      - run: npm run build:weapp
+      - run: npm run test:env
+
+  flutter-analyze:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Front-Flutter
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      # 版本固定为解析 Front-Flutter/pubspec.lock 的那一版（与 docker-publish.yml 一致）：
+      # 跟随 '3.x' 会在 stable 前进时让 pub 按新 SDK 重新解析，重现「锁文件里两个包不配套、
+      # 门禁全绿却构建才炸」那类问题（2026-09-22 的 objective_c/code_assets 即为此）。
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.2'
+          cache: true
+      - run: flutter pub get
+      # 容忍既有 warning/info（项目有 100+ 历史 lint 问题），仅 error 视为失败
+      - run: flutter analyze --no-fatal-warnings --no-fatal-infos
+      # 单测 + 覆盖率门禁（行覆盖 ≥45%，防回归；awk 解析 lcov.info 不引入额外依赖）
+      - run: flutter test --coverage
+      - name: Enforce line coverage ≥45%
+        run: |
+          awk -F: '/^LF:/{lf+=$2} /^LH:/{lh+=$2} END {
+            if (lf == 0) { print "no coverage data"; exit 1 }
+            pct = 100 * lh / lf;
+            printf "Line coverage: %.1f%%\n", pct;
+            if (pct < 45) { print "Coverage below 45% threshold"; exit 1 }
+          }' coverage/lcov.info
+      - name: 上传 Flutter 覆盖率报告（lcov）
+        uses: actions/upload-artifact@v5
+        with:
+          name: coverage-flutter
+          path: Front-Flutter/coverage/lcov.info
+          if-no-files-found: warn

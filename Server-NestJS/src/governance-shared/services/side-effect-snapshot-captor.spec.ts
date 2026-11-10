@@ -1,0 +1,238 @@
+// SPDX-License-Identifier: Apache-2.0
+
+import { Test } from '@nestjs/testing';
+import { getEntityManagerToken } from '@nestjs/typeorm';
+import { SideEffectSnapshotCaptor } from './side-effect-snapshot-captor';
+
+describe('SideEffectSnapshotCaptor (E-1 字段级变更快照)', () => {
+  let captor: SideEffectSnapshotCaptor;
+  let entityManager: { getRepository: jest.Mock; connection: { entityMetadatas: any[] } };
+
+  beforeEach(async () => {
+    entityManager = {
+      getRepository: jest.fn(),
+      connection: { entityMetadatas: [] },
+    };
+    const module = await Test.createTestingModule({
+      providers: [
+        SideEffectSnapshotCaptor,
+        { provide: getEntityManagerToken(), useValue: entityManager },
+      ],
+    }).compile();
+    captor = module.get(SideEffectSnapshotCaptor);
+  });
+
+  describe('normalize', () => {
+    it('null/undefined → null', () => {
+      expect(captor.normalize(null)).toBeNull();
+      expect(captor.normalize(undefined)).toBeNull();
+    });
+
+    it('Date → ISO 字符串', () => {
+      const out = JSON.parse(captor.normalize({ at: new Date('2026-08-30T00:00:00Z') })!);
+      expect(out.at).toBe('2026-08-30T00:00:00.000Z');
+    });
+
+    it('敏感键掩码（password/token/secret）', () => {
+      const out = JSON.parse(
+        captor.normalize({ title: 'x', password: 'p', apiKey: 'k', note: 'ok' })!,
+      );
+      expect(out.password).toBe('[REDACTED]');
+      expect(out.apiKey).toBe('[REDACTED]');
+      expect(out.title).toBe('x');
+    });
+
+    it('片段集并入共享判据 —— salt/passwd/api_key 不打折，email/phone 也补上', () => {
+      const out = JSON.parse(
+        captor.normalize({
+          salt: 's',
+          passwd: 'p',
+          api_key: 'k',
+          email: 'a@b.c',
+          phone: '13800138000',
+          title: 'x',
+        })!,
+      );
+      // These three belong to the fragment set this file used to own; folding it into the shared
+      // predicate must not drop them.
+      // 这三个原本属于本文件自己那套片段 —— 并入共享判据时不许丢。
+      expect(out.salt).toBe('[REDACTED]');
+      expect(out.passwd).toBe('[REDACTED]');
+      expect(out.api_key).toBe('[REDACTED]');
+      // PII names the local pattern never carried now arrive through the shared predicate.
+      // 旧本地正则从不带 PII 名，统一后由共享判据补上。
+      expect(out.email).toBe('[REDACTED]');
+      expect(out.phone).toBe('[REDACTED]');
+      expect(out.title).toBe('x');
+    });
+
+    it('超长字符串截断 200 字符', () => {
+      const out = JSON.parse(captor.normalize({ body: 'a'.repeat(500) })!);
+      expect((out.body as string).length).toBeLessThanOrEqual(201);
+      expect(out.body).toContain('…');
+    });
+
+    it('循环引用按深度截断降级（不栈溢出、不抛错）', () => {
+      const c: Record<string, unknown> = {};
+      c.self = c;
+      const out = captor.normalize(c);
+      expect(out).not.toBeNull();
+      const parsed = JSON.parse(out!) as Record<string, unknown>;
+      let node: unknown = parsed;
+      while (node != null && typeof node === 'object') {
+        node = (node as Record<string, unknown>).self;
+      }
+      expect(node).toBe('[max-depth]');
+    });
+  });
+
+  describe('captureAfter', () => {
+    it('本地实体（event）按 resultId 重查全量字段转 JSON', async () => {
+      const eventRepo = { findOne: jest.fn().mockResolvedValue({ id: 42, title: '晨会', startTime: new Date('2026-08-30T01:00:00Z') }) };
+      entityManager.getRepository.mockReturnValue(eventRepo);
+      const { json: out, reason } = await captor.captureAfter('event', 42);
+      expect(entityManager.getRepository).toHaveBeenCalledWith('Event');
+      expect(reason).toBeNull(); // REV-13：取到了就没有成因
+      const parsed = JSON.parse(out!);
+      expect(parsed.id).toBe(42);
+      expect(parsed.title).toBe('晨会');
+    });
+
+    it('B 路径外部（proxy_call）无本地实体 → 用 fallback（execute 返回数据）', async () => {
+      const { json: out, reason } = await captor.captureAfter('proxy_call', 0, { id: 9, status: 'updated' });
+      expect(entityManager.getRepository).not.toHaveBeenCalled();
+      // REV-13：回退**拿到内容** ⇒ 有效快照、不置标（`fell_back` 是机制不是成因）
+      expect(reason).toBeNull();
+      const parsed = JSON.parse(out!);
+      expect(parsed.status).toBe('updated');
+    });
+
+    it('实体查不到 → json null，且成因是 row_missing（不是「设计上的缺席」）', async () => {
+      const eventRepo = { findOne: jest.fn().mockResolvedValue(null) };
+      entityManager.getRepository.mockReturnValue(eventRepo);
+      const r = await captor.captureAfter('event', 999);
+      expect(r.json).toBeNull();
+      expect(r.reason).toBe('row_missing');
+    });
+
+    it('查询抛错 → json null，且成因是 failed（异常路径单独可辨）', async () => {
+      entityManager.getRepository.mockImplementation(() => ({
+        findOne: jest.fn().mockRejectedValue(new Error('db down')),
+      }));
+      const r = await captor.captureAfter('event', 1);
+      expect(r.json).toBeNull();
+      expect(r.reason).toBe('failed');
+    });
+
+    it('#4 生成模块（invoice）按元数据解析实体并捕获快照', async () => {
+      entityManager.connection.entityMetadatas = [
+        {
+          name: 'Invoice',
+          targetName: 'Invoice',
+          tableName: 'invoices',
+          deleteDateColumn: { propertyName: 'deletedAt' },
+          columns: [{ propertyName: 'invoiceNo' }, { propertyName: 'dueDate' }],
+        },
+      ];
+      const invoiceRepo = { findOne: jest.fn().mockResolvedValue({ id: 7, invoiceNo: 'INV-001', dueDate: null }) };
+      entityManager.getRepository.mockReturnValue(invoiceRepo);
+      const { json: out } = await captor.captureAfter('invoice', 7);
+      expect(entityManager.getRepository).toHaveBeenCalledWith('Invoice');
+      const parsed = JSON.parse(out!);
+      expect(parsed.invoiceNo).toBe('INV-001');
+    });
+
+    it('#4 无软删列且非显式别名的类型 → 无本地实体，走 fallback（不误查）', async () => {
+      entityManager.connection.entityMetadatas = [
+        {
+          name: 'SomeReadOnly',
+          targetName: 'SomeReadOnly',
+          tableName: 'some_read_only',
+          deleteDateColumn: null,
+          columns: [],
+        },
+      ];
+      const { json: out } = await captor.captureAfter('some_read_only', 3, { fallback: true });
+      expect(entityManager.getRepository).not.toHaveBeenCalled();
+      expect(JSON.parse(out!).fallback).toBe(true);
+    });
+
+    /**
+     * 按**资源**声明的 PII（`resource-routes.piiFieldsForEntity`）：快照是管理台「工具与副作用」
+     * 列表读的那份数据。同一个 `name` 键在客户上打码、在合同上不打码 —— 声明是**按实体**的。
+     *
+     * PII declared per entity: the snapshot is what the admin tool-effects list reads. The same `name`
+     * key is masked on a customer and left alone on a contract.
+     */
+    it('crm_customer：name / company 在快照里就打码（其余字段照旧）', async () => {
+      entityManager.connection.entityMetadatas = [
+        {
+          name: 'CrmCustomer',
+          targetName: 'CrmCustomer',
+          tableName: 'crm_customer',
+          deleteDateColumn: { propertyName: 'deletedAt' },
+          columns: [{ propertyName: 'name' }],
+        },
+      ];
+      entityManager.getRepository.mockReturnValue({
+        findOne: jest
+          .fn()
+          .mockResolvedValue({ id: 7, name: '云帆商贸', company: '云帆科技', email: 'a@b.com', status: 'lead' }),
+      });
+
+      const { json: out } = await captor.captureAfter('crm_customer', 7);
+
+      expect(JSON.parse(out!)).toEqual({
+        id: 7,
+        name: '[REDACTED]',
+        company: '[REDACTED]',
+        email: '[REDACTED]',
+        status: 'lead',
+      });
+      expect(out!).not.toContain('云帆商贸');
+      expect(out!).not.toContain('云帆科技');
+    });
+
+    it('合同：同一个 `name` 键**不**打码 —— 声明按实体，不按键名', async () => {
+      entityManager.connection.entityMetadatas = [
+        {
+          name: 'Contract',
+          targetName: 'Contract',
+          tableName: 'contracts',
+          deleteDateColumn: { propertyName: 'deletedAt' },
+          columns: [{ propertyName: 'name' }],
+        },
+      ];
+      entityManager.getRepository.mockReturnValue({
+        findOne: jest.fn().mockResolvedValue({ id: 3, name: '服务合同 2026', amount: 100 }),
+      });
+
+      const { json: out } = await captor.captureAfter('contract', 3);
+
+      expect(JSON.parse(out!).name).toBe('服务合同 2026');
+    });
+  });
+
+  describe('captureBefore', () => {
+    it('非 update 类工具（create 类）→ null，不解析实体', async () => {
+      expect(await captor.captureBefore('create_event', { title: 'x' })).toBeNull();
+      expect(entityManager.getRepository).not.toHaveBeenCalled();
+    });
+
+    it('proxy 写（update_customer_status）无本地实体 → args 摘要并脱敏敏感键', async () => {
+      const out = await captor.captureBefore('update_customer_status', {
+        customerId: 1,
+        apiKey: 'sk-123',
+        status: 'active',
+        remark: '催款',
+      });
+      expect(entityManager.getRepository).not.toHaveBeenCalled();
+      const parsed = JSON.parse(out!);
+      expect(parsed.customerId).toBe(1);
+      expect(parsed.apiKey).toBe('[REDACTED]');
+      expect(parsed.status).toBe('active');
+      expect(out).not.toContain('sk-123');
+    });
+
+  });
+});

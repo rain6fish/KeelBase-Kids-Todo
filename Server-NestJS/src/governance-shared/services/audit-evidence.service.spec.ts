@@ -1,0 +1,962 @@
+// SPDX-License-Identifier: Apache-2.0
+
+import { createHash, createHmac } from 'crypto';
+import { NotFoundException } from '@nestjs/common';
+import { UserRole } from '../../common/entities/user.entity';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { AuditEvidenceService } from './audit-evidence.service';
+import { AuditStatsService } from './audit-stats.service';
+import { deriveOutcome, deriveTool, BackfillRow } from './audit-outcome';
+
+/**
+ * AW-3：`/4` 的 `coverage` 段由 `CoverageService` 装配。本 spec 关心的不是它怎么算（那是
+ * `coverage-gaps.spec.ts` 的事），而是它**出现在包里、且进了 canonical** —— 故这里只给一个固定的桩。
+ *
+ * AW-3: the `/4` `coverage` section is assembled by `CoverageService`. What this spec cares about is not
+ * how it is computed (that is `coverage-gaps.spec.ts`) but that it is **in the package, and in the
+ * canonical** — so a fixed stub is all this needs.
+ */
+const coverageStub = () => ({
+  forFacts: jest.fn((input: { kind: string; subjectRef: string | null }) => ({
+    registryRevision: 'test-rev',
+    scope: {
+      kind: input.kind,
+      since: '2026-01-01T00:00:00.000Z',
+      to: '2026-01-01T00:00:00.000Z',
+      subjectRef: input.subjectRef,
+    },
+    sources: [],
+    verdict: 'unknown',
+    gaps: [],
+  })),
+});
+
+/**
+ * C-3：报表 / 证据面现在**按列**读 `outcome` 与 `tool`，所以夹具行必须带这两列——行是从库里读出来的，
+ * 库里就有它们。用**生产**规则（与那支回填迁移共用）从行自己已有的三个值推出来，于是夹具**说不出**
+ * 写入方写不出的形状：要造一个 `blocked` 行，就得像真实行那样带上 `authorization` 里那条
+ * `risk_policy`，而不是只在 `errorMessage` 里写「blocked」——后者正是 `C-3` 拆掉的那种读法。
+ *
+ * C-3: the report / evidence surface reads `outcome` and `tool` as columns now, so a fixture row has to
+ * carry them — rows come out of the database and the database has them. They are derived with the
+ * production rules (shared with the backfill migration) from the three values the row already has, so
+ * a fixture cannot state a shape no writer could produce: a `blocked` row has to carry the
+ * `risk_policy` reason the way a real one does, rather than spelling "blocked" in `errorMessage` —
+ * which is the reading C-3 removed.
+ */
+const rows = <T extends Record<string, any>>(rs: T[]) =>
+  rs.map((r) => {
+    const shape = r as unknown as BackfillRow;
+    return { ...r, outcome: deriveOutcome(shape), tool: deriveTool(shape) };
+  });
+
+/** The same, for the single row `findOne` hands back. */
+const row = <T extends Record<string, any>>(r: T) => rows([r])[0];
+
+/** ① 证据根（§internal.17 ①，docs/evidence-root.spec.md）：getEvidenceRoot 装配 + 鉴权 + 根锚 */
+describe('AuditEvidenceService.getEvidenceRoot（① 证据根 v3）', () => {
+  const AUDIT_HMAC_KEY = 'test-evidence-root-key';
+
+  function build(opts: { effect?: any | null; viewer?: string; isAdmin?: boolean; convRows?: any[]; governancePolicy?: any; claims?: any[] } = {}) {
+    const logRepo = {
+      find: jest.fn().mockResolvedValue(opts.convRows ?? []),
+      // ACT-5：占位行指过来的那条审计行按 id 取（未给占位行时不会被调到）
+      findOne: jest.fn().mockImplementation(async (arg?: { where?: { id?: number } }) =>
+        (opts.convRows ?? []).find((r: any) => r.id === arg?.where?.id) ?? null,
+      ),
+    };
+    // ACT-5（消费者①）：占位行仓储（给了才走精确配对；不给 ⇒ 退回保守规则，既有用例即此形）
+    const claimsRepo = {
+      findOne: jest.fn().mockImplementation(async (arg?: { where?: { idempotencyKey?: string } }) =>
+        (opts.claims ?? []).find((c: any) => c.idempotencyKey === arg?.where?.idempotencyKey) ?? null,
+      ),
+    };
+    // A8: the lookup is narrowed to the viewer when one is passed, so the stub has to honour
+    // `where.userId`. A stub that always returns the fixture would hand back a row the real query
+    // never would, and the non-owner case could not be observed at all.
+    //
+    // A8：传了查看者时查询会按用户收窄，故替身必须尊重 `where.userId`。恒返回固定行的替身
+    // 会交出真实查询永远不会返回的行，非本人那条路径也就根本测不出来。
+    const effectsRepo = {
+      findOne: jest.fn().mockImplementation(async (arg?: { where?: { userId?: string } }) => {
+        if (!opts.effect) return null;
+        const scoped = arg?.where?.userId;
+        return scoped === undefined || scoped === opts.effect.userId ? opts.effect : null;
+      }),
+    };
+    const operationAudit = {
+      chainRowsByTarget: jest.fn().mockResolvedValue([
+        { seq: 1, id: 500, prevHash: null, hash: 'a'.repeat(64), payload: { method: 'PATCH', path: '/crm/tasks/7' } },
+      ]),
+    } as any;
+    const governancePolicy = opts.governancePolicy ?? (undefined as any);
+    // 证据域已独立成服务（阶段 3 第三刀）：构造参数随之收敛
+    const service = new AuditEvidenceService(
+      logRepo as any,
+      effectsRepo as any,
+      { computeHash: jest.fn() } as any,
+      coverageStub() as any, // AW-3：/4 的 coverage 段
+      undefined, // cacheService
+      undefined, // authorizationExplainer
+      undefined, // agentService
+      operationAudit,
+      governancePolicy,
+      claimsRepo as any,
+    );
+    return { service, logRepo, effectsRepo, operationAudit, governancePolicy, claimsRepo };
+  }
+
+  const allowedSnapshot = JSON.stringify({
+    allowed: true,
+    tool: 'create_followup_task',
+    riskLevel: 'R3',
+    strategy: 'confirmation',
+    checks: [{ name: 'user_scoped', ok: true, note: '仅本人数据' }],
+    policy: { revision: 'ab12cd34ef56', updatedAt: '2026-09-04T09:20:00.000Z' },
+  });
+  const convRow = row({
+    id: 38172,
+    userId: '42',
+    username: 'alex',
+    action: 'tool_call',
+    detail: 'create_followup_task({"customerId":7})',
+    conversationId: 'c1',
+    authorization: allowedSnapshot,
+    businessEvent: 'FollowupTaskCreated',
+    evidence: JSON.stringify({ decision: 'create', evidence: [], policy: 'p', confidence: 0.9 }),
+    hash: 'b'.repeat(64),
+    createdAt: new Date('2026-09-04T09:21:00Z'),
+  });
+  const effect = {
+    id: 9281,
+    userId: '42',
+    conversationId: 'c1',
+    toolName: 'create_followup_task',
+    resultType: 'crm_task',
+    resultId: 7,
+    beforeSnapshot: null,
+    afterSnapshot: '{"id":7,"status":"open"}',
+  };
+
+  beforeEach(() => {
+    process.env.AUDIT_HMAC_KEY = AUDIT_HMAC_KEY;
+  });
+  afterEach(() => {
+    delete process.env.AUDIT_HMAC_KEY;
+  });
+
+  it('装配 v4 证据根：action/authorization(policy.revision)/decision/副作用锚+根锚/coverage/签名', async () => {
+    const { service, operationAudit } = build({ effect, viewer: '42', convRows: [convRow] });
+    const out = await service.getEvidenceRoot('crm_task', 7, '42', false);
+
+    expect(out.format).toBe('keelbase-audit-evidence/4');
+    // AW-3：/4 必带 coverage —— 缺了就不该说它是 /4（schema 的 required 也这么要求）。
+    expect(out.coverage).toMatchObject({ registryRevision: 'test-rev', verdict: 'unknown' });
+    expect((out.coverage.scope as { kind: string }).kind).toBe('action');
+    expect(out.action).toMatchObject({ id: 'crm_task:7', resultType: 'crm_task', resultId: 7, effectId: 9281, conversationId: 'c1' });
+    expect(out.authorization?.allowed).toMatchObject({ checks: expect.any(Array), policy: { revision: 'ab12cd34ef56' } });
+    expect(out.decision.businessEvent).toBe('FollowupTaskCreated');
+    expect(out.effect.before).toBeNull();
+    expect(out.effect.after).toEqual({ id: 7, status: 'open' });
+    // 子链 + operation-audit 反查
+    expect(out.chains.aiAudit).toHaveLength(1);
+    // 含补偿锚路径：级联补偿行按根业务 id 落 targetId，不带这条子串会漏掉「被补偿过」的事实
+    expect(operationAudit.chainRowsByTarget).toHaveBeenCalledWith('7', [
+      '/crm/tasks/',
+      '/ai/tool-effects/compensate',
+    ]);
+    expect(out.chains.operationAudit).toHaveLength(1);
+    // 根锚：side-effect 摘要 + digest 自洽
+    const sideAnchor = out.root.anchors.find((a: any) => a.kind === 'side-effect')!;
+    expect(sideAnchor.hash).toBe(createHash('sha256').update(JSON.stringify(out.effect)).digest('hex'));
+    // 切片一（1.0.8 deferred）：决策/审计链锚（ai-audit）与副作用锚都入根锚——chains 非空，不再只断副作用
+    const aiAnchor = out.root.anchors.find((a: any) => a.kind === 'ai-audit');
+    expect(aiAnchor).toBeTruthy();
+    expect(aiAnchor.rowId).toBe(convRow.id);
+    expect(aiAnchor.hash).toBe('b'.repeat(64));
+    expect(out.root.anchors.map((a: any) => a.kind)).toEqual(
+      expect.arrayContaining(['ai-audit', 'side-effect']),
+    );
+    expect(out.root.digest).toBe(createHash('sha256').update(JSON.stringify(out.root.anchors)).digest('hex'));
+    // ① spec 对齐：业务摘要（trigger 存在时经 summarizeAudit）
+    expect(out.summary).toBeTruthy();
+    expect(typeof out.summary?.sentence).toBe('string');
+    expect(out.summary?.stats).toBeDefined();
+    // replay：无 governancePolicy 注入 → 省略（replayDecision 不调）
+    expect(out.replay).toBeNull();
+    // 签名（v3 canonical 可复现：含 summary——存在才含，与导出同源）
+    const canonical = JSON.stringify({
+      action: out.action,
+      authorization: out.authorization ?? null,
+      decision: out.decision,
+      effect: out.effect,
+      chains: out.chains,
+      root: out.root,
+      // AW-3：`coverage` **进 canonical** —— 覆盖声明必须被签住，否则它可以事后被改写成更漂亮的版本
+      // 而不破签，那这一段就是装饰。本行与 `scripts/verify-evidence.mjs` 的键序逐字对应。
+      // AW-3: `coverage` is part of the canonical — the statement has to be signed, or it could be
+      // rewritten after the fact without breaking the signature and the section would be decoration.
+      coverage: out.coverage,
+      exportedAt: out.exportedAt,
+      ...(out.summary ? { summary: out.summary } : {}),
+      ...(out.replay ? { replay: out.replay } : {}),
+    });
+    // §11 双签：未配 SM2_PRIVATE_KEY → sm2 段缺席（而不是伪造一个空段）；HMAC 落在 signature.hmac
+    expect(out.signature?.hmac).toBe(createHmac('sha256', AUDIT_HMAC_KEY).update(canonical).digest('hex'));
+    expect(out.signature?.sm2).toBeUndefined();
+  });
+
+  it('replay wire：授权快照 policy.revision → replayDecision 被调 + replay 段入包', async () => {
+    const replayDecision = jest.fn().mockResolvedValue({
+      mode: 'history', verifiable: true, reproducible: true, policyChanged: false, toolDecisionChanged: false,
+      recordedRevision: 'ab12cd34ef56', currentRevision: 'ab12cd34ef56',
+    });
+    const { service, governancePolicy } = build({
+      effect,
+      viewer: '42',
+      convRows: [convRow],
+      // AW-3：证据根也要读治理粒度（它是 coverage 的一条事实）。桩补上这个方法 —— 缺它本该红，
+      // 而不是让实现去防一个「真实服务不会有」的形状。
+      governancePolicy: { replayDecision, getAuditGranularity: jest.fn().mockResolvedValue('all') },
+    });
+    const out = await service.getEvidenceRoot('crm_task', 7, '42', false);
+    // 授权快照带 policy.revision + effect.toolName → replayDecision 被调
+    expect(replayDecision).toHaveBeenCalledWith(expect.objectContaining({
+      tool: 'create_followup_task',
+      checks: expect.any(Array),
+      policyRevision: 'ab12cd34ef56',
+    }));
+    expect(out.replay).toMatchObject({ reproducible: true, recordedRevision: 'ab12cd34ef56' });
+  });
+
+  it('ACT-2：同会话同名工具调用两次 → **不归因**（不把 A 的授权/意图挂到 B 的 effect 上）', async () => {
+    // 「给客户 A 建任务，再给客户 B 建任务」：两条 tool_call 同名，effect 只属于其中一次。
+    // 旧实现取「第一条相符」⇒ B 的 effect 会拿到 A 的 businessEvent / evidence / 授权快照。
+    const rowA = {
+      ...convRow,
+      id: 101,
+      detail: 'create_followup_task({"customerId":1})',
+      businessEvent: 'FollowupTaskCreatedForCustomerA',
+    };
+    const rowB = {
+      ...convRow,
+      id: 102,
+      detail: 'create_followup_task({"customerId":9})',
+      businessEvent: 'FollowupTaskCreatedForCustomerB',
+    };
+    const { service } = build({ effect, viewer: '42', convRows: [rowA, rowB] });
+
+    const out = await service.getEvidenceRoot('crm_task', 7, '42', false);
+
+    // 配对不唯一 ⇒ 一律留空，而不是任选一条
+    expect(out.decision.businessEvent).toBeNull();
+    expect(out.decision.evidence).toBeNull();
+    expect(out.authorization).toBeNull();
+    expect(out.summary).toBeNull();
+    // ai-audit 锚也不该出现（没有可归因的那一行）
+    expect(out.root.anchors.some((a: any) => a.kind === 'ai-audit')).toBe(false);
+    // 副作用锚仍在 —— 不被归因不等于没有副作用
+    expect(out.root.anchors.some((a: any) => a.kind === 'side-effect')).toBe(true);
+  });
+
+  it('ACT-2：会话内无同名 tool_call → 不回落到「最后一条任意 tool_call」（旧实现会拿别人的事件）', async () => {
+    // 再套一层 `row()`：这一行的 `detail` 被换成了**另一个工具**，故 `tool` 必须跟着重算 —— 否则这条
+    // 夹具就自相矛盾（散文说 A、字段说 B），而它要证的那件事正好建立在这两者是同一件事上。
+    const otherRow = row({
+      ...convRow,
+      id: 201,
+      detail: 'query_customers({})',
+      businessEvent: 'CustomersQueried',
+    });
+    const { service } = build({ effect, viewer: '42', convRows: [otherRow] });
+
+    const out = await service.getEvidenceRoot('crm_task', 7, '42', false);
+
+    expect(out.decision.businessEvent).toBeNull();
+    expect(out.authorization).toBeNull();
+    expect(out.root.anchors.some((a: any) => a.kind === 'ai-audit')).toBe(false);
+  });
+
+  it('副作用不存在 → 404', async () => {
+    const { service } = build({ effect: null });
+    await expect(service.getEvidenceRoot('crm_task', 999, '42', false)).rejects.toThrow(NotFoundException);
+  });
+
+  it('非本人非管理员 → 404：按用户收窄，不确认该动作存在（防枚举，同 auth 域口径）', async () => {
+    const { service } = build({ effect, viewer: '7' });
+    await expect(service.getEvidenceRoot('crm_task', 7, '7', false)).rejects.toThrow(NotFoundException);
+  });
+
+  it('管理员可读他人动作', async () => {
+    const { service } = build({ effect, viewer: '1', isAdmin: true, convRows: [convRow] });
+    await expect(service.getEvidenceRoot('crm_task', 7, '1', true)).resolves.toMatchObject({
+      action: { id: 'crm_task:7' },
+    });
+  });
+
+  // ACT-5（消费者①）：**精确配对**。同一会话里同名工具调用两次时，模板/授权/意图都可能被挂到**别人**
+  // 那条 effect 上；占位行（每次调用一行）把「哪一次」变成可读的事实，下面这组钉的就是它。
+  describe('ACT-5 执行身份精确配对', () => {
+    // 同一次会话里的两条同名 tool_call，只有 businessEvent 不同 —— 这正是「给客户 A 建任务、再给客户 B 建任务」
+    const rowA = { ...convRow, id: 100, businessEvent: 'FollowupTaskCreatedForA' };
+    const rowB = { ...convRow, id: 200, businessEvent: 'FollowupTaskCreatedForB' };
+    const both = [rowA, rowB];
+
+    it('同名两次 ⇒ 每条 effect 配到**它自己**那条触发行（旧实现只能「不归因」）', async () => {
+      const a = build({
+        effect: { ...effect, id: 1, resultId: 7, idempotencyKey: 'k-a' },
+        viewer: '42',
+        convRows: both,
+        claims: [{ idempotencyKey: 'k-a', auditRowId: 100 }],
+      });
+      const b = build({
+        effect: { ...effect, id: 2, resultId: 8, idempotencyKey: 'k-b' },
+        viewer: '42',
+        convRows: both,
+        claims: [{ idempotencyKey: 'k-b', auditRowId: 200 }],
+      });
+
+      await expect(a.service.getEvidenceRoot('crm_task', 7, '42', false)).resolves.toMatchObject({
+        decision: { businessEvent: 'FollowupTaskCreatedForA' },
+      });
+      await expect(b.service.getEvidenceRoot('crm_task', 8, '42', false)).resolves.toMatchObject({
+        decision: { businessEvent: 'FollowupTaskCreatedForB' },
+      });
+    });
+
+    it('**反向对照**：没有占位行（本表之前的旧数据 / 代理写）⇒ 依旧保守 —— 两条候选，不归因', async () => {
+      const { service } = build({ effect, viewer: '42', convRows: both });
+
+      const out = await service.getEvidenceRoot('crm_task', 7, '42', false);
+
+      expect(out.decision.businessEvent).toBeNull();
+    });
+
+    it('占位行在、但它指的那条审计行取不到 ⇒ **不归因**，而不是回头去候选里猜', async () => {
+      const { service } = build({
+        effect: { ...effect, idempotencyKey: 'k-a' },
+        viewer: '42',
+        convRows: both,
+        claims: [{ idempotencyKey: 'k-a', auditRowId: 999 }],
+      });
+
+      const out = await service.getEvidenceRoot('crm_task', 7, '42', false);
+
+      expect(out.decision.businessEvent).toBeNull();
+    });
+  });
+});
+
+describe('AuditEvidenceService（报表 / 链校验 / 证据装配）', () => {
+  let service: AuditEvidenceService;
+  let logRepo: { find: jest.Mock; findOne: jest.Mock; createQueryBuilder: jest.Mock };
+  let effectsRepo: { count: jest.Mock; find: jest.Mock; findOne: jest.Mock };
+  let chain: { computeHash: jest.Mock; verifyChain: jest.Mock };
+
+  beforeEach(() => {
+    logRepo = {
+      find: jest.fn().mockResolvedValue([]),
+      findOne: jest.fn().mockResolvedValue(null),
+      createQueryBuilder: jest.fn(),
+    };
+    effectsRepo = {
+      count: jest.fn().mockResolvedValue(0),
+      find: jest.fn().mockResolvedValue([]),
+      findOne: jest.fn().mockResolvedValue(null),
+    };
+    chain = {
+      computeHash: jest.fn().mockReturnValue('h'),
+      verifyChain: jest.fn().mockReturnValue({ valid: true, checked: 0 }),
+    };
+    service = new AuditEvidenceService(
+      logRepo as never,
+      effectsRepo as never,
+      chain as never,
+      coverageStub() as never, // AW-3：/4 的 coverage 段
+      undefined, // cacheService
+      // §internal.16 A-5 放行快照：authorizationExplainer 供「无快照降级重算」场景（快照场景不应调用）
+      {
+        explainAuthorization: jest.fn().mockResolvedValue({
+          tool: 'query_customers',
+          checks: [{ name: 'RECOMPUTED', ok: true }],
+        }),
+      } as never,
+    );
+  });
+
+    it('verifyChain 沿 id 升序取数并委托链校验', async () => {
+      logRepo.find.mockResolvedValue([{ id: 1, prevHash: null, hash: 'a' }]);
+      await service.verifyChain();
+      expect(logRepo.find).toHaveBeenCalledWith({ order: { id: 'ASC' } });
+      expect(chain.verifyChain).toHaveBeenCalled();
+    });
+
+    it('E-2：valid 链返回最近 24 条切片', async () => {
+      const rows = Array.from({ length: 30 }, (_, i) => ({
+        id: i + 1, prevHash: i === 0 ? null : `h${i}`, hash: `h${i + 1}`,
+        createdAt: new Date(), action: 'chat', detail: null, isError: false,
+      }));
+      logRepo.find.mockResolvedValue(rows);
+      (chain.verifyChain as jest.Mock).mockReturnValue({ valid: true, checked: 30 });
+      const result = await service.verifyChain();
+      expect(result.chain).toHaveLength(24);
+      expect(result.chain[0].id).toBe(7); // 30-24+1
+      expect(result.chain[23].id).toBe(30);
+      expect(result.chain.every((n) => !n.broken)).toBe(true);
+    });
+
+    it('E-2：broken 链以断点为中心切片并标记断点行', async () => {
+      const rows = Array.from({ length: 30 }, (_, i) =>
+        row({
+          id: i + 1, prevHash: i === 0 ? null : `h${i}`, hash: `h${i + 1}`,
+          createdAt: new Date(), action: 'tool_call', detail: 'query_customers({})', isError: false,
+        }),
+      );
+      logRepo.find.mockResolvedValue(rows);
+      (chain.verifyChain as jest.Mock).mockReturnValue({ valid: false, checked: 10, brokenIndex: 11 });
+      const result = await service.verifyChain();
+      expect(result.chain.length).toBeLessThan(30); // 断点窗口而非全量
+      const brokenNode = result.chain.find((n) => n.broken);
+      expect(brokenNode).toBeDefined();
+      expect(brokenNode!.id).toBe(11);
+      expect(brokenNode!.toolName).toBe('query_customers');
+    });
+
+    it('feedback 后置写入不参与哈希 payload（submitFeedback 不断链，HS-11）', async () => {
+      logRepo.find.mockResolvedValue([{ id: 1, prevHash: null, hash: 'a' }]);
+      let payloadFor: ((row: Record<string, unknown>) => Record<string, unknown>) | undefined;
+      (chain.verifyChain as jest.Mock).mockImplementation((_rows, cb) => {
+        payloadFor = cb;
+        return { valid: true, checked: 1 };
+      });
+      await service.verifyChain();
+      // 即使行里已写入 feedback（submitFeedback 后置更新），payload 仍恒为 null —— 与写入时 canonical 一致
+      const payload = payloadFor!({
+        id: 1,
+        prevHash: null,
+        hash: 'a',
+        feedback: 'thumbs_down',
+        feedbackNote: '回答不准',
+      });
+      expect(payload.feedback).toBeNull();
+      expect(payload.feedbackNote).toBeNull();
+    });
+
+    it('§internal.16 A-1：business_event/evidence 不入哈希 payload（链外，_payload 恒 null）', async () => {
+      logRepo.find.mockResolvedValue([{ id: 1, prevHash: null, hash: 'a' }]);
+      let payloadFor: ((row: Record<string, unknown>) => Record<string, unknown>) | undefined;
+      (chain.verifyChain as jest.Mock).mockImplementation((_rows, cb) => {
+        payloadFor = cb;
+        return { valid: true, checked: 1 };
+      });
+      await service.verifyChain();
+      const payload = payloadFor!({
+        id: 1,
+        prevHash: null,
+        hash: 'a',
+        businessEvent: 'CustomerRiskAssessed',
+        evidence: '{"decision":"high"}',
+      });
+      expect(payload.businessEvent).toBeNull();
+      expect(payload.evidence).toBeNull();
+    });
+
+    it('PC-2：verify/stats/cost/action-report 响应无越界键（⊆ 冻结契约）', async () => {
+      (chain.verifyChain as jest.Mock).mockReturnValue({ valid: true, checked: 0 });
+      (logRepo.find as jest.Mock).mockResolvedValue([]);
+      const statsService = new AuditStatsService(logRepo as never, undefined);
+      const propsOf = (relPath: string) =>
+        Object.keys(
+          (JSON.parse(readFileSync(resolve(__dirname, `../../../specs/protocol/${relPath}`), 'utf8')) as {
+            properties: Record<string, unknown>;
+          }).properties,
+        );
+      const noExtra = (obj: Record<string, unknown>, relPath: string) => {
+        const props = propsOf(relPath);
+        expect(Object.keys(obj).filter((k) => !props.includes(k))).toEqual([]);
+      };
+      noExtra(await service.verifyChain(), 'schemas/v2/audit-chain-verification.schema.json');
+      // 聚合响应已由 AuditStatsService 产出（阶段 3 拆分）——契约校验跟着响应走，断言不变
+      noExtra(await statsService.getAllStats(), 'schemas/v2/audit-usage-stats.schema.json');
+      noExtra(await statsService.getCostBreakdown(), 'schemas/v1/audit-cost-breakdown.schema.json');
+      noExtra(await service.getActionReport(), 'schemas/v2/audit-action-report.schema.json');
+    });
+
+  describe('getActionReport（§10 P1 合规证据包）', () => {
+    it('聚合 执行/批准/拒绝/阻断 + 副作用 + 哈希链', async () => {
+      logRepo.find.mockResolvedValue(rows([
+        { id: 1, userId: '1', action: 'tool_call', detail: 'create_followup_task({"customerId":1})', isError: false, createdAt: new Date() },
+        { id: 2, userId: '1', action: 'tool_confirmation', detail: 'create_followup_task() → approve', isError: false, createdAt: new Date() },
+        { id: 3, userId: '1', action: 'tool_confirmation', detail: 'x() → decline', isError: true, errorMessage: 'User declined the operation', createdAt: new Date() },
+        // 一行靠它的**结构化理由**说自己是 blocked。此前这条夹具只在 `errorMessage` 里写「blocked」，
+        // 而旧读法是按那句话里的词判的 —— `C-3` 拆掉的正是那种读法，故这里补上真实行会带的 reasons。
+        { id: 4, userId: '1', action: 'tool_call', detail: 'query_customers({})', isError: true, errorMessage: 'Tool "query_evil" is blocked (risk level R5)', authorization: '[{"name":"risk_policy"}]', createdAt: new Date() },
+      ]));
+      effectsRepo.count.mockResolvedValue(2);
+      chain.verifyChain.mockReturnValue({ valid: true, checked: 4 });
+
+      const report = await service.getActionReport({ userId: '1' });
+
+      expect(report.summary).toEqual({
+        executed: 1,
+        approved: 1,
+        rejected: 1,
+        blocked: 1,
+        refused: 0,
+        errors: 2,
+        effects: 2,
+      });
+      expect(report.hashChain).toEqual({ valid: true, checked: 4, brokenIndex: null, tableRows: 4 });
+      // 明细样本：从 detail 提取工具名 + 阻断原因可见
+      expect(report.samples[0].toolName).toBe('create_followup_task');
+      expect(report.samples[3].toolName).toBe('query_customers');
+      expect(report.samples[3].errorMessage).toContain('blocked (risk level R5)');
+      // B3：同日日志聚合到单个 byDay 桶（计数与 summary 对齐）
+      expect(report.byDay).toHaveLength(1);
+      expect(report.byDay[0]).toMatchObject({ executed: 1, approved: 1, rejected: 1, blocked: 1, refused: 0, errors: 2 });
+    });
+
+    // R4 转人工审批：isError=false（还没被拒）但 detail 是 pending_approval ⇒ **两格都不进** ——
+    // 计成 approved 就是合规报告虚报。护栏用例（新旧实现同绿）：它钉的是规则本身。
+    it('R4 转人工审批（pending_approval）既不计批准也不计拒绝', async () => {
+      logRepo.find.mockResolvedValue(rows([
+        { id: 1, userId: '1', action: 'tool_confirmation', detail: 'create_followup_task() → approve', isError: false, createdAt: new Date() },
+        { id: 2, userId: '1', action: 'tool_confirmation', detail: 'create_project_with_tasks({"name":"x"}) → pending_approval', isError: false, createdAt: new Date() },
+      ]));
+      chain.verifyChain.mockReturnValue({ valid: true, checked: 2 });
+
+      const report = await service.getActionReport({ userId: '1' });
+
+      expect(report.summary.approved).toBe(1);
+      expect(report.summary.rejected).toBe(0);
+      expect(report.byDay[0]).toMatchObject({ approved: 1, rejected: 0 });
+    });
+
+    it('byDay 按 UTC 日聚合（多日升序，阻断/错误分别入桶）', async () => {
+      logRepo.find.mockResolvedValue(rows([
+        { id: 1, userId: '1', action: 'tool_call', detail: 'create_x()', isError: false, createdAt: new Date('2026-08-20T10:00:00Z') },
+        // 阻断行必须带**结构化的理由**：旧读法靠 `errorMessage` 里那个词，`by-day` 改读 `outcome` 列后，
+        // 没有 `authorization` 的行推不出结局，只算 error —— 而写入方从不会发出那种行。
+        { id: 2, userId: '1', action: 'tool_call', detail: 'query_y({})', isError: true, errorMessage: 'blocked (risk level R5)', authorization: '[{"name":"risk_policy"}]', createdAt: new Date('2026-08-20T11:00:00Z') },
+        { id: 3, userId: '1', action: 'tool_call', detail: 'create_z()', isError: false, createdAt: new Date('2026-08-21T09:00:00Z') },
+      ]));
+      effectsRepo.count.mockResolvedValue(0);
+      chain.verifyChain.mockReturnValue({ valid: true, checked: 3 });
+
+      const report = await service.getActionReport();
+
+      expect(report.byDay).toEqual([
+        { date: '2026-08-20', executed: 1, approved: 0, rejected: 0, blocked: 1, refused: 0, errors: 1 },
+        { date: '2026-08-21', executed: 1, approved: 0, rejected: 0, blocked: 0, refused: 0, errors: 0 },
+      ]);
+    });
+
+    // 反证用：把 `refused` 拿掉（并回 errors 一桶），这条用例就红。
+    it('治理/授权拒绝计入 refused —— 不再与执行失败共用 errors 那一格', async () => {
+      logRepo.find.mockResolvedValue(rows([
+        {
+          id: 1, userId: '1', action: 'tool_call', detail: 'delete_customer({"id":7})', isError: true,
+          errorMessage: 'Tool "delete_customer" is not enabled',
+          authorization: '[{"name":"tool_enabled"}]', createdAt: new Date('2026-09-01T10:00:00Z'),
+        },
+      ]));
+      effectsRepo.count.mockResolvedValue(0);
+      chain.verifyChain.mockReturnValue({ valid: true, checked: 1 });
+
+      const report = await service.getActionReport();
+
+      expect(report.summary).toMatchObject({ executed: 0, blocked: 0, refused: 1, errors: 1 });
+      expect(report.byDay[0]).toMatchObject({ executed: 0, blocked: 0, refused: 1, errors: 1 });
+    });
+
+    // 反证用：把 `tableRows` 改回 `checked`，这条用例就红。
+    it('verifyChain 的 tableRows 数全部行，checked 只数已入链的行', async () => {
+      logRepo.find.mockResolvedValue([
+        { id: 1, prevHash: null, hash: 'h1', createdAt: new Date(), action: 'chat', detail: null, isError: false },
+        { id: 2, prevHash: 'h1', hash: 'h2', createdAt: new Date(), action: 'chat', detail: null, isError: false },
+        { id: 3, prevHash: null, hash: null, createdAt: new Date(), action: 'chat', detail: null, isError: false },
+      ]);
+      (chain.verifyChain as jest.Mock).mockReturnValue({ valid: true, checked: 2 });
+
+      const result = await service.verifyChain();
+
+      expect(result.checked).toBe(2);
+      expect(result.tableRows).toBe(3);
+      // 未入链的那一行确实没有进链校验 —— 分母之差不是摆设
+      expect((chain.verifyChain as jest.Mock).mock.calls[0][0]).toHaveLength(2);
+    });
+
+    it('无日志时全零 + 哈希链 checked 0', async () => {
+      logRepo.find.mockResolvedValue([]);
+      effectsRepo.count.mockResolvedValue(0);
+      chain.verifyChain.mockReturnValue({ valid: true, checked: 0 });
+
+      const report = await service.getActionReport();
+      expect(report.summary.executed).toBe(0);
+      expect(report.hashChain).toEqual({ valid: true, checked: 0, brokenIndex: null, tableRows: 0 });
+      expect(report.samples).toEqual([]);
+      expect(report.byDay).toEqual([]);
+    });
+
+    it('E-1：effectDiffs 解析副作用 before/after 快照', async () => {
+      logRepo.find.mockResolvedValue([]);
+      effectsRepo.count.mockResolvedValue(1);
+      effectsRepo.find.mockResolvedValue([
+        {
+          id: 7,
+          toolName: 'create_followup_task',
+          resultType: 'crm_task',
+          resultId: 3,
+          createdAt: new Date('2026-08-30T00:00:00Z'),
+          beforeSnapshot: null,
+          afterSnapshot: '{"id":3,"title":"跟进","status":"open"}',
+        },
+      ]);
+      chain.verifyChain.mockReturnValue({ valid: true, checked: 0 });
+
+      const report = await service.getActionReport({ userId: '1' });
+      expect(report.effectDiffs).toHaveLength(1);
+      expect(report.effectDiffs[0]).toMatchObject({
+        resultType: 'crm_task',
+        before: null,
+        after: { id: 3, title: '跟进', status: 'open' },
+      });
+    });
+
+    it('E-1：快照非法 JSON 降级 null（不破坏证据包）', async () => {
+      logRepo.find.mockResolvedValue([]);
+      effectsRepo.count.mockResolvedValue(1);
+      effectsRepo.find.mockResolvedValue([
+        { id: 8, toolName: 'create_todo', resultType: 'todo', resultId: 1, createdAt: new Date(), beforeSnapshot: 'not-json', afterSnapshot: null },
+      ]);
+      chain.verifyChain.mockReturnValue({ valid: true, checked: 0 });
+
+      const report = await service.getActionReport();
+      expect(report.effectDiffs[0]).toMatchObject({ before: null, after: null });
+    });
+  });
+
+  describe('getActionReportExport（D4/A2 证据包：format + chain + 签名）', () => {
+    it('导出含 format / 全量 chain（payload 供离线重算）/ 签名覆盖 chain', async () => {
+      (service as any).getActionReport = jest.fn().mockResolvedValue({
+        summary: { totalCalls: 1 },
+        hashChain: { valid: true, checked: 2, brokenIndex: null },
+        effectDiffs: [],
+      });
+      const prevKey = process.env.AUDIT_HMAC_KEY;
+      process.env.AUDIT_HMAC_KEY = 'ab'.repeat(32);
+      try {
+        logRepo.find.mockResolvedValue(rows([
+          { id: 1, userId: '42', conversationId: null, action: 'tool_call', detail: 'query_customers({})', model: 'deepseek-v4-flash', provider: 'deepseek', promptTokens: 10, completionTokens: 5, durationMs: 100, isError: false, errorMessage: null, authorization: null, prevHash: null, hash: 'a'.repeat(64) },
+          { id: 2, userId: '42', conversationId: null, action: 'chat', detail: 'hello', model: null, provider: null, promptTokens: null, completionTokens: null, durationMs: null, isError: false, errorMessage: null, authorization: null, prevHash: 'a'.repeat(64), hash: 'b'.repeat(64) },
+        ]));
+        const out = await service.getActionReportExport({});
+        expect(out.format).toBe('keelbase-audit-evidence/2');
+        expect(out.generator).toBe('keelbase-audit-export');
+        expect(out.compliance).toEqual([]); // mock report 无 samples → 空合规段
+        expect(out.chain).toHaveLength(2);
+        expect(out.chain[0]).toMatchObject({ seq: 1, id: 1, prevHash: null, hash: 'a'.repeat(64) });
+        expect(out.chain[1].seq).toBe(2);
+        expect(out.chain[1].prevHash).toBe('a'.repeat(64));
+        // payload 与写入侧一致（feedback/businessEvent 恒 null，供离线重算）
+        expect(out.chain[0].payload).toMatchObject({ userId: '42', action: 'tool_call', completionTokens: 5, feedback: null, businessEvent: null, evidence: null });
+        expect(out.signature?.hmac).toMatch(/^[0-9a-f]{64}$/);
+        // ② 绑定：证据包(/2)键集 == evidence-package v3 契约的 /2 分支
+        const pkgSchema = JSON.parse(
+          readFileSync(resolve(__dirname, '../../../specs/protocol/schemas/v3/evidence-package.schema.json'), 'utf8'),
+        ) as { oneOf: Array<{ properties: Record<string, unknown> & { format?: { const: string } } }> };
+        const branch = pkgSchema.oneOf.find((b) => b.properties.format?.const === 'keelbase-audit-evidence/2');
+        expect(branch).toBeDefined();
+        expect(Object.keys(out).sort()).toEqual(Object.keys(branch!.properties).sort());
+      } finally {
+        if (prevKey === undefined) delete process.env.AUDIT_HMAC_KEY;
+        else process.env.AUDIT_HMAC_KEY = prevKey;
+      }
+    });
+
+    it('§internal.16 A-6 合规段：samples 业务摘要 + 责任链（签名覆盖 compliance）', async () => {
+      (service as any).getActionReport = jest.fn().mockResolvedValue({
+        summary: { executed: 1 },
+        hashChain: { valid: true, checked: 1, brokenIndex: null },
+        effectDiffs: [],
+        samples: [{ id: 1, action: 'tool_call', toolName: 'analyze_customer_risk', isError: false, createdAt: new Date() }],
+      });
+      const prevKey = process.env.AUDIT_HMAC_KEY;
+      process.env.AUDIT_HMAC_KEY = 'ab'.repeat(32);
+      try {
+        logRepo.find.mockResolvedValue(rows([
+          { id: 1, userId: '42', username: 'alex', conversationId: 'c1', action: 'tool_call', detail: 'analyze_customer_risk({"id":7})', businessEvent: 'CustomerRiskAssessed', evidence: '{"decision":"high","evidence":["订单降42%"]}', agentId: 'key-a', prevHash: null, hash: 'a'.repeat(64) },
+          { id: 2, userId: '42', username: 'alex', conversationId: 'c1', action: 'chat', detail: 'hi', prevHash: 'a'.repeat(64), hash: 'b'.repeat(64) },
+        ]));
+        const out = await service.getActionReportExport({});
+        expect(out.compliance).toHaveLength(1);
+        expect(out.compliance[0].summary.sentence).toContain('alex');
+        expect(out.compliance[0].summary.sentence).toContain('high');
+        expect(out.compliance[0].businessEvent).toBe('CustomerRiskAssessed');
+        expect(out.compliance[0].identityChain.human.username).toBe('alex');
+        expect(out.compliance[0].identityChain.tool.toolName).toBe('analyze_customer_risk');
+      } finally {
+        if (prevKey === undefined) delete process.env.AUDIT_HMAC_KEY;
+        else process.env.AUDIT_HMAC_KEY = prevKey;
+      }
+    });
+  });
+
+  describe('getChain（§internal.16 A-5 跨系统身份链）', () => {
+    it('聚合 Human→Intent→Agent→Tool→Action + 会话工具序列 + source', async () => {
+      logRepo.findOne.mockResolvedValue(row({
+        id: 1, userId: '42', username: 'bob', action: 'tool_call',
+        detail: 'create_followup_task({"customerId":7})',
+        businessEvent: 'FollowupTaskCreated', agentId: 'key-legacy-erp', callerAgentId: 'research',
+        businessIntent: '跟进高风险客户', source: 'bridge',
+        conversationId: 'c1', createdAt: new Date(),
+      }));
+      logRepo.find.mockResolvedValue(rows([
+        { id: 1, action: 'tool_call', detail: 'create_followup_task({})', businessEvent: 'FollowupTaskCreated', agentId: 'key-legacy-erp', createdAt: new Date() },
+      ]));
+      const res = await service.getChain(1);
+      expect(res.human.username).toBe('bob');
+      expect(res.agent.agentId).toBe('key-legacy-erp');
+      expect(res.agent.callerAgentId).toBe('research');
+      expect(res.intent).toBe('跟进高风险客户');
+      expect(res.source).toBe('bridge');
+      expect(res.tool.toolName).toBe('create_followup_task');
+      expect(res.action.businessEvent).toBe('FollowupTaskCreated');
+      expect(res.chain).toHaveLength(1);
+    });
+
+    it('拒绝场景：解析 authorization checks 为授权依据', async () => {
+      logRepo.findOne.mockResolvedValue(row({
+        id: 2, userId: '42', action: 'tool_call', detail: 'query_evil({})',
+        authorization: JSON.stringify([{ name: 'risk_policy', ok: false, note: 'R5 阻断' }]),
+        createdAt: new Date(),
+      }));
+      logRepo.find.mockResolvedValue([]);
+      const res = await service.getChain(2);
+      expect(res.authorization.denied).toEqual([{ name: 'risk_policy', ok: false, note: 'R5 阻断' }]);
+      expect(res.authorization.allowed).toBeNull();
+    });
+
+    it('放行快照优先：allowed 用事件时点快照（不重算当前策略）', async () => {
+      const snapshotChecks = [{ name: 'user_scoped', ok: true, note: '仅本人数据' }];
+      logRepo.findOne.mockResolvedValue(row({
+        id: 3, userId: '42', action: 'tool_call', detail: 'query_customers({})',
+        authorization: JSON.stringify({ allowed: true, tool: 'query_customers', riskLevel: 'R1', strategy: 'auto', checks: snapshotChecks }),
+        createdAt: new Date(),
+      }));
+      logRepo.find.mockResolvedValue([]);
+      const res = await service.getChain(3);
+      expect(res.authorization.denied).toBeNull();
+      // allowed 取快照 checks（而非 aiService.explainAuthorization 的 RECOMPUTED）→ 证明快照优先、未重算
+      expect(res.authorization.allowed).toEqual({ checks: snapshotChecks, riskLevel: 'R1' });
+    });
+
+    it('§internal.17 ③ Policy Evidence：快照带 policy.revision → allowed 投影携带「哪一版规则允许」', async () => {
+      logRepo.findOne.mockResolvedValue(row({
+        id: 5, userId: '42', action: 'tool_call', detail: 'create_followup_task({})',
+        authorization: JSON.stringify({
+          allowed: true, tool: 'create_followup_task', riskLevel: 'R3', strategy: 'confirmation',
+          checks: [{ name: 'user_scoped', ok: true, note: '仅本人数据' }],
+          policy: { revision: 'a1b2c3d4e5f6', updatedAt: '2026-09-04T09:20:00.000Z' },
+        }),
+        createdAt: new Date(),
+      }));
+      logRepo.find.mockResolvedValue([]);
+      const res = await service.getChain(5);
+      expect(res.authorization.allowed?.policy).toEqual({ revision: 'a1b2c3d4e5f6', updatedAt: '2026-09-04T09:20:00.000Z' });
+      // 无版本的历史行仍不注入键（向后兼容，见放行快照测试）
+    });
+
+    it('历史数据无放行快照 → 降级当前策略重算（向后兼容）', async () => {
+      logRepo.findOne.mockResolvedValue(row({
+        id: 4, userId: '42', action: 'tool_call', detail: 'query_customers({})', authorization: null,
+        createdAt: new Date(),
+      }));
+      logRepo.find.mockResolvedValue([]);
+      const res = await service.getChain(4);
+      expect(res.authorization.denied).toBeNull();
+      expect(res.authorization.allowed).toEqual({
+        tool: 'query_customers',
+        checks: [{ name: 'RECOMPUTED', ok: true }],
+      });
+    });
+  });
+});
+
+/**
+ * P0-20: the single-event explanation, and the two things it must not do.
+ *
+ * <p>It must not **guess**. An operator reads one action, so every section it cannot substantiate has
+ * to come back empty rather than filled from a neighbour — a row with no claim has no effect, no
+ * approval and no business leg, and says so. The claim's absence is the honest answer, and it is
+ * asserted here because the tempting alternative (pair by conversation, the way the evidence root has
+ * to when no claim exists) is exactly what ACT-2 stopped doing after it attached one customer's
+ * authorisation to another customer's effect.
+ *
+ * <p>It must not let a target's silence read as progress. A `compensating` effect the target never
+ * acknowledged lands on `result_unknown`, asserted end to end rather than only against the pure
+ * function, because that is the reading that would otherwise have shipped.
+ *
+ * P0-20：单事件解释面，以及它**两件不许做的事**。一、不许**猜**：操作者读的是**一次**动作，凡是拿不出
+ * 凭据的段落都必须**空着**，而不是从邻居那里填满——没有占位行的行就**没有**副作用、没有审批、没有业务
+ * 那一腿，它如实说没有。占位行**缺席**就是那个诚实的答案，这里把它钉住，因为那个诱人的替代（按会话配
+ * 对，也就是证据根在无占位行时不得不走的那条）正是 ACT-2 在把一位客户的授权挂到另一位客户的副作用上
+ * 之后停掉的事。二、不许让**目标的沉默**读成进展：目标从未确认的 `compensating` 落到 `result_unknown`，
+ * 此处**端到端**断言而不是只测那个纯函数，因为那正是会被发出去的读法。
+ */
+describe('AuditEvidenceService.getInterpretation（P0-20 单事件解释面）', () => {
+  function build(
+    opts: {
+      claim?: any | null;
+      effect?: any | null;
+      confirmation?: any | null;
+      opRows?: any[];
+      conversationId?: string | null;
+      rowUserId?: string;
+      orgService?: any;
+    } = {},
+  ) {
+    const auditRow = row({
+      id: 7,
+      userId: opts.rowUserId ?? 'u1',
+      username: 'alex',
+      action: 'tool_call',
+      detail: 'create_task({"title":"跟进"})',
+      isError: false,
+      authorization: null,
+      conversationId: opts.conversationId === undefined ? 'c1' : opts.conversationId,
+      businessEvent: null,
+      evidence: null,
+      createdAt: new Date('2026-10-16T00:00:00Z'),
+    });
+    const logRepo = {
+      findOne: jest.fn().mockResolvedValue(auditRow),
+      find: jest.fn().mockResolvedValue([auditRow]),
+    };
+    const effectsRepo = {
+      findOne: jest.fn().mockImplementation(async (arg?: { where?: { id?: number } }) =>
+        opts.effect && opts.effect.id === arg?.where?.id ? opts.effect : null,
+      ),
+    };
+    // The claim is found by `auditRowId` — the key that makes this join precise rather than approximate.
+    // 占位行按 `auditRowId` 找 —— 正是这个键让这次连接是**精确**的、而不是近似的。
+    const claimsRepo = {
+      findOne: jest.fn().mockImplementation(async (arg?: { where?: { auditRowId?: number } }) =>
+        opts.claim && arg?.where?.auditRowId === 7 ? opts.claim : null,
+      ),
+    };
+    const confirmationsRepo = {
+      findOne: jest.fn().mockImplementation(async (arg?: { where?: { token?: string } }) =>
+        opts.confirmation && arg?.where?.token === opts.confirmation.token ? opts.confirmation : null,
+      ),
+    };
+    const operationAudit = {
+      chainRowsByTarget: jest.fn().mockResolvedValue(opts.opRows ?? []),
+    } as any;
+    const service = new AuditEvidenceService(
+      logRepo as any,
+      effectsRepo as any,
+      { computeHash: jest.fn() } as any,
+      coverageStub() as any, // AW-3：/4 的 coverage 段
+      undefined, // cacheService
+      undefined, // authorizationExplainer
+      undefined, // agentService
+      operationAudit,
+      undefined, // governancePolicy
+      claimsRepo as any,
+      confirmationsRepo as any,
+      undefined, // dataSource
+      opts.orgService,
+    );
+    return { service, operationAudit, logRepo };
+  }
+
+  it('无会话的审计行 ⇒ conversation 为空数组，且不去读「空谓词」的整表', async () => {
+    // A row with no conversation used to query with an empty `where`, which means every audit row —
+    // and the result was returned as `conversation` after only the anchor row was scope-checked.
+    // 无会话的行以前用空 `where` 查询，等于整张审计表；而结果只对锚点行判过范围后原样作为
+    // `conversation` 返回。
+    const { service, logRepo } = build({ conversationId: null });
+    const res = await service.getInterpretation(7);
+    expect(res.conversation).toEqual([]);
+    expect(logRepo.find).not.toHaveBeenCalled();
+  });
+
+  it('多组织行动者：按 id 判范围与列表同口径（任一成员关系，不取「最早加入」）', async () => {
+    const orgService = {
+      getUserOrgContext: jest.fn().mockResolvedValue({ orgId: 99, deptId: null }),
+      isMemberOfOrg: jest.fn().mockResolvedValue(true),
+    };
+    const { service } = build({ rowUserId: '42', orgService });
+    const res = await service.getInterpretation(7, { userId: 5, role: UserRole.USER } as any);
+    expect(orgService.isMemberOfOrg).toHaveBeenCalledWith(42, 99);
+    expect(res.row.id).toBe(7);
+  });
+
+  it('多组织行动者不在读者组织 ⇒ 404（与列表同一条谓词）', async () => {
+    const orgService = {
+      getUserOrgContext: jest.fn().mockResolvedValue({ orgId: 99, deptId: null }),
+      isMemberOfOrg: jest.fn().mockResolvedValue(false),
+    };
+    const { service } = build({ rowUserId: '42', orgService });
+    await expect(
+      service.getInterpretation(7, { userId: 5, role: UserRole.USER } as any),
+    ).rejects.toThrow(NotFoundException);
+  });
+
+  it('无占位行 ⇒ 副作用/审批为空、业务那一腿为空、状态取自审计行 —— 不按会话去猜', async () => {
+    const { service, operationAudit } = build();
+    const res = await service.getInterpretation(7);
+    expect(res.effect).toBeNull();
+    expect(res.approval).toBeNull();
+    expect(res.operationAudit).toEqual([]);
+    expect(res.state).toBe('executed');
+    // 不猜的判据：没有占位行时**根本没去问**业务那一腿。
+    // The no-guessing criterion: with no claim it does not even ask the business leg.
+    expect(operationAudit.chainRowsByTarget).not.toHaveBeenCalled();
+  });
+
+  it('占位行 → 副作用 → 已撤销 ⇒ 状态是补偿成功，副作用带撤销档位', async () => {
+    const { service } = build({
+      claim: { id: 1, auditRowId: 7, effectId: 42, authorizationRef: null },
+      effect: {
+        id: 42, toolName: 'create_task', resultType: 'crm_task', resultId: 9,
+        revokeClass: 'local_compensate', revokeStatus: 'revoked', revokeAcknowledgedAt: null,
+        beforeSnapshot: null, afterSnapshot: null,
+      },
+      opRows: [{ seq: 1, id: 500, prevHash: null, hash: 'a'.repeat(64), payload: {} }],
+    });
+    const res = await service.getInterpretation(7);
+    expect(res.state).toBe('compensation_succeeded');
+    expect(res.effect).toMatchObject({ id: 42, revokeStatus: 'revoked', revokeWindow: null });
+    expect(res.operationAudit).toHaveLength(1);
+  });
+
+  it('⚠ 补偿中且目标未回音 ⇒ 结果未知（端到端，不只是纯函数）', async () => {
+    const { service } = build({
+      claim: { id: 1, auditRowId: 7, effectId: 42, authorizationRef: null },
+      effect: {
+        id: 42, toolName: 'send_mail', resultType: 'mail', resultId: 3,
+        revokeClass: 'governed_external', revokeStatus: 'compensating', revokeAcknowledgedAt: null,
+        beforeSnapshot: null, afterSnapshot: null,
+      },
+    });
+    const res = await service.getInterpretation(7);
+    expect(res.effect?.revokeWindow).toBe('unacknowledged');
+    expect(res.state).toBe('result_unknown');
+  });
+
+  it('占位行的 authorizationRef → 确认行 ⇒ 谁批准有了着落，待批准则状态是等人', async () => {
+    const { service } = build({
+      claim: { id: 1, auditRowId: 7, effectId: null, authorizationRef: 'tok-1' },
+      confirmation: {
+        token: 'tok-1', toolName: 'create_task', riskLevel: 'R3', kind: 'single', status: 'pending',
+        approverId: null, decidedAt: null, expiresAt: new Date('2026-10-16T01:00:00Z'),
+      },
+    });
+    const res = await service.getInterpretation(7);
+    expect(res.approval).toMatchObject({ token: 'tok-1', status: 'pending', riskLevel: 'R3' });
+    expect(res.state).toBe('awaiting_confirmation');
+  });
+});

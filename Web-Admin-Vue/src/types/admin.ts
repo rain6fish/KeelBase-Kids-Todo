@@ -1,0 +1,558 @@
+// SPDX-License-Identifier: Apache-2.0
+
+export interface MonitorSummary {
+  health: {
+    status: string
+    uptimeSec: number
+    nodeEnv?: string
+    version: string
+  }
+  dependencies: {
+    database: string
+    redis: string
+    queue: string
+    storage: string
+    mail: string
+    push: string
+  }
+  counts: {
+    users: number
+    events: number
+    notifications: number
+    sessions: number
+    operationAuditLogs: number
+    aiAuditLogs: number
+    conversations: number
+    knowledge: number
+  }
+  metrics: {
+    requestRateRps: number | null
+    errorRatePct: number | null
+    latencyP95Ms: number | null
+    inFlight: number | null
+  }
+}
+
+export interface PlatformOverview {
+  counts: {
+    users: number
+    events: number
+    todos: number
+    notifications: number
+    operationAuditLogs: number
+    aiAuditLogs: number
+  }
+  storage: {
+    driver: string
+    bytes: number | null
+  }
+  trend: Array<{ date: string; count: number }>
+}
+
+export interface AdminSession {
+  id: number
+  userId: number
+  username: string | null
+  deviceName: string | null
+  ip: string | null
+  createdAt: string | null
+  lastActiveAt: string | null
+}
+
+export interface BroadcastResult {
+  sent: number
+  mode: 'selected' | 'all'
+}
+
+export interface OperationAuditLog {
+  id: number
+  userId?: number | null
+  action: string
+  method: string
+  path: string
+  /** 功能语义 key（如 users.create），前端按语言渲染为功能名 */
+  featureKey?: string | null
+  /** 兜底英文功能名 */
+  featureFallback?: string | null
+  targetId?: string | null
+  requestBody?: string | null
+  /** A-1 字段级变更留痕（JSON：[{ field, before, after }]） */
+  changes?: string | null
+  /** A-1 业务事件归一化（如 CustomerUpdated） */
+  businessEvent?: string | null
+  /**
+   * G-1 event-time authorization snapshot (`{allowed, role, basis, feature, statusCode}`; one of the
+   * annotation columns outside the hash payload). The wire has always carried it; the type did not
+   * declare it, so the operation-audit surface could not answer "why was it allowed".
+   *
+   * G-1 事件时点授权依据快照（链外注解列）。线上一直带着它，但此前**没有声明** —— 于是「为什么允许」
+   * 在操作审计这一面答不出来。
+   */
+  authorization?: string | null
+  ip?: string | null
+  /** AU-3（§22.19 归因层）：访客标识——区分共享演示账号（alex）下的不同访客；链外列 */
+  guestId?: string | null
+  userAgent?: string | null
+  statusCode?: number | null
+  createdAt: string
+  /** 所属用户名（管理端审计 JOIN 用户表返回） */
+  username?: string | null
+}
+
+export interface KnowledgeArticle {
+  id: number
+  title: string
+  content: string
+  category?: string | null
+  sourceFile?: string | null
+  fileUrl?: string | null
+  docType?: string | null
+  chunkCount?: number | null
+  createdAt: string
+  updatedAt: string
+}
+
+export interface AppVersionInfo {
+  latestVersion: string
+  minRequiredVersion: string
+  updateUrl: string
+  changelog: string[]
+}
+
+export interface UserDetail {
+  id: number
+  username: string
+  email: string
+  phone?: string | null
+  role: string
+  nickname: string
+  emailVerified?: boolean
+  createdAt?: string
+  updatedAt?: string
+  sessions: Array<{
+    id: number
+    deviceName: string | null
+    ip: string | null
+    lastActiveAt: string | null
+    createdAt: string | null
+  }>
+  notifications: Array<{
+    id: number
+    title: string
+    body: string | null
+    type: string
+    isRead: boolean
+    createdAt: string | null
+  }>
+  counts: {
+    events: number
+    operationAuditLogs: number
+    aiAuditLogs: number
+    totalTokens: number
+  }
+}
+
+// ---- P3 新增 ----
+
+export interface TrashItem {
+  // The set of types is derived server-side from entity metadata, so it grows with the schema —
+  // a user-visible union here would be a second, stale authority for it.
+  // 类型集合由服务端从实体元数据派生、随 schema 增长 —— 在这里写死一个联合就是第二个会过期的权威。
+  type: string
+  id: number
+  // Entities with no display column (e.g. a flow instance) honestly answer null.
+  // 没有展示列的实体（如流程实例）如实答 null。
+  title: string | null
+  userId: number | null
+  username: string | null
+  deletedAt: string | null
+}
+
+export interface TrashResponse {
+  items: TrashItem[]
+  total: number
+  page: number
+  limit: number
+  totalPages: number
+}
+
+export interface TrashRestoreResult {
+  restored: boolean
+  type: string
+  id: number
+}
+
+export interface AnalyticsResponse {
+  period: { days: number }
+  activeUsers: {
+    daily: Array<{ date: string; count: number }>
+    wau: number
+    mau: number
+    totalUsers: number
+  }
+  retention: {
+    ratePct: number
+    retained: number
+    activeLast30d: number
+  }
+  featureFunnel: Array<{ action: string; count: number }>
+  errors: {
+    aiErrors: number
+    trend: Array<{ date: string; count: number }>
+  }
+}
+
+export interface ImportResult {
+  type: 'user' | 'event' | 'todo'
+  total: number
+  success: number
+  failed: number
+  errors: Array<{ row: number; reason: string }>
+}
+
+export interface AdminTemplate {
+  id: string
+  name: string
+  description: string
+  events: Array<{
+    title: string
+    description?: string
+    startTime: string
+    endTime: string
+    location?: string
+    isCancelled?: boolean
+    reminderMinutes?: number
+  }>
+  todos: Array<{
+    title: string
+    description?: string
+    completed?: boolean
+    dueDate?: string
+  }>
+}
+
+export interface TemplateImportResult {
+  template: string
+  targetUserId: number
+  events: number
+  todos: number
+}
+
+export interface AdminAiTool {
+  name: string
+  description: string
+  parameters: Array<{ name: string; type: string; required: boolean }>
+  enabled: boolean
+  requiresConfirmation: boolean
+  /** §internal.15(4) R4 审批档（双人审批）：true 表示需审批人而非本人即时确认 */
+  requiresApproval?: boolean
+  /** §internal.15(4) 生效门控档位：auto | confirm | approval | blocked（R5 恒阻断） */
+  gateMode?: 'auto' | 'confirm' | 'approval' | 'blocked'
+  allowedRoles: string[]
+  /** W5 Risk-based Tool Contract：R0-R5 风险级 + 策略（auto/policy/confirmation/human_approval/block） */
+  riskLevel?: string
+  riskStrategy?: string
+  /** KB-6：副作用撤销能力档位（none / local_compensate / governed_external / transactional）——治理面可见分档 */
+  revokeClass?: string
+  permissions: {
+    requireVerifiedEmail?: boolean
+    featureFlag?: string
+    adminOnly?: boolean
+  } | null
+}
+
+/** R4 双人审批请求（管理端审批页） */
+export interface AiApprovalRequest {
+  id: number
+  token: string
+  toolName: string
+  args: string
+  operatorId: string
+  conversationId?: string | null
+  riskLevel: string
+  status: 'pending' | 'approved' | 'declined'
+  approverId?: string | null
+  decidedAt?: string | null
+  createdAt: string
+  /** 审批路径可见：提交人 / 审批人用户名（后端联用户表附） */
+  operatorName?: string
+  approverName?: string
+  /**
+   * P2 审批执行轴（wire governance-confirmation-item v2）：**非 approved 行为 null**。
+   * `failed` 含「执行报错」（executionError 有值）与「崩溃/挂起、未记录结果」（executionError 为 null）两种。
+   */
+  executionState?: 'not_started' | 'running' | 'succeeded' | 'failed' | null
+  executedAt?: string | null
+  executionError?: string | null
+}
+
+export interface SettingRow {
+  key: string
+  value: string
+  type: 'string' | 'number' | 'boolean'
+}
+
+export interface ToolEffect {
+  id: number
+  toolName: string
+  conversationId: string | null
+  /** EB-2 Bridge Audit：proxy_call = 外部系统（B 路径）写副作用（撤销走 Java 补偿，无本地实体） */
+  resultType: string
+  resultId: number
+  argsHash: string
+  createdAt: string
+  targetExists: boolean
+  targetSoftDeleted: boolean
+  targetTitle: string | null
+  /** E-1 字段级变更审计：before/after 快照（JSON 字符串；create 类 before 为 null） */
+  beforeSnapshot?: string | null
+  afterSnapshot?: string | null
+  /** KB-6：撤销能力档位 + 撤销结果运维态（服务端回传；据档位诚实渲染，none 不显示撤销钮） */
+  revokeClass?: string
+  revokeStatus?: string | null
+  /**
+   * REV-2：`compensating`（已请求外部补偿·结果未知）的补偿请求时刻 / 年龄 / 陈旧标记。
+   * 服务端只回答「多久了 / 可能已陈旧」——真值仍在目标系统，不据此当作成功或失败。
+   * `revokeAgeMinutes` 为 null 表示年龄未知（引入该列之前写入的行）。
+   */
+  revokeRequestedAt?: string | null
+  revokePending?: boolean
+  revokeAgeMinutes?: number | null
+  revokeStale?: boolean
+  /**
+   * REV-2 细化：外呼**确认**时刻 + 窗口读数 —— 同一条 `compensating` 因此分为两种不确定：
+   * `unacknowledged` = 可能根本没到达外部系统（进程死在外呼中途）；`awaiting_target` = 确实到达了、对方没给终态。
+   */
+  revokeAcknowledgedAt?: string | null
+  revokeWindow?: 'unacknowledged' | 'awaiting_target' | null
+  /**
+   * REV-1：所属补偿组**声明与持有不一致**（同参数重试声明了与已登记不同的成员）。
+   * 该组的撤销**不会**报告完成；`dispute` 是被拒声明与双向差集的证据。
+   */
+  disputed?: boolean
+  dispute?: {
+    declared: Array<{ resultType: string; resultId: number }>
+    stored: Array<{ resultType: string; resultId: number }>
+    onlyDeclared: Array<{ resultType: string; resultId: number }>
+    onlyStored: Array<{ resultType: string; resultId: number }>
+    decidedAt: string
+    /**
+     * ARC-6：管理端**显式确认**过的时刻/人。有值 ⇒ 该组不再「未了结」，**证据仍原样保留**。
+     * 缺失集合变了时服务端会丢掉旧确认（上一份不再适用），故此处可能重新变空。
+     */
+    acknowledgedAt?: string
+    acknowledgedBy?: string
+  } | null
+  /**
+   * REV-11：**这是谁的活**。`ownerUserId` 是那次写所代表的用户；`revokeNeedsClaim` 是**派生**读数
+   * （滞留且无人接手）；`revokeClaimedBy/At` 是**谁接手了**（认领是记录里的事实，不是推断）。
+   */
+  ownerUserId?: string | null
+  revokeNeedsClaim?: boolean
+  revokeClaimedBy?: string | null
+  revokeClaimedAt?: string | null
+  /**
+   * REV-7：**谁在替该用户执行**（agent 身份），读自本行、无需 join 审计行。
+   * `null` = 当时没有 agent 参与，或该行早于本列（语义为未知，不回填）。
+   */
+  agentId?: string | null
+  /**
+   * REV-6 / REV-13：该行身份缺「变更」那半（成组成员登记时无变更快照），以及**为什么缺**。
+   * 成因四值不等价：`no_captor` / `no_entity_and_empty_fallback` 是设计，`row_missing` / `failed` 是故障。
+   * 成因列 `null` 有两种读法（未置标 / 置标于该列出现之前 ⇒ 不可考），**都不冒充已知**。
+   */
+  identityIncomplete?: boolean
+  identityIncompleteReason?: string | null
+  /**
+   * REV-10：**本次调用在数据层真的写了、而账上没有对应的行**。`null` = 没观察到（寻常情形）。
+   * 这是**发现**不是裁决 —— 它不改声明、不触发补偿、不动撤销结论。
+   * `id` 为 `null` 表示「知道写了那张表，不知道哪一行」——那仍然是「账上没有」。
+   */
+  undeclaredWrites?: Array<{ entity: string; id: number | string | null; kind: 'insert' | 'update' | 'softDelete' }> | null
+  /** KB-6：归一状态（executed / revoked / revoking_external / revoke_failed）——governed_external 禁显示为 revoked */
+  status?: string
+  /** 服务端单一权威的撤销可点（status=executed 且档位非 none）；三端据此渲染 */
+  revocable?: boolean
+}
+
+/** D5 Agent Registry：已注册 Agent 清单（GET /ai/agents，管理台） */
+export interface AiAgent {
+  id: number
+  name: string
+  ownerId?: number | null
+  purpose?: string | null
+  /** 能力清单（JSON 数组字符串，如 '["read_customer","create_followup"]'） */
+  capabilities?: string | null
+  /** 信任级别 R1-R5（R1 读自动 / R3 写需确认 / R4 双人审批 / R5 阻断） */
+  trustLevel: string
+  description?: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+/** D1/B4 治理视图：业务动作 → AI 副作用 + 决策轨迹（GET /ai/governance/action/:resultType/:resultId） */
+export interface GovernanceActionResponse {
+  effect: {
+    id: number
+    userId: string // Who
+    toolName: string // What
+    argsHash: string
+    conversationId: string | null
+    resultType: string // Side Effects
+    resultId: number
+    createdAt: string // When
+    targetExists: boolean // A-3 生命周期：目标当前状态
+    targetSoftDeleted: boolean // 撤销 = 目标软删
+    targetTitle: string | null
+    // 级联补偿 + A-3 恢复态（服务端单一权威；docs/cascade-compensation.spec.md §7）
+    revokeStatus: 'revoked' | 'compensating' | 'revoke_failed' | null
+    compensationGroup: string | null // 同组 = 同一次业务动作的多表副作用
+    parentEffectId: number | null // 根副作用的 effect id（null = 本条即根）
+    cascadeSize: number // 组内条数（1 = 单目标，无级联）
+    restored: boolean // 补偿过但目标当前未软删 → 已恢复
+  }
+  trace: unknown | null // DecisionTrace（AiTraceView 同源；抽屉内渲染关键步骤，完整轨迹走 AiTraceView）
+}
+
+/** §internal.16 A-2 业务实体行为史（Business History） */
+export interface BusinessHistoryEvent {
+  id: string
+  source: 'ai-side-effect' | 'ai-trace' | 'rest-write'
+  time: string
+  actorId?: string | null
+  toolName?: string | null
+  businessEvent?: string | null
+  args?: string | null
+  outcome?: string | null
+  evidence?: string | null
+  before?: string | null
+  after?: string | null
+  changes?: string | null
+  action?: string | null
+  method?: string | null
+  path?: string | null
+  steps?: unknown[] | null
+  effectId?: number
+}
+
+export interface BusinessHistoryResponse {
+  target: { exists: boolean; title?: string | null; status?: string | null; deletedAt?: string | null }
+  events: BusinessHistoryEvent[]
+}
+
+export interface ToolEffectsResponse {
+  total: number
+  page: number
+  limit: number
+  items: ToolEffect[]
+}
+
+export interface OpsAlert {
+  level: 'critical' | 'warning'
+  title: string
+  detail: string
+}
+
+export interface OpsSummary {
+  alerts: OpsAlert[]
+  metrics: {
+    requestRateRps: number | null
+    errorRatePct: number | null
+    latencyP95Ms: number | null
+    inFlight: number | null
+  }
+  logErrors: {
+    since: string
+    opErrors: Array<{ code: number; count: number }>
+    aiErrors: number
+  }
+  trend: Array<{ day: string; total: number; errors: number }>
+}
+
+// 对话历史（GET /ai/conversations，admin 复用本人历史接口）
+export interface AiConversationMessage {
+  role: 'system' | 'user' | 'assistant' | 'tool'
+  content: string
+  timestamp?: string
+}
+
+export interface AiConversationSummary {
+  id: string
+  provider?: string
+  model?: string
+  summary?: string
+  /** 工作账本：用户命名的会话标题（未设 = 用首条消息派生预览）。契约 conversation-data v2 起 */
+  title?: string
+  /** 契约 conversation-data v2 起：会话消息条数（结构信息，不含内容） */
+  messageCount?: number
+  messages: AiConversationMessage[]
+  createdAt: string
+  lastActivityAt: string
+}
+
+/**
+ * AU-4（§22.19）：会话**元数据**视图——审计行「一跳看对话」的第一步。
+ * 服务端保证**不含任何消息正文**（无 messages、无 summary），故「引用优先」不是 UI 装饰。
+ */
+export interface AiConversationMeta {
+  id: string
+  userId: string
+  provider: string
+  model: string
+  messageCount: number
+  createdAt: string
+  lastActivityAt: string
+}
+
+/** B-proxy 外部系统（Java 集成）接入状态（GET /ai/proxy/integrations/status，管理台监控中心） */
+export interface ProxyIntegrationStatus {
+  configured: boolean
+  baseUrl?: string
+  audience?: string
+  configuredTools?: number
+  reachable?: boolean
+  statusEnabled?: boolean
+  fetchedAt?: string
+  error?: string
+  // Java /keelbase/status 面板透传（部分字段；Secret 不外泄）
+  provenance?: string
+  delegation?: {
+    configured?: boolean
+    secretConfigured?: boolean
+    audience?: string
+    issuer?: string
+    protectedPaths?: string[]
+  }
+  export?: { enabled?: boolean; baseUrl?: string; audience?: string }
+  audit?: { enabled?: boolean; configured?: boolean; baseUrl?: string }
+  tools?: {
+    count?: number
+    names?: string[]
+    riskDistribution?: Record<string, number>
+    revokeCovered?: number
+  }
+  warnings?: string[]
+  errors?: string[]
+  health?: { status?: 'UP' | 'DOWN' | 'UNKNOWN'; summary?: string }
+}
+
+/** BA 异常行为基线：告警行（wire 契约 ai-behavior-alert v1；`evidence` 已是对象，前端不再 parse） */
+export interface BehaviorAlertRow {
+  id: number
+  rule: string
+  level: 'warning' | 'critical'
+  subject: { kind: 'conversation' | 'user'; id: string }
+  conversationId: string | null
+  title: string
+  detail: string
+  evidence: {
+    count: number
+    threshold: number
+    windowMinutes: number
+    sampleRowIds?: number[]
+    toolName?: string
+  }
+  status: 'open' | 'acknowledged'
+  createdAt: string
+  decidedAt: string | null
+}

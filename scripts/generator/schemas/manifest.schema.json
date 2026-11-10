@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "$id": "manifest.schema.json",
+  "title": "Application Model · 来源身份清单 .keelbase/manifest.json — v1",
+  "description": "PC-7（CE-2 缺口）：manifest 此前只被 doctor 逐字段手查、无声明式 schema。本 schema 与 scripts/generator/manifest.mjs 的写入形状同源（schema/identity/generator 为常量）。消费者：keelbase doctor 完整性检查 + scripts/check-app-model.mjs。",
+  "type": "object",
+  "required": ["schema", "identity", "generator", "generatorVersion", "protocol", "modules"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": { "const": 1, "description": "清单结构版本（MANIFEST_SCHEMA）" },
+    "identity": { "const": "keelbase-application" },
+    "generator": { "const": "keelbase" },
+    "generatorVersion": { "type": "string", "minLength": 1 },
+    "protocol": { "type": "string", "minLength": 1, "description": "模块协议版本（MANIFEST_PROTOCOL）" },
+    "modules": {
+      "type": "array",
+      "description": "已生成模块（复数名，排序去重）",
+      "items": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,29}$" }
+    },
+    "searchableModules": {
+      "type": "array",
+      "description": "声明了 searchable 的已生成模块，按模块名排序。每项带 fields = spec 里 string/text 字段的属性名（按声明顺序），运行时全局搜索只匹配这些列 —— 列由声明来、不在运行时嗅探类型。重生成该模块会刷新其 fields；条目不因别的模块的运行而被移除。可选键：旧清单无它仍合法",
+      "items": {
+        "type": "object",
+        "required": ["module", "fields"],
+        "additionalProperties": false,
+        "properties": {
+          "module": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,29}$" },
+          "fields": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+        }
+      }
+    }
+  }
+}

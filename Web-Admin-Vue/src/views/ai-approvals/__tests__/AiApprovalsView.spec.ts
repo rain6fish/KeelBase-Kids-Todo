@@ -1,0 +1,204 @@
+// SPDX-License-Identifier: Apache-2.0
+
+import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { mount, flushPromises } from '@vue/test-utils'
+import { defineComponent } from 'vue'
+import { createI18n } from 'vue-i18n'
+import zh from '@/i18n/zh'
+import en from '@/i18n/en'
+
+const { approvalsMock, decidedMock, decideMock, retryMock, errorMock, successMock } = vi.hoisted(() => ({
+  approvalsMock: vi.fn(),
+  decidedMock: vi.fn(),
+  decideMock: vi.fn(),
+  retryMock: vi.fn(),
+  errorMock: vi.fn(),
+  successMock: vi.fn(),
+}))
+
+vi.mock('@/api/aiTools', () => ({
+  aiToolsApi: {
+    approvals: approvalsMock,
+    decidedApprovals: decidedMock,
+    decideApproval: decideMock,
+    retryApprovalExecution: retryMock,
+  },
+}))
+vi.mock('@/stores/snackbar', () => ({
+  useSnackbarStore: () => ({ error: errorMock, success: successMock }),
+}))
+
+// AW-2: the view reads `auth.isAdmin`; default to admin so the existing decision-path assertions still
+// exercise the admin UI, and flip it to test the auditor's read-only rendering.
+// AW-2：视图读 `auth.isAdmin`；默认 admin 让既有裁决路径断言照旧，翻转后测审计读者的只读渲染。
+const authState = vi.hoisted(() => ({ isAdmin: true, isAuditor: false }))
+vi.mock('@/stores/auth', () => ({ useAuthStore: () => authState }))
+
+import ElementPlus from 'element-plus'
+import AiApprovalsView from '../AiApprovalsView.vue'
+
+const AppTableStub = defineComponent({
+  name: 'AppTable',
+  props: ['headers', 'items', 'loading'],
+  template:
+    '<div class="app-table-stub"><template v-for="item in items" :key="item.id"><slot name="item.actions" :item="item" /><slot name="item.execution" :item="item" /><slot name="item.audit" :item="item" /></template></div>',
+})
+
+function mountView() {
+  const i18n = createI18n({ legacy: false, locale: 'zh', messages: { zh, en } })
+  return mount(AiApprovalsView, {
+    global: {
+      plugins: [i18n, ElementPlus],
+      stubs: {
+        PageHeader: true,
+        AppTable: AppTableStub,
+        StatusChip: true,
+        AppIcon: true,
+      },
+    },
+  })
+}
+
+beforeEach(() => {
+  vi.clearAllMocks()
+  authState.isAdmin = true
+  authState.isAuditor = false
+})
+
+describe('AiApprovalsView', () => {
+  const decidedRow = (extra: Record<string, unknown> = {}) => ({
+    id: 9,
+    token: 't9',
+    toolName: 'create_event',
+    args: '{"title":"x"}',
+    operatorId: 'u1',
+    conversationId: null,
+    riskLevel: 'R4',
+    status: 'approved',
+    approverId: 'a1',
+    decidedAt: '2026-09-23T02:00:00Z',
+    createdAt: '2026-09-23T01:00:00Z',
+    executionState: 'failed',
+    executedAt: null,
+    executionError: '目标系统不可达',
+    ...extra,
+  })
+
+  it('P2：执行失败的行显示「执行未完成」并提供重试按钮', async () => {
+    approvalsMock.mockResolvedValue([])
+    decidedMock.mockResolvedValue([decidedRow()])
+
+    const wrapper = mountView()
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('执行未完成')
+    expect(wrapper.text()).toContain('重试执行')
+  })
+
+  it('P2：点重试 → 调 retryApprovalExecution 并重载列表', async () => {
+    approvalsMock.mockResolvedValue([])
+    decidedMock.mockResolvedValue([decidedRow()])
+    retryMock.mockResolvedValue({ ok: true, success: true })
+
+    const wrapper = mountView()
+    await flushPromises()
+    const btn = wrapper.findAll('button').find((b) => b.text().includes('重试执行'))
+    expect(btn).toBeTruthy()
+    await btn!.trigger('click')
+    await flushPromises()
+
+    expect(retryMock).toHaveBeenCalledWith('t9')
+    expect(successMock).toHaveBeenCalledWith('已重试')
+    // 重载：decided 被再次拉取
+    expect(decidedMock.mock.calls.length).toBeGreaterThan(1)
+  })
+
+  it('P2：已执行成功的行**不**显示重试按钮（不制造可重复执行的暗示）', async () => {
+    approvalsMock.mockResolvedValue([])
+    decidedMock.mockResolvedValue([
+      decidedRow({ executionState: 'succeeded', executedAt: '2026-09-23T02:00:05Z', executionError: null }),
+    ])
+
+    const wrapper = mountView()
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('已执行')
+    expect(wrapper.text()).not.toContain('重试执行')
+  })
+
+  it('挂载 → 并行调用 approvals + decidedApprovals', async () => {
+    approvalsMock.mockResolvedValue([
+      { id: 1, token: 't1', toolName: 'create_event', args: '{"title":"x"}', operatorId: 'u1', conversationId: null, riskLevel: 'R4', status: 'pending', createdAt: '2026-08-21' },
+    ])
+    decidedMock.mockResolvedValue([
+      { id: 2, token: 't2', toolName: 'create_todo', args: '{"title":"y"}', operatorId: 'u2', conversationId: null, riskLevel: 'R4', status: 'approved', approverId: 'u3', decidedAt: '2026-08-21', createdAt: '2026-08-20' },
+    ])
+
+    mountView()
+    await flushPromises()
+
+    expect(approvalsMock).toHaveBeenCalledTimes(1)
+    expect(decidedMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('auditor 只读：队列照读，批准/拒绝/重试按钮不渲染', async () => {
+    authState.isAdmin = false
+    approvalsMock.mockResolvedValue([
+      { id: 1, token: 't1', toolName: 'create_event', args: '{}', operatorId: 'u1', conversationId: null, riskLevel: 'R4', status: 'pending', createdAt: '2026-08-21' },
+    ])
+    decidedMock.mockResolvedValue([decidedRow()])
+
+    const wrapper = mountView()
+    await flushPromises()
+
+    expect(approvalsMock).toHaveBeenCalledTimes(1)
+    expect(decidedMock).toHaveBeenCalledTimes(1)
+    expect(wrapper.find('.app-table-stub .el-button--success').exists()).toBe(false)
+    expect(wrapper.find('.app-table-stub .el-button--danger').exists()).toBe(false)
+    expect(wrapper.text()).not.toContain('重试执行')
+  })
+
+  it('加载失败 → snackbar.error 提示', async () => {
+    approvalsMock.mockRejectedValue(new Error('审批服务异常'))
+
+    mountView()
+    await flushPromises()
+
+    expect(errorMock).toHaveBeenCalledWith('审批服务异常')
+  })
+
+  it('批准 → 调用 decideApproval(token, approve) + success + 刷新', async () => {
+    approvalsMock.mockResolvedValue([
+      { id: 1, token: 'tok-1', toolName: 'create_event', args: '{}', operatorId: 'u1', conversationId: null, riskLevel: 'R4', status: 'pending', createdAt: '2026-08-21' },
+    ])
+    decidedMock.mockResolvedValue([])
+    decideMock.mockResolvedValue({ ok: true, success: true })
+
+    const wrapper = mountView()
+    await flushPromises()
+
+    await wrapper.find('.app-table-stub .el-button--success').trigger('click')
+    await flushPromises()
+
+    expect(decideMock).toHaveBeenCalledWith('tok-1', 'approve')
+    expect(successMock).toHaveBeenCalledWith('已批准并执行')
+    expect(approvalsMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('拒绝 → 调用 decideApproval(token, decline)', async () => {
+    approvalsMock.mockResolvedValue([
+      { id: 2, token: 'tok-2', toolName: 'create_event', args: '{}', operatorId: 'u1', conversationId: null, riskLevel: 'R4', status: 'pending', createdAt: '2026-08-21' },
+    ])
+    decidedMock.mockResolvedValue([])
+    decideMock.mockResolvedValue({ ok: true })
+
+    const wrapper = mountView()
+    await flushPromises()
+
+    await wrapper.find('.app-table-stub .el-button--danger').trigger('click')
+    await flushPromises()
+
+    expect(decideMock).toHaveBeenCalledWith('tok-2', 'decline')
+    expect(successMock).toHaveBeenCalledWith('已拒绝')
+  })
+})

@@ -1,0 +1,95 @@
+// SPDX-License-Identifier: Apache-2.0
+
+import { AuthorizationExplainerService } from './authorization-explainer.service';
+
+/** §internal.17③ Policy Evidence：getAuthorizationReasons 单次取策略 → 决策输入 checks + 决策时策略内容指纹 revision 同源 */
+describe('AuthorizationExplainerService (§internal.17③ Policy Evidence)', () => {
+  function build(governancePolicy?: any) {
+    const toolRegistry = { riskLevel: jest.fn(() => 'R3') } as any;
+    const usersService = { findOne: jest.fn().mockResolvedValue({ role: 'user' }) } as any;
+    const service = new AuthorizationExplainerService(toolRegistry, {} as any, governancePolicy, usersService);
+    return { service };
+  }
+
+  it('单次取策略：checks 按当前 tools 派生，policy = 决策时策略内容指纹 revision + updatedAt', async () => {
+    const governancePolicy = {
+      getPolicy: jest.fn().mockResolvedValue({
+        tools: { create_event: { allowedRoles: ['admin'] } },
+        audit: { granularity: 'all' },
+        updatedAt: new Date('2026-09-04T09:20:00.000Z'),
+        revision: 'a1b2c3d4e5f6',
+      }),
+    };
+    const { service } = build(governancePolicy);
+
+    const res = await service.getAuthorizationReasons('create_event', '7', true);
+    expect(res.policy).toEqual({ revision: 'a1b2c3d4e5f6', updatedAt: '2026-09-04T09:20:00.000Z' });
+    // role_allowed：策略白名单 ['admin']，用户角色 user → ok:false
+    const roleCheck = res.checks.find((c) => c.name === 'role_allowed')!;
+    expect(roleCheck.ok).toBe(false);
+    const toolEnabled = res.checks.find((c) => c.name === 'tool_enabled')!;
+    expect(toolEnabled.ok).toBe(true); // 策略无 enable:false → 默认启用
+    expect(governancePolicy.getPolicy).toHaveBeenCalledTimes(1);
+  });
+
+  it('档位覆盖：注册表取不到时由调用方传入（外部工具）→ 不抛，按该档派生检查', async () => {
+    const toolRegistry = {
+      riskLevel: jest.fn(() => {
+        throw new Error('Tool "mcp_x" not found');
+      }),
+    } as any;
+    const service = new AuthorizationExplainerService(toolRegistry, {} as any, undefined, undefined);
+
+    // 不传 → 注册表抛（外部工具不在本地注册表：这正是调用方必须传档的原因）
+    await expect(service.getAuthorizationReasons('mcp_x', '7', true)).rejects.toThrow('not found');
+
+    // 传了 → 用传入的档，且不再碰注册表（清掉上一步的调用计数再断言）
+    toolRegistry.riskLevel.mockClear();
+    const res = await service.getAuthorizationReasons('mcp_x', '7', true, 'R3');
+    expect(res.riskLevel).toBe('R3');
+    expect(res.riskStrategy).toBe('confirmation');
+    expect(toolRegistry.riskLevel).not.toHaveBeenCalled();
+  });
+
+  it('策略禁用工具 → tool_enabled ok:false，仍带 policy.revision', async () => {
+    const governancePolicy = {
+      getPolicy: jest.fn().mockResolvedValue({
+        tools: { create_event: { enabled: false } },
+        audit: { granularity: 'all' },
+        updatedAt: new Date('2026-09-04T10:00:00.000Z'),
+        revision: 'f0e1d2c3b4a5',
+      }),
+    };
+    const { service } = build(governancePolicy);
+    const res = await service.getAuthorizationReasons('create_event', '7', true);
+    const toolEnabled = res.checks.find((c) => c.name === 'tool_enabled')!;
+    expect(toolEnabled).toMatchObject({ ok: false, note: '治理策略禁用' });
+    expect(res.policy?.revision).toBe('f0e1d2c3b4a5');
+  });
+
+  it('治理注入但无策略行（getPolicy 空库形态：updatedAt null + 空指纹）→ policy 不附，tool_enabled 默认启用', async () => {
+    // §5：无策略行/未配治理 → 不附 policy（getPolicy 恒返回空 value 内容指纹，revision 非空信号不可用，须以 updatedAt 判「有行」）
+    const governancePolicy = {
+      getPolicy: jest.fn().mockResolvedValue({
+        tools: {},
+        audit: { granularity: 'all' },
+        updatedAt: null,
+        revision: '0a1b2c3d4e5f', // 空库也返回的空指纹——旧守卫 if(policy?.revision) 会误附
+      }),
+    };
+    const { service } = build(governancePolicy);
+    const res = await service.getAuthorizationReasons('create_event', '7', true);
+    expect(res.policy).toBeUndefined();
+    const toolEnabled = res.checks.find((c) => c.name === 'tool_enabled')!;
+    expect(toolEnabled.ok).toBe(true);
+  });
+
+  it('无治理策略 → policy 不附（默认策略语义），checks 缺省 governance 项', async () => {
+    const { service } = build(undefined);
+    const res = await service.getAuthorizationReasons('query_events', '7', false);
+    expect(res.policy).toBeUndefined();
+    expect(res.checks.map((c) => c.name)).not.toContain('tool_enabled');
+    expect(res.checks.map((c) => c.name)).toEqual(['user_scoped', 'risk_policy']);
+    expect(res.riskLevel).toBe('R3');
+  });
+});

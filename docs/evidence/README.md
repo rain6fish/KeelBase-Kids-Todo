@@ -1,0 +1,221 @@
+# KeelBase Evidence System — 证据体系：每项能力「你怎么证明」
+
+> Proof Mode：**Capability Complete / Proof Incomplete** 是当前阶段主缺口——
+> 能力已声明（见 [enterprise-capabilities.md](../enterprise-capabilities.md)，对外企业级能力声明），
+> 本目录回答另一半问题：**每一项能力，用什么可运行的验证来证明它真实有效、可被第三方复核**。
+>
+> 9 月主线 = Proof Mode + Feature Freeze（非 P0 Bug 不进 Core）。证据体系按此组织：
+> 每条能力 = **声明（claim）** → **怎么证明（how to prove，可运行命令）** → **产物落在哪（artifact）** →
+> **最近证据（last verified，含日期与结果）**。
+>
+> 状态图例：✅ 已证明 / 🔶 有证据待补跑 / ⬜ 证明方法待建。
+
+---
+
+## 1. 证据分层 / Evidence Layers
+
+| 层 | 证明人 | 证明方式 | 对应资产 |
+|---|---|---|---|
+| L0 运行时可验证 | 任何带管理员 token 的人 | 调在线验证端点，现算现验 | `/audit/verify`、`/ai/eval/report` 等 |
+| L1 离线独立复核 | 审计机构 / 第三方 | 证据包 + 独立实现脚本重算，不装系统 | `verify-evidence.mjs`（只依赖 Node 内置） |
+| L2 静态留档 | 评估人 / 发布流程 | 可重复运行的评测/基准报告**代表样本**落仓 | `docs/benchmark/*.md`、`Server-NestJS/docs/benchmark/*.md`（代表性报告已入库） |
+
+> ⚠ 运行产物默认**不进仓**：`Server-NestJS/docs/benchmark/evidence-verify-*` / `docs/benchmark/generated-module-*` 已被 `.gitignore` 忽略（脚本每次跑产出一对 md+json，会持续堆积）。`protocol-conformance-*` 随 runner 搬去了契约仓，落在它的 `reports/`（同样已忽略）。**已入库的代表性报告不受影响**（gitignore 不取消已跟踪文件）；要发布某次具体证据用 `git add -f <file>`。
+
+原则：**能现算的用端点，能导出的离线复核，能留档的定期跑**。证据要「说得出、跑得动、拿得走」。
+
+---
+
+## 2. Runtime Governance（运行治理）能力证据
+
+### 2.1 审计篡改即断链（应用边界内 tamper-evident，哈希链 HS-11）
+
+- **声明**：每条 AI/操作审计入 HMAC 哈希链（`prev_hash|hash`），改任何业务字段、删行、换序都会断链；写路径 DB 级串行锁防分叉。
+- **怎么证明（运行时）**：
+  ```bash
+  # AI 审计链完整性（admin）
+  GET /api/v1/audit/verify
+  # 操作审计链完整性（admin）
+  GET /api/v1/audit/operations/verify
+  # → { valid: true, checked: N }，逐行重算 hash
+  ```
+- **怎么证明（离线复核，审计机构用）**：导出证据包 → 独立脚本重算每条 payload：
+  ```bash
+  # Server-NestJS/
+  npm run verify:evidence -- <证据包.json> --key <AUDIT_HMAC_KEY>
+  # 无 --key：链结构验证（seq/prevHash/genesis，检删行换序断链）
+  # 有 --key：全量重算 canonicalJSON + HMAC + 签名（检内容篡改）
+  ```
+- **产物**：`Server-NestJS/docs/benchmark/evidence-verify-<ts>.md`（verify-*.mjs 机器验证报告同族落点）。**默认不进仓**（被 .gitignore 忽略，防运行产物堆积）；发布某次证据用 `git add -f`。
+- **最近证据（2026-09-02）**：ECS demo 实测 `valid:true`——AI 审计链 83 行（曾断链 genesis：密钥轮换后旧密钥不可推导，已用当前密钥重签修复，改动前已备份）、操作审计链 284 行；哈希链恢复不依赖任何代码版本。
+
+### 2.2 越权拒绝（CASL 行级）
+
+- **声明**：用户/AI 只能触达本人数据；跨用户行级访问一律 403/拒绝，含 AI 工具调用。
+- **怎么证明（确定性对抗，无 LLM）**：
+  ```bash
+  # 管理台「安全演示」（A2）：GET /api/v1/ai/security-showcase/scenarios 列出场景
+  POST /api/v1/ai/security-showcase/run/:scenarioId   # 选「跨用户越权拒绝」
+  # → outcome + 决策轨迹（业务语言），复用真实 CASL 防护逻辑
+  ```
+- **怎么证明（LLM 评测）**：`POST /api/v1/ai/eval/run`（越权用例）；e2e 越权 403 用例。
+- **最近证据**：`docs/benchmark/adversarial-proof.md`；security-showcase 确定性场景（394e658）。
+
+### 2.3 提示注入拒绝（HS-8）
+
+- **声明**：注入指令（越权/改系统提示/要求泄露他人数据）不执行，返回策略拒绝。
+- **怎么证明**：security-showcase 注入拒绝场景 + `POST /ai/eval/run` 注入用例 + HS-8 注入防线 e2e。
+- **最近证据**：`docs/benchmark/adversarial-proof.md`。
+
+### 2.4 AI 写操作安全（R3 确认 / R5 阻断 / HS-3 副作用可撤销）
+
+- **声明**：AI 写工具需本人确认（R3）或双人审批（R4）；不可逆/高影响动作 R5 阻断；AI 创建的记录记副作用、管理台与本人均可撤销（软删入回收站，可恢复）。
+- **怎么证明**：
+  ```bash
+  GET  /api/v1/ai/tool-effects            # 副作用证据列表（admin）
+  DELETE /api/v1/ai/tool-effects/:id      # 撤销 AI 创建的记录（admin，回收站可恢复）
+  DELETE /api/v1/ai/my/tool-effects/:id   # 本人撤销（所有权校验）
+  # 确认门控：POST /api/v1/ai/confirmations/:token（approve/reject）
+  # 对抗场景：security-showcase「不可逆动作 R5 阻断」「写操作 R3 确认门控」
+  ```
+- **最近证据（2026-09-02）**：ECS demo 已种 2 条副作用（create_event/create_todo 指向真实事件/待办），管理台可现场演示撤销闭环。
+- **run-level approval（KB-5，批量确认不可规模化回应）** 🔶 spec 定稿、实现排 1.1：同一轮 ≥2 需即时确认写工具 → 聚成一个计划批（`mode:'run'`），逐条 diff 摘要 + 风险分层后一次授权；decline 整批跳过、逐条执行仍逐条审计/可撤销。规范：[run-level-approval.spec.md](../run-level-approval.spec.md)。验收测试随 1.1 实现落地（聚合/单条兼容/混合风险 max/R5 不并入/无摘要工具降级单独确认）。
+
+### 2.5 工具权限与治理策略（HS-2 / HS-9）
+
+- **声明**：AI 工具清单带权限元数据；治理策略数据驱动、改即生效（工具开关/确认规则/角色白名单/审计粒度）。
+- **怎么证明**：
+  ```bash
+  GET /api/v1/ai/tools                   # 工具清单 + 风险级/权限元数据
+  GET /api/v1/ai/governance/policy       # 当前治理策略
+  PUT /api/v1/ai/governance/policy       # 改策略 → 下一个调用即生效（无需发版）
+  ```
+- **最近证据（2026-09-02）**：ECS demo 已种治理策略单行（工具确认规则 + 审计粒度 all）。
+
+### 2.6 授权链「为什么允许」（A-5）
+
+- **声明**：任何审计动作可展开完整责任链 Human→Intent→Agent→Tool→Business Action + 授权依据；放行记录事件时点授权快照（`authorization.allowed`），导出不重算。
+- **怎么证明**：
+  ```bash
+  GET /api/v1/audit/logs/:id/chain            # 身份链 + 授权依据（拒绝 checks / 放行快照）
+  POST /api/v1/auth/permissions/explain       # 决策 + 依据（本人）
+  POST /api/v1/auth/permissions/explain/target # 管理员排查任意用户（admin）
+  GET  /api/v1/auth/permissions/chain          # 授权链图（授权者→角色→策略→资源→生效期）
+  ```
+- **文档**：`docs/audit-authz-snapshot.spec.md`（事件时点快照协议）。
+
+### 2.7 合规证据包（A-6 / D4）
+
+- **声明**：一键导出可提交审计机构的证据包（业务摘要 + 责任链 + 权限判断 + 审批 + 数据 diff + 技术 trace + 哈希链 + 签名），格式 `keelbase-audit-evidence/2`，第三方离线可验。
+- **证据根 v3（§internal.17 ① AUDIT-ID）**：`GET /api/v1/ai/governance/evidence-root/:resultType/:resultId`（本人/管理员）导出**单动作跨链证据包** `keelbase-audit-evidence/3`——授权快照（含 policy.revision）+ Decision Evidence + 同会话 AI 审计链行 + operation_audit 链行 + 副作用行，`root` 跨链根锚（sha256 排序锚）+ v3 canonical 整包 HMAC；`verify-evidence.mjs` 加 `/3` 分支（structure，或 `--key` 全量子链重算 + 副作用摘要 + 签名；v1/v2 不变）。
+- **怎么证明**：
+  ```bash
+  GET /api/v1/audit/action-report/export       # 导出证据包（admin，可带 userId/since/limit）
+  npm run verify:evidence -- 包.json --key ...  # 离线验证签名与哈希链（见 2.1）
+  ```
+- **证据根 v3 一键复现（KB-3，回应"哈希链锚在哪"）**：造一条确定性 AI 写动作 → 导出 v3 证据根 → 离线验证 PASS → 篡改检测 FAIL：
+  ```bash
+  cd Server-NestJS
+  npm run verify:evidence-root   # 自举隔离后端（fresh sqlite + demo provider）跑 trust-proof S7，产出 docs/benchmark/evidence-root-<ts>.json
+  # 复核（任意审计机构/第三方，离线）：
+  node scripts/verify-evidence.mjs docs/benchmark/evidence-root-<ts>.json --key <AUDIT_HMAC_KEY>
+  ```
+  边界与 N-1/N-2/N-3 一致：证据根为**应用边界内篡改即断链 + 离线可复核**的完整性证据，非防 DBA/root、非不可抵赖存储。
+- **国密 SM2 + 可信时间锚（规格先行，未实现）**：证据包签名从对称 HMAC 扩展到非对称 **SM2（SM2-with-SM3）**——第三方持公钥离线独立验签，配定期根锚 + 可选 RFC3161 时间戳（法律级可举证；信创/等保弹药）。算法与格式已冻结于 [`docs/evidence-root.spec.md`](../evidence-root.spec.md) §11（防返工）；实现触发 = 密评客户 / 首个等保现场。
+- **文档**：A-6（执行记录）。**信任边界与威胁模型**（本目录证据的"不承诺"边界源，N-1/N-2/N-3）：[docs/security/threat-model.md](../security/threat-model.md) · [EN](../security/threat-model-en.md) · [SECURITY.md Not-a-*](../../SECURITY.md)。
+
+### 2.8 审计交付物：离线自包含 HTML 报告（D-1 / D-2）
+
+- **声明**：把**机器可验**的证据（JSON + 离线验签脚本）转成**审计员双击即读、可打印归档**的单文件 HTML——**不新增证据事实**，只做聚合 / 呈现 / 打包；报告由**被验物**在审阅侧产出，服务端不进可信链。
+- **D-2 单动作证据报告**：由证据包（`keelbase-audit-evidence/1|2|3`）渲染**单动作**报告（结论 / 封面 / 摘要 / 授权依据 / 决策 / 副作用 / 链行 / 根锚 / 签名 / 验证步骤 / 诚实边界，默认中英并列）：
+  ```bash
+  cd Server-NestJS
+  node scripts/verify-evidence.mjs <pkg.json> --format=html --out report.html   # 默认 json 行为不变
+  ```
+- **D-1 期间审计报告**：由 `GET /audit/action-report/export` 产物（`keelbase-audit-evidence/2`）渲染**期间**报告——七问（谁 / 何时 / 做了什么 / 为什么 / 凭什么被允许 / 结果 / 可否独立验证）+ 期间摘要 + 动作构成 + **逐条动作索引**（每条**链接**到该动作的 D-2 报告）：
+  ```bash
+  cd Server-NestJS
+  node scripts/render-period-report.mjs <export.json> [--key <AUDIT_HMAC_KEY>] [--lang zh|en] --out report.html
+  ```
+- **边界（报告内固定声明）**：明细为样本（显式打印「明细样本 N / 总数 M」）；无 `--key` 为结构验证（**未重算**）；尾行截断不可检（需外部锚 = D-4）；「tamper-evident（应用边界内）」非「物理不可改」。
+- **零外链 / 零依赖**：CSS 内联、无 `<script src>` / 远程字体图片 / `fetch`；仅 Node 内置，**无新增 npm 依赖**。测试：`npm run cli:test`（根 `scripts/*.test.mjs`）。
+- **D-3 人读「决策说明」**：授权快照（角色 / 行级范围 / 策略版本 / 检查清单 + P-③ 回放三态）翻成审计员读得懂的「凭什么允许 / 为何拒绝」——由 `audit-interpreter.service` 的 `explainAuthorization` **单一真源**产出（确定性模板、非 LLM），随 AI 审计响应与 `/2` 导出 `compliance[].decisionNote` 下发；语义 key `authz.allow` / `authz.deny` / `authz.unknown` / `authz.replay.*`。
+- **文档**：[`docs/evidence-report.spec.md`](../evidence-report.spec.md)（D-2）· [`docs/period-audit-report.spec.md`](../period-audit-report.spec.md)（D-1）· [`docs/decision-note.spec.md`](../decision-note.spec.md)（D-3）。
+
+---
+
+## 3. Trust（信任）能力证据
+
+### 3.1 Business-safe Agent 评测（Benchmark）
+
+- **声明**：AI 工具行为在确定性安全用例集（越权/注入/写拒绝/PII/无头隔离）下不越界。
+- **怎么证明**：
+  ```bash
+  POST /api/v1/ai/eval/run      # 跑评测批（admin，逐用例调 LLM）
+  GET  /api/v1/ai/eval/report   # 最近评测报告
+  POST /api/v1/ai/eval/seed     # 补齐内置安全评测用例（幂等）
+  ```
+- **产物**：`docs/benchmark/agent-benchmark-*.md`、`adversarial-proof.md`、`stranger-challenge-report-*.md`。
+
+### 3.2 私有 AI / 数据主权（POV-1）
+
+- **声明**：可全本地部署（Ollama），数据不出域。
+- **怎么证明**：私有 AI 验证脚本 + 留档 `docs/benchmark/private-ai.json`；`docker compose --profile private-ai up -d ollama` 后配 `AI_PROVIDER=ollama`。
+
+### 3.3 失败路径可信（KB-4）
+
+- **声明**：在失败分支（超时 / DB 故障 / 补偿失败 / 未知结果 / 重复执行 / 审计中断）下 Runtime 仍可信——**如实记录状态、不假装成功、不重复副作用、证据不丢**；外部调用有界（超时不无限挂起）。
+- **怎么证明（确定性，无 LLM）**：
+  ```bash
+  cd Server-NestJS
+  npm run test:failure-path   # A 层 fault-injection 语料（src/ai/failure-path/failure-path-corpus.spec.ts）
+  npx jest --config test/jest-e2e.json test/failure-path.e2e-spec.ts   # B 层真实链路
+  # 全绿断言：FP-1/5 幂等（唯一冲突 skip）、FP-2 确认 token 一次性、FP-3 超时有界、
+  #           FP-4 DB 故障不吞、FP-6 审计 fail-closed、FP-7 补偿失败如实、FP-8 未知结果如实
+  ```
+- **文档**：`docs/failure-path-corpus.spec.md`（语料清单 + Known limits：execute→record 非原子窗口如实记录，不修）。
+- **产物**：`docs/benchmark/failure-path-*.md`。
+- **最近证据**：KB-4 落地（2026-09-07，F1 超时守卫 + F2 record 不吞 DB 错误 + 语料）。
+
+---
+
+## 4. Build / 质量能力证据
+
+### 4.1 性能与并发
+
+- **声明**：公开/认证/DB/AI 场景吞吐与延迟基线可对比（含 AI 并发、SSE 首字节）。
+- **怎么证明**：
+  ```bash
+  # Server-NestJS/，docs/benchmark/README.md 有完整前置
+  node scripts/benchmark/run-benchmark.mjs     # 默认 8s × 8 并发
+  # BENCH_SECONDS=20 BENCH_CONNECTIONS=50 ... 自定义
+  ```
+- **产物**：`docs/benchmark/benchmark-*.md`（p99 延迟基线，如 2026-08-29：/app/version 789 req/s p99 45ms）。
+
+### 4.2 回归防线（测试 / 覆盖率 / 安全门禁）
+
+- **声明**：改动带回归防线；覆盖率门槛 + 安全模块分档门禁；e2e + Release Gate 确定性。
+- **怎么证明**：
+  ```bash
+  npm test                        # 后端单测
+  npm run test:cov                # 覆盖率门槛（statements≥86 + check-security-coverage 分档）
+  npm run test:e2e                # 端到端
+  npm run lint
+  # CI：lint + 单测/e2e + 构建 + 前端 typecheck/build + Flutter analyze/test（.github/workflows/ci.yml）
+  ```
+
+---
+
+## 5. 使用说明 / How to Use
+
+- **现场演示**（带管理员账号，在线环境）：2.1 链 verify → 2.2/2.3 安全演示 → 2.4 撤销闭环 → 2.7 证据包导出 + 离线验证。demo 环境已含 2.1/2.4/2.5 的种子证据（ECS `reset-test-data.js` **每 3 天 03:00** 由 cron 重种）。
+- **写新证据**：新增能力按本目录格式补一行「声明 → 怎么证明 → 产物」；能用既有端点/脚本的组织，不另造证明体系。
+- **对外语言红线**：本目录只用能力语言（证明/证据/可信/可复核），不使用竞争性措辞或内部规划代号。
+
+## 相关文档 / Related Docs
+
+- [enterprise-capabilities.md](../enterprise-capabilities.md) —— 能力「声明」侧（对外企业级能力声明）
+- [docs/benchmark/](../benchmark/README.md) —— 评测/压测/对抗性证明报告库
+- HS 系规格：`docs/hs11-audit-chain.spec.md`、`docs/hs9-governance-policy.spec.md`、`docs/hs10-mcp-adapter.spec.md`
+- 审计取证规格：`docs/audit-authz-snapshot.spec.md`、`docs/audit-unauthorized-view.spec.md`、`docs/audit-lifecycle-elsteps.spec.md`
+- [keelbase-dna.md](../keelbase-dna.md) —— 四核心原则（Runtime over Prompt / Capability≠Authority / Trust Verifiable / Design for Recovery）

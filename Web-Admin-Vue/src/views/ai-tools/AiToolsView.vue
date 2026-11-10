@@ -1,0 +1,460 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<template>
+  <div>
+    <PageHeader :title="t('navAiTools')" />
+
+    <!-- N-6 AI-23 内容安全配置（Settings ai_content_safety，实时生效） -->
+    <el-card v-if="canEdit" shadow="never" class="mb-4">
+      <template #header>
+        <div class="d-flex align-center justify-space-between">
+          <span>{{ t('contentSafetyTitle') }}</span>
+          <div>
+            <el-button text :disabled="savingSafety" @click="loadContentSafety()">
+              <template #icon><AppIcon icon="mdi-restore" /></template>
+              {{ t('resetPolicy') }}
+            </el-button>
+            <el-button type="primary" :loading="savingSafety" @click="onSaveContentSafety()">
+              <template #icon><AppIcon icon="mdi-content-save" /></template>
+              {{ t('savePolicy') }}
+            </el-button>
+          </div>
+        </div>
+      </template>
+      <div class="d-flex align-center ga-2 mb-3">
+        <el-switch v-model="contentSafety.enabled" />
+        <span class="text-caption text-medium-emphasis">{{ t('contentSafetyHint') }}</span>
+      </div>
+      <div class="mb-3">
+        <div class="text-caption font-weight-medium mb-1">{{ t('contentSensitiveWords') }}</div>
+        <el-input v-model="contentSafety.sensitiveText" type="textarea" :rows="4" :placeholder="t('contentWordsPlaceholder')" />
+      </div>
+      <div>
+        <div class="text-caption font-weight-medium mb-1">{{ t('contentJailbreakWords') }}</div>
+        <el-input v-model="contentSafety.jailbreakText" type="textarea" :rows="3" :placeholder="t('contentWordsPlaceholder')" />
+      </div>
+    </el-card>
+
+    <el-card shadow="never" class="mb-4">
+      <template #header>{{ t('toolInventory') }}</template>
+      <div v-if="tools.length">
+        <el-row :gutter="16">
+          <el-col v-for="tool in tools" :key="tool.name" :xs="24" :md="12" :lg="8">
+            <el-card shadow="never" class="mb-4">
+              <template #header>
+                <div class="text-subtitle-1 d-flex align-center ga-2">
+                  <AppIcon
+                    :icon="tool.requiresConfirmation ? 'mdi-shield-check-outline' : 'mdi-wrench-outline'"
+                    :color="tool.requiresConfirmation ? 'var(--el-color-warning)' : 'var(--el-color-primary)'"
+                    size="18"
+                  />
+                  {{ tool.name }}
+                  <el-tag v-if="tool.requiresConfirmation" size="small" type="warning" effect="light">{{ t('requiresConfirmation') }}</el-tag>
+                  <el-tag v-if="tool.riskLevel" size="small" :type="riskTag(tool).type" effect="light">{{ tool.riskLevel }} · {{ riskTag(tool).label }}</el-tag>
+                  <el-tag v-if="tool.revokeClass" size="small" :type="revokeClassTag(tool.revokeClass, t).type" effect="plain">{{ revokeClassTag(tool.revokeClass, t).label }}</el-tag>
+                </div>
+              </template>
+              <div class="text-caption">
+                <div class="text-medium-emphasis mb-1">{{ tool.description }}</div>
+                <div v-if="tool.parameters.length">
+                  <span class="font-weight-medium">{{ t('parameters') }}:</span>
+                  {{ tool.parameters.map((p) => `${p.name}${p.required ? '*' : ''}`).join(', ') }}
+                </div>
+                <div v-if="tool.permissions?.adminOnly" class="text-error">{{ t('adminOnly') }}</div>
+              </div>
+            </el-card>
+          </el-col>
+        </el-row>
+      </div>
+      <div v-else class="text-medium-emphasis">{{ t('loading') }}</div>
+    </el-card>
+
+    <PageHeader v-if="canEdit" :title="t('toolEffects')">
+      <el-button @click="loadEffects()">
+        <template #icon><AppIcon icon="mdi-refresh" /></template>
+        {{ t('refresh') }}
+      </el-button>
+    </PageHeader>
+
+    <el-card v-if="canEdit" shadow="never" class="mb-4">
+      <div class="d-flex ga-3 align-center">
+        <el-input v-model="effectUserId" :label="t('filterByUserId')" type="number" style="max-width: 180px" />
+        <el-button type="primary" @click="loadEffects(1)">
+          <template #icon><AppIcon icon="mdi-filter-variant" /></template>
+          {{ t('filter') }}
+        </el-button>
+      </div>
+    </el-card>
+
+    <AppTable v-if="canEdit" :headers="effectHeaders" :items="effects" :loading="effectsLoading" :total="effectTotal" :items-per-page="limit">
+      <template #item.resultType="{ item }">
+        <StatusChip :status="item.resultType" :label-map="resultTypeMap" />
+      </template>
+      <template #item.createdAt="{ item }">{{ formatTime(item.createdAt) }}</template>
+      <template #item.targetTitle="{ item }">
+        <div>{{ item.targetTitle || '-' }}</div>
+        <!-- REV-11 / REV-7：两件此前读不出来的事，现在由该行自己回答 -->
+        <div class="text-caption text-medium-emphasis">
+          <span v-if="item.ownerUserId">{{ t('ownerUserId') }}: {{ item.ownerUserId }}</span>
+          <span v-if="item.agentId"> · {{ t('agentId') }}: {{ item.agentId }}</span>
+          <!-- REV-11：已认领就写明谁接手了；未认领且滞留则由操作列的认领钮承载 -->
+          <span v-if="item.revokeClaimedBy"> · {{ t('claimedBy') }}: {{ item.revokeClaimedBy }}</span>
+        </div>
+        <!-- REV-6/REV-13：身份缺「变更」那半 —— 四种成因不等价，故障那两种不该被读成设计 -->
+        <div v-if="item.identityIncomplete" class="text-caption text-warning">
+          {{ t('identityIncomplete') }}
+          <span v-if="item.identityIncompleteReason">· {{ item.identityIncompleteReason }}</span>
+          <span v-else>· {{ t('identityReasonUnknown') }}</span>
+        </div>
+        <!-- REV-10：本次调用写了、账上却没有的行 —— **写时**就看得见，不必等撤销时才发现 -->
+        <div v-if="item.undeclaredWrites?.length" class="text-caption text-error">
+          {{ t('undeclaredWrites', { n: item.undeclaredWrites.length }) }}:
+          {{ undeclaredLabel(item) }}
+        </div>
+      </template>
+      <template #item.fieldDiff="{ item }">
+        <el-button v-if="item.afterSnapshot" text size="small" type="primary" @click="showDiff(item)">
+          {{ diffCount(item) }} {{ t('diffFields') }}
+        </el-button>
+        <span v-else class="text-medium-emphasis">—</span>
+      </template>
+      <template #item.status="{ item }">
+        <!-- REV-1: when the group's declaration and its held rows disagree, the primary reading must
+             not be the green "active" chip — reading a bookkeeping disagreement as "all fine" is
+             exactly what this prevents.
+             REV-1：该组的「声明」与「持有」在打架时，主读数不得是绿色的「进行中」——
+             把两本账不一致读成「一切正常」，正是这条要挡的。 -->
+        <StatusChip v-if="item.disputed" status="disputed" :label-map="effectStatusMap" :color-map="effectStatusColorMap" />
+        <!-- ARC-6: acknowledging means "a human looked and accepted the evidence", not "the
+             disagreement went away" — so it is still not green, and it says who acknowledged when.
+             ARC-6：确认 = 「有人看过并接受了证据」，不是「不一致消失了」——仍不是绿色，且注明谁在何时确认 -->
+        <template v-else-if="item.dispute?.acknowledgedAt">
+          <StatusChip status="disputedAck" :label-map="effectStatusMap" :color-map="effectStatusColorMap" />
+          <div class="text-caption text-medium-emphasis mt-1">
+            {{ t('effectDisputedAcknowledged', { by: item.dispute.acknowledgedBy || '-', at: formatTime(item.dispute.acknowledgedAt) }) }}
+          </div>
+        </template>
+        <!-- KB-6 据档位诚实渲染：none 不承诺可撤；governed_external 撤销后显示"已请求补偿/结果未知"而非已撤销 -->
+        <StatusChip v-else-if="item.status === 'revoked'" status="cancelled" :label-map="effectStatusMap" :color-map="effectStatusColorMap" />
+        <StatusChip v-else-if="item.status === 'revoking_external'" status="revoking" :label-map="effectStatusMap" :color-map="effectStatusColorMap" />
+        <StatusChip v-else-if="item.status === 'revoke_failed'" status="error" :label-map="effectStatusMap" :color-map="effectStatusColorMap" />
+        <StatusChip v-else status="ok" :label-map="effectStatusMap" :color-map="effectStatusColorMap" />
+        <!-- REV-2 refinement: "external revoke pending" splits into two windows — may never have
+             reached the target vs. reached it and heard nothing back.
+             REV-2 细化：「外部撤销中」再分两窗——可能根本没到达 vs 到达了但没回音 -->
+        <div
+          v-if="item.revokeWindow"
+          class="text-caption mt-1"
+          :class="item.revokeWindow === 'unacknowledged' ? 'text-warning' : 'text-medium-emphasis'"
+        >
+          <span class="font-weight-medium">{{ t('revokeWindowLabel') }}:</span>
+          {{ revokeWindowLabel(item.revokeWindow) }}
+        </div>
+      </template>
+      <template #item.actions="{ item }">
+        <el-button
+          v-if="canRevoke(item)"
+          text
+          size="small"
+          type="danger"
+          :title="t('revokeEffect')"
+          @click="confirmRevoke(item)"
+        >
+          <AppIcon icon="mdi-undo-variant" />
+        </el-button>
+        <span v-else-if="item.status === 'revoking_external'" class="text-medium-emphasis text-caption">{{ t('revokingExternalHint') }}</span>
+        <span v-else-if="item.status === 'revoke_failed'" class="text-error text-caption">{{ t('revokeFailed') }}</span>
+        <span v-else class="text-medium-emphasis text-caption">—</span>
+        <!-- REV-11：滞留且无人接手 ⇒ 可认领。这是**派生**读数（服务端给），不是前端自己算的 -->
+        <el-button
+          v-if="item.revokeNeedsClaim"
+          text
+          size="small"
+          type="warning"
+          :title="t('claimEffect')"
+          @click="onClaim(item)"
+        >
+          <AppIcon icon="mdi-account-arrow-right-outline" />
+        </el-button>
+        <!-- ARC-6：有争议且**尚未确认** ⇒ 可确认（解除「未了结」，证据仍留） -->
+        <el-button
+          v-if="item.disputed && !item.dispute?.acknowledgedAt"
+          text
+          size="small"
+          type="info"
+          :title="t('acknowledgeDispute')"
+          @click="onAcknowledgeDispute(item)"
+        >
+          <AppIcon icon="mdi-flag-checkered" />
+        </el-button>
+      </template>
+    </AppTable>
+
+    <AppPagination v-if="canEdit" :page="effectPage" :limit="limit" :total="effectTotal" :loading="effectsLoading" @update:page="loadEffects" />
+
+    <ConfirmDialog
+      v-if="canEdit"
+      v-model="showRevoke"
+      :title="t('revokeEffect')"
+      :content="t('revokeEffectConfirm', { title: pending?.targetTitle || `#${pending?.resultId}` })"
+      @confirm="onRevoke"
+    />
+
+    <!-- E-1 字段级变更审计：副作用目标记录 before/after diff -->
+    <el-dialog v-if="canEdit" v-model="showDiffDialog" :title="t('fieldChange')" width="600px">
+      <FieldDiff v-if="diffTarget" :before="diffTarget.beforeSnapshot" :after="diffTarget.afterSnapshot" />
+    </el-dialog>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { computed, onMounted, ref } from 'vue'
+import { useI18n } from 'vue-i18n'
+import PageHeader from '@/components/PageHeader.vue'
+import AppTable from '@/components/AppTable.vue'
+import AppPagination from '@/components/AppPagination.vue'
+import StatusChip from '@/components/StatusChip.vue'
+import ConfirmDialog from '@/components/ConfirmDialog.vue'
+import FieldDiff from '@/components/FieldDiff.vue'
+import { useSnackbarStore } from '@/stores/snackbar'
+import { useAuthStore } from '@/stores/auth'
+import { aiToolsApi } from '@/api/aiTools'
+import { settingsApi } from '@/api/settings'
+import { formatTime } from '@/utils/format'
+import { revokeClassTag } from '@/utils/revokeClass'
+import type { AdminAiTool, ToolEffect } from '@/types/admin'
+
+const { t } = useI18n()
+const snackbar = useSnackbarStore()
+const auth = useAuthStore()
+// AW-2: the auditor reads the tool inventory; the content-safety editor and the effects ledger are
+// admin-only on the server, so they do not render for it (an entry that 403s is worse than none).
+// AW-2：审计读者只读工具清单；内容安全编辑与副作用账本在服务端仍只给管理员，故对它不渲染。
+const canEdit = computed(() => auth.isAdmin)
+
+const tools = ref<AdminAiTool[]>([])
+const effects = ref<ToolEffect[]>([])
+const effectTotal = ref(0)
+const effectPage = ref(1)
+const limit = 20
+const effectsLoading = ref(false)
+const effectUserId = ref<number | undefined>(undefined)
+// E-1 字段级变更审计：查看目标记录 before/after diff
+const diffTarget = ref<ToolEffect | null>(null)
+const showDiffDialog = ref(false)
+
+// N-6 内容安全配置编辑状态（textarea 用文本，保存时 split）
+const contentSafety = ref<{ enabled: boolean; sensitiveText: string; jailbreakText: string }>({ enabled: true, sensitiveText: '', jailbreakText: '' })
+const savingSafety = ref(false)
+
+const resultTypeMap = computed(() => ({ event: t('events'), todo: t('todos') }))
+// KB-6：副作用归一状态文案 + 色（revoking_external = 已请求外部补偿/结果未知，禁显示 revoked）
+const effectStatusMap = computed(() => ({
+  ok: t('active'),
+  cancelled: t('cancelled'),
+  revoking: t('statusRevokingExternal'),
+  error: t('statusRevokeFailed'),
+  // REV-1 / ARC-6: a dispute is **another reading**, not folded into the four values above — open is
+  // red, acknowledged is orange (still not green).
+  // REV-1 / ARC-6：争议是**另一种读数**，不混进上面四值——未了结给红，已确认给橙（仍不是绿）
+  disputed: t('effectDisputed'),
+  disputedAck: t('effectDisputedAckChip'),
+}))
+const effectStatusColorMap = computed(() => ({
+  ok: 'success',
+  cancelled: 'warning',
+  revoking: 'warning',
+  error: 'danger',
+  disputed: 'danger',
+  disputedAck: 'warning',
+}))
+
+
+/** 撤销可点：服务端单一权威下发 revocable（不再客户端重算档位规则，防与后端漂移） */
+function canRevoke(item: ToolEffect): boolean {
+  return item.revocable ?? false
+}
+
+/**
+ * REV-2 refinement: the two window readings of `compensating`. Neither means "revoked", but their
+ * uncertainty differs: no acknowledgement = the request may never have arrived; acknowledged =
+ * it did arrive and only the final state is missing. The server already computed it
+ * (`revokeWindow`); the front end only renders the two values as distinguishable sentences.
+ *
+ * REV-2 细化：`compensating` 的两个窗口读数。两者都**不是**「已撤销」，但不确定性不同：
+ * 无确认凭据 = 请求可能根本没到达；有确认凭据 = 确实到达了、只是没有终态。
+ * 服务端已算好（`revokeWindow`），前端只负责把两个值渲染成可区分的一句话。
+ */
+function revokeWindowLabel(window: string): string {
+  return window === 'unacknowledged' ? t('revokeWindowUnacknowledged') : t('revokeWindowAwaitingTarget')
+}
+
+/**
+ * REV-10：把「账上没有的写」渲染成一行可读文本（`实体#id`）。主键未知时给 `?` ——
+ * 「知道写了那张表、不知道哪一行」仍然是「账上没有」，不拿一个假 id 去填。
+ */
+function undeclaredLabel(item: ToolEffect): string {
+  return (item.undeclaredWrites ?? []).map((w) => `${w.entity}#${w.id ?? '?'}`).join(', ')
+}
+
+/** E-1：副作用目标记录字段变更数（无快照 0；非法 JSON 0） */
+function diffCount(item: ToolEffect): number {
+  if (!item.afterSnapshot) return 0
+  try {
+    const after = JSON.parse(item.afterSnapshot) as Record<string, unknown>
+    if (!item.beforeSnapshot) return Object.keys(after).length
+    const before = JSON.parse(item.beforeSnapshot) as Record<string, unknown>
+    const keys = new Set([...Object.keys(before), ...Object.keys(after)])
+    return [...keys].filter((k) => JSON.stringify(before[k]) !== JSON.stringify(after[k])).length
+  } catch {
+    return 0
+  }
+}
+
+function showDiff(item: ToolEffect) {
+  diffTarget.value = item
+  showDiffDialog.value = true
+}
+
+/** W5 风险级标签：R5 阻断（红）/ R4 人工审批（橙）/ R3 需确认（橙）/ R0-R2 自动（绿） */
+function riskTag(tool: AdminAiTool) {
+  const lv = tool.riskLevel || ''
+  if (lv === 'R5') return { label: t('riskBlocked'), type: 'danger' as const }
+  if (lv === 'R4') return { label: t('riskApproval'), type: 'warning' as const }
+  if (lv === 'R3') return { label: t('riskConfirm'), type: 'warning' as const }
+  return { label: t('riskAuto'), type: 'success' as const }
+}
+
+const effectHeaders = computed(() => [
+  { key: 'id', title: t('idCol') },
+  { key: 'toolName', title: t('tool') },
+  { key: 'resultType', title: t('resultType') },
+  { key: 'resultId', title: t('resultId') },
+  { key: 'targetTitle', title: t('titleLabel') },
+  { key: 'fieldDiff', title: t('fieldChange') },
+  { key: 'status', title: t('statusCol') },
+  { key: 'createdAt', title: t('createdAt') },
+  { key: 'actions', title: t('actionCol') },
+])
+
+/** 加载工具清单（治理策略编辑已收敛至独立「策略中心」，不在此维护双编辑器）。 */
+async function loadTools() {
+  try {
+    tools.value = await aiToolsApi.tools()
+  } catch (err) {
+    snackbar.error(err instanceof Error ? err.message : t('loadFailed'))
+  }
+}
+
+/** N-6 加载内容安全配置（Settings ai_content_safety） */
+async function loadContentSafety() {
+  try {
+    const rows = await settingsApi.list()
+    const row = rows.find((r) => r.key === 'ai_content_safety')
+    if (row) {
+      const parsed = JSON.parse(row.value || '{}') as { enabled?: boolean; sensitive?: string[]; jailbreak?: string[] }
+      contentSafety.value = {
+        enabled: parsed.enabled !== false,
+        sensitiveText: Array.isArray(parsed.sensitive) ? parsed.sensitive.join('\n') : '',
+        jailbreakText: Array.isArray(parsed.jailbreak) ? parsed.jailbreak.join('\n') : '',
+      }
+    } else {
+      contentSafety.value = { enabled: true, sensitiveText: '', jailbreakText: '' }
+    }
+  } catch {
+    // 缺省不填（默认表由后端兜底）
+  }
+}
+
+/** N-6 保存内容安全配置（换行/逗号分隔 → JSON → PUT 实时生效） */
+async function onSaveContentSafety() {
+  savingSafety.value = true
+  try {
+    const split = (s: string) => s.split(/\n|,/).map((x) => x.trim()).filter(Boolean)
+    await settingsApi.update(
+      'ai_content_safety',
+      JSON.stringify({
+        enabled: contentSafety.value.enabled,
+        sensitive: split(contentSafety.value.sensitiveText),
+        jailbreak: split(contentSafety.value.jailbreakText),
+      }),
+    )
+    snackbar.success(t('policySaved'))
+  } catch {
+    snackbar.error(t('loadFailed'))
+  } finally {
+    savingSafety.value = false
+  }
+}
+
+async function loadEffects(p = 1) {
+  effectsLoading.value = true
+  try {
+    const res = await aiToolsApi.effects(effectUserId.value, p, limit)
+    effects.value = res.items
+    effectTotal.value = res.total
+    effectPage.value = p
+  } catch (err) {
+    snackbar.error(err instanceof Error ? err.message : t('loadFailed'))
+  } finally {
+    effectsLoading.value = false
+  }
+}
+
+const showRevoke = ref(false)
+const pending = ref<ToolEffect | null>(null)
+function confirmRevoke(item: ToolEffect) {
+  pending.value = item
+  showRevoke.value = true
+}
+async function onRevoke() {
+  if (!pending.value) return
+  try {
+    await aiToolsApi.revokeEffect(pending.value.id)
+    snackbar.success(t('revoked'))
+    loadEffects(effectPage.value)
+  } catch (err) {
+    snackbar.error(err instanceof Error ? err.message : t('revokeFailed'))
+  } finally {
+    showRevoke.value = false
+  }
+}
+
+/**
+ * REV-11：认领一条滞留补偿。服务端的拒绝**分种类**（`not_stale` / `already_claimed` / `not_found`）——
+ * 对看台子的人是三回事，故各自给一句文案，不压成一个「失败」。
+ */
+const CLAIM_REFUSAL_KEYS: Record<string, string> = {
+  not_stale: 'claimNotStale',
+  already_claimed: 'claimAlreadyClaimed',
+  not_found: 'claimNotFound',
+}
+
+async function onClaim(item: ToolEffect) {
+  try {
+    const res = await aiToolsApi.claimEffect(item.id)
+    if (res.outcome === 'claimed') snackbar.success(t('claimDone'))
+    else snackbar.warning(t(CLAIM_REFUSAL_KEYS[res.outcome] ?? 'claimNotStale'))
+    loadEffects(effectPage.value)
+  } catch (err) {
+    snackbar.error(err instanceof Error ? err.message : t('loadFailed'))
+  }
+}
+
+/** ARC-6：确认争议 —— 解除「未了结」，证据仍留。人的动作，故失败要报出来而不是静默。 */
+async function onAcknowledgeDispute(item: ToolEffect) {
+  try {
+    await aiToolsApi.acknowledgeDispute(item.id)
+    snackbar.success(t('disputeAcknowledged'))
+    loadEffects(effectPage.value)
+  } catch (err) {
+    snackbar.error(err instanceof Error ? err.message : t('loadFailed'))
+  }
+}
+
+onMounted(() => {
+  loadTools()
+  if (!canEdit.value) return
+  loadEffects()
+  loadContentSafety()
+})
+</script>

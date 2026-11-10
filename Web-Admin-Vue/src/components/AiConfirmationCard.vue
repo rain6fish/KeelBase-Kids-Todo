@@ -1,0 +1,208 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<template>
+  <div class="ai-confirm-card pa-3" :class="{ 'border-left': true }">
+    <!-- 标题：写操作需确认 + 工具名 -->
+    <div class="d-flex align-center ga-2 mb-2">
+      <AppIcon icon="mdi-shield-alert" color="var(--el-color-warning)" size="20" />
+      <span class="text-body-2 font-weight-medium">{{ t('confirmTitle') }}</span>
+      <el-tag v-if="riskLabel" size="small" :type="riskTagType" effect="light">{{ riskLabel }}</el-tag>
+      <el-tag v-if="confirmation.mode === 'approval'" size="small" type="warning" effect="plain">{{ t('riskApproval') }}</el-tag>
+    </div>
+
+    <!-- §22.17 ④ 影响预览：确认前告知将动到几个动作、哪类对象（估计值，非承诺） -->
+    <div v-if="impactText" class="d-flex align-center ga-1 text-caption mb-2">
+      <AppIcon icon="mdi-chart-timeline-variant" size="16" color="var(--el-color-info)" />
+      <span>{{ impactText }}</span>
+    </div>
+
+    <!-- §22.17 ④ 影响预览 v1.1 撤销口径：能撤才说能撤（KB-6 revokeClass 四档，与撤销/工具治理页同一词表） -->
+    <div v-if="revokeTags.length" class="d-flex align-center ga-1 text-caption mb-2">
+      <AppIcon icon="mdi-undo-variant" size="16" color="var(--el-color-info)" />
+      <span>{{ t('confirmRevoke') }}</span>
+      <el-tag v-for="(tag, i) in revokeTags" :key="i" size="small" :type="tag.type" effect="plain">
+        {{ tag.label }}<template v-if="tag.count > 1"> ×{{ tag.count }}</template>
+      </el-tag>
+    </div>
+
+    <!-- KB-5 run 卡（mode==='run'）：整批动作列表 + runRisk 徽标，一次授权 / 整批跳过 -->
+    <template v-if="isRun">
+      <div class="d-flex align-center ga-2 mb-2">
+        <el-tag size="small" type="warning" effect="light">{{ runRiskLabel }}</el-tag>
+        <span class="text-body-2 text-medium-emphasis">{{ runCountLabel }}</span>
+      </div>
+      <div class="run-items mb-2">
+        <div v-for="(item, i) in runItems" :key="i" class="d-flex align-center ga-2 run-item">
+          <AppIcon icon="mdi-arrow-right-thin" size="16" />
+          <span class="text-body-2 flex-grow-1">{{ presentText(item.summary) || item.toolName }}</span>
+          <el-tag v-if="item.riskLevel" size="small" effect="plain">{{ item.riskLevel }}</el-tag>
+        </div>
+      </div>
+      <div class="text-caption text-medium-emphasis mb-2">{{ t('confirmNeedsConfirmation') }}</div>
+      <div class="d-flex align-center justify-end mt-2 ga-2">
+        <el-button size="small" @click="emit('rejected')">
+          <template #icon><AppIcon icon="mdi-close" /></template>
+          {{ t('confirmReject') }}
+        </el-button>
+        <el-button size="small" type="primary" @click="emit('approved', false)">
+          <template #icon><AppIcon icon="mdi-check" /></template>
+          {{ t('confirmApprove') }}
+        </el-button>
+      </div>
+    </template>
+
+    <!-- 单动作卡（R3 即时 / R4 已提交审批） -->
+    <template v-else>
+      <div class="text-body-2 mb-1">{{ presentText(confirmation.summary) || confirmation.toolName }}</div>
+      <div v-if="hasArgs" class="text-caption text-medium-emphasis mb-1" style="font-family: monospace; white-space: pre-wrap">{{ argsText }}</div>
+
+      <!-- Why：为何需要确认（风险级人类语言） -->
+      <div class="text-caption text-medium-emphasis mb-2">{{ t('confirmNeedsConfirmation') }}</div>
+
+      <!-- 技术详情（授权检查清单，可展开） -->
+      <div v-if="confirmation.authorization?.checks?.length">
+        <el-button text size="small" class="pa-0 mb-1" @click="showDetail = !showDetail">
+          {{ showDetail ? t('collapseTechDetail') : t('expandTechDetail') }}
+          <AppIcon :icon="showDetail ? 'mdi-chevron-up' : 'mdi-chevron-down'" size="16" />
+        </el-button>
+        <div v-if="showDetail" class="pa-2" style="background: var(--el-fill-color-light); border-radius: 4px">
+          <div v-for="c in confirmation.authorization.checks" :key="c.name" class="d-flex align-center ga-1 text-body-2">
+            <AppIcon :icon="c.ok ? 'mdi-check-circle' : 'mdi-close-circle'" :color="c.ok ? 'var(--el-color-success)' : 'var(--el-color-danger)'" size="16" />
+            <span :class="c.ok ? '' : 'text-error'">{{ c.note || c.name }}</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 操作：信任勾选 + 批准/拒绝 -->
+      <div class="d-flex align-center justify-space-between mt-2">
+        <el-checkbox v-model="trustTool" size="small">{{ t('confirmTrustTool') }}</el-checkbox>
+        <div class="d-flex ga-2">
+          <el-button size="small" @click="emit('rejected')">
+            <template #icon><AppIcon icon="mdi-close" /></template>
+            {{ t('confirmReject') }}
+          </el-button>
+          <el-button size="small" type="primary" @click="emit('approved', trustTool)">
+            <template #icon><AppIcon icon="mdi-check" /></template>
+            {{ t('confirmApprove') }}
+          </el-button>
+        </div>
+      </div>
+    </template>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { computed, ref } from 'vue'
+import { useI18n } from 'vue-i18n'
+import AppIcon from '@/components/AppIcon.vue'
+import { revokeClassTag, type RevokeClassTagType } from '@/utils/revokeClass'
+import type { AiConfirmation } from '@/utils/streamChat'
+import { usePresentText } from '@/utils/presentation'
+
+const presentText = usePresentText()
+
+const props = defineProps<{ confirmation: AiConfirmation }>()
+const emit = defineEmits<{
+  approved: [trustTool: boolean]
+  rejected: []
+}>()
+
+const { t } = useI18n()
+const trustTool = ref(false)
+const showDetail = ref(false)
+
+// KB-5：run 卡分支（mode==='run' 整批授权；run 卡隐藏 HS-6 信任勾选——per-tool 信任语义不被批内模糊）
+const isRun = computed(() => props.confirmation.mode === 'run' && !!props.confirmation.run)
+const runItems = computed(() => props.confirmation.run?.items ?? [])
+const runRiskLevel = computed(() => props.confirmation.run?.riskLevel || '')
+const runRiskLabel = computed(() => {
+  const lv = runRiskLevel.value
+  if (lv === 'R5') return t('riskBlocked')
+  if (lv === 'R4') return t('riskApproval')
+  if (lv === 'R3') return t('riskConfirm')
+  return lv ? t('riskAuto') : ''
+})
+const runCountLabel = computed(() => {
+  const n = runItems.value.length
+  return t('confirmRunCount', { n })
+})
+
+/**
+ * §22.17 ④ 影响预览文案：动作数 + 对象类型分组。
+ * 对象类型按机器标识原样显示（不翻译）——与撤销 / 审计 / 证据页同一口径，避免分叉。
+ * 无 impact（后端无可解析对象时省略）→ 整行不渲染。
+ */
+const impactText = computed(() => {
+  const impact = props.confirmation.impact
+  if (!impact || impact.targets.length === 0) return ''
+  const targets = impact.targets.map((t) => `${t.resultType} ×${t.count}`).join('、')
+  return `${t('confirmImpact', { actions: impact.actions })} · ${targets}`
+})
+
+/**
+ * §22.17 ④ 影响预览 v1.1：撤销口径 —— 批准前告诉审批人「这批动作事后能不能撤回」。
+ * 单条 → 该动作一档；run → 按档**分组计数**（如「可撤销（本地）×2、不可撤销」）。
+ * **不发明"批内最弱档"这类汇总规则**（spec §1.3：无规则即无可漂移的第二实现）。
+ * 后端缺省省略 revokeClass（老载荷）→ 整行不渲染，不补默认"可撤销"。
+ */
+const revokeTags = computed(() => {
+  const tally = new Map<string, { label: string; type: RevokeClassTagType; count: number }>()
+  const add = (rk?: string) => {
+    if (!rk) return
+    const cur = tally.get(rk)
+    if (cur) cur.count += 1
+    else tally.set(rk, { ...revokeClassTag(rk, t), count: 1 })
+  }
+  if (isRun.value) runItems.value.forEach((item) => add(item.revokeClass))
+  else add(props.confirmation.revokeClass)
+  return [...tally.values()]
+})
+
+const hasArgs = computed(() => {
+  const a = props.confirmation.arguments
+  return !!a && Object.keys(a).length > 0
+})
+const argsText = computed(() =>
+  props.confirmation.arguments ? JSON.stringify(props.confirmation.arguments, null, 2) : '',
+)
+
+/** 风险级标签（R5 阻断/红，R4 人工审批/橙，R3 需确认/橙，R0-R2 自动/绿） */
+const riskLevel = computed(() => props.confirmation.authorization?.riskLevel || '')
+const riskLabel = computed(() => {
+  const lv = riskLevel.value
+  if (lv === 'R5') return t('riskBlocked')
+  if (lv === 'R4') return t('riskApproval')
+  if (lv === 'R3') return t('riskConfirm')
+  return lv ? t('riskAuto') : ''
+})
+const riskTagType = computed<'danger' | 'warning' | 'success'>(() => {
+  const lv = riskLevel.value
+  if (lv === 'R5') return 'danger'
+  if (lv === 'R4' || lv === 'R3') return 'warning'
+  return 'success'
+})
+</script>
+
+<style scoped>
+.ai-confirm-card {
+  border: 1px solid var(--el-border-color-light);
+  border-radius: 8px;
+  background: var(--el-bg-color);
+}
+.border-left {
+  border-left: 3px solid var(--el-color-warning);
+}
+.run-items {
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 6px;
+  padding: 4px 8px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+.run-item {
+  padding: 4px 0;
+  border-bottom: 1px solid var(--el-border-color-lighter);
+}
+.run-item:last-child {
+  border-bottom: none;
+}
+</style>

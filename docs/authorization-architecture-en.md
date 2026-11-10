@@ -1,0 +1,301 @@
+# KeelBase Authorization Architecture
+
+> **Positioning**: KeelBase's authorization system is an **Authorization Architecture** — centered on business authorization and data-level access control, extended into **AI Agent / Tool Governance** — not a traditional RBAC permission system.
+>
+> CASL is one **technical component of the authorization-decision layer** (providing fine-grained Action / Subject / Conditions / Fields authorization), not the product-level definition of permissions.
+
+---
+
+## 1. Why not a "CASL permission system"
+
+Traditional enterprise permission chain:
+
+```
+User → Role → Permission → API → Database
+```
+
+AI enterprise application permission chain:
+
+```
+User → Agent → Tool → Business Operation → Database
+```
+
+The difference is in the middle: **an Agent is not a normal user** — it autonomously chooses tools, parameters, and execution paths. API-level permissions (RBAC) alone cannot constrain an AI. KeelBase needs:
+
+```
+User Authorization
+  + Agent Authorization
+  + Tool Authorization
+  + Data Scope
+  + Side Effect Governance
+  + Human Confirmation
+  + Audit
+```
+
+This is the meaning of permissions in a Business-safe Agent Runtime: **"Can the AI perform this business action on behalf of this user?"** — not "how do enterprise users manage roles."
+
+---
+
+## 2. Five-layer authorization model (L1–L5)
+
+| Layer | Responsibility | KeelBase Implementation |
+|---|---|---|
+| **L1 Identity** | Who? (User / Organization / authentication) | JWT (access+refresh rotation), login lockout, MFA, SSO/OIDC, email/SMS verification; User / Org / Department / Member |
+| **L2 Business Authorization** | What can this person theoretically do? (Role / Permission) | CASL AbilityFactory + PoliciesGuard + @CheckPolicies + row-level checks; Explainable Authz |
+| **L3 Agent Authorization** | What can an Agent do on their behalf? | Agent Registry (`ai_agents`) + trust_level R1–R5; delegation identity (D4); headless key ownership |
+| **L4 Tool & Data Governance** | What data can a specific tool operate on? | Tool risk levels R0–R5; tool permission metadata (featureFlag / adminOnly / requiresConfirmation); governance policy (enable switch + role allowlist); data scope (user_scoped) |
+| **L5 Side-effect Governance** | Even if allowed, it may not execute directly | Human confirmation; idempotency; revocable side effects (tool-effects); audit hash chain; decision trace |
+
+```
+L1 Identity ─ User / Organization
+     ↓
+L2 Business Authorization ─ Role / Permission / CASL Ability
+     ↓
+L3 Agent Authorization ─ Agent → allowed capabilities
+     ↓
+L4 Tool & Data Governance ─ Tool → Action → Resource → Data Scope
+     ↓
+L5 Side-effect Governance ─ Confirmation / Idempotency / Revoke / Audit
+```
+
+---
+
+## 3. Layer design details
+
+### L1 Identity
+
+- **Authentication**: JWT access token (payload: sub / username / role) + refresh token rotation (updated on each use, old token invalidated immediately); login lockout (failure threshold); MFA (TOTP); enterprise SSO (OIDC dynamic discovery); email/SMS verification codes.
+- **Sessions**: refresh tokens stored as SHA-256 hashes (not plaintext); sessions can be revoked remotely; `/auth/sessions` management.
+- **Organization**: User / Organization / Department / Member (roles: owner / member / admin); org-level data sharing (members can read/manage org todos, etc.).
+- **Missing identity is a DENY (fail-closed)**: among the three, "cannot resolve" must never become "continue as
+  someone else" — the invariant is `Identity → resolve → failure → DENY`, not `failure → anonymous/default →
+  continue`. The HTTP main path is covered by the global `JwtAuthGuard` (no identity = 401); a headless API key
+  always carries an owning user (`ownerUserId`, defaulting to admin), so the entry side has no "no subject" state.
+- **The privileged sentinel `'0'` (system account)**: tool gating **skips** the role allowlist and `adminOnly`
+  for `userId === '0'` (`ToolGateService.assertToolAllowed`). It is a string sentinel produced by **convention**,
+  not an identity — so **only trusted in-process callers may produce it** (currently the only source is the eval
+  fixture's admin-assistant category; the admin assistant `/admin/ai/chat` uses the real admin id). **No
+  request-side identity may be mapped to it**: feeding `'0'` into the gate is a double bypass in one step.
+
+### L2 Business Authorization
+
+- **Ability rules (CaslAbilityFactory)**:
+  - `admin` → `can('manage', 'all')`
+  - `user` → `can('manage', 'User', { id: user.sub })`, `can('manage', 'Event', { userId: user.sub })`, plus row-level ownership for flagship entities (Crm* / Pm* / Approval*)
+- **Policy guard**: global `PoliciesGuard` (after JwtAuthGuard); `@CheckPolicies((a) => a.can(...))` for route-level declarations; `@CurrentAbility()` for row-level object checks in services/controllers (`subject('Customer', obj)` + `ability.can(...)`).
+- **Explainable Authz**:
+  - `describeForUser`: resolves ability rules into a readable "permission list + basis" (role + resource scope all/own + reason)
+  - `explain`: returns decision + basis for an "action × resource" (`/auth/permissions/explain`)
+  - `explainForTarget`: admin reverse-lookup of a target user's decision basis (`/auth/permissions/explain/target`)
+
+### L3 Agent Authorization
+
+- **Agent Registry (`ai_agents`)**: formal definition of registered agents (id / name / owner / purpose / capabilities / **trust_level**). Minimal version auto-registers from headless API Keys; sub-agent names are attributed at runtime.
+- **trust_level R1–R5**: R1 read auto-execute / R2 light / R3 write requires human confirmation / R4 dual-person approval / R5 blocked (irreversible/external action).
+- **Delegation & identity (D4)**: agent call-chain attribution (parent action id / upstream agent / delegation context / business intent / source channel); audits attribute to the human via agent_id; headless API Keys execute under the key owner's identity.
+
+### L4 Tool & Data Governance
+
+- **Tool risk levels (ToolRegistry)**: every AI tool registers a riskLevel + riskStrategy:
+  - R1 (auto): read-only, auto-executes
+  - R3 (confirmation): write operations, requires human confirmation
+  - R4 (human_approval): dual-person approval
+  - R5 (block): blocked, never enters confirmation/execution
+  - External MCP tools auto-declare risk by readOnly (A2: readOnly→R1, non-readOnly→R3)
+- **Tool permission metadata (`permissions`)**: `featureFlag` (feature toggle), `adminOnly`, `requiresConfirmation`.
+- **Governance policy (GovernancePolicy)**: tool enable switch + role allowlist; **role is looked up in the database in real time on every tool call** (role downgrade takes effect immediately).
+- **Data scope (user_scoped)**: every tool call carries the authenticated user and can only read/write their own (or same-org) data.
+- **Denial check list (`AuthorizationDeniedError.reasons`)**: `risk_policy` (R5 blocked) / `tool_enabled` (governance disabled) / `role_allowed` (role allowlist) / `feature_flag` (toggle off) / `admin_only` / `user_scoped` — structured failure reasons flow into the decision trace and audit, and the frontend can render "why blocked".
+
+### L5 Side-effect Governance
+
+- **Human confirmation**: write operations trigger confirmation (approve / reject / trust this round); execution only after approval; R4 requires dual-person approval.
+- **Side-effect records (tool-effects)**: AI-created business records are registered (target type + current state), supporting revoke (soft delete + trash recovery).
+- **Audit hash chain**: AI audit + operation audit chained SHA-256; `/audit/verify` verifies integrity; tampering fails; sensitive fields in request bodies are auto-redacted.
+- **Decision trace**: user request → AI decision → tool call → authorization check (including denial reasons) → human confirmation → data change, fully traceable.
+
+---
+
+## 4. Runtime execution order of an AI tool call
+
+```
+User request → JWT authentication (L1)
+  → Tool risk check: R5 → blocked (risk_policy) (L4)
+  → Governance policy: enable switch (tool_enabled) → role allowlist (role_allowed, real-time DB lookup) (L4)
+  → Feature flag (feature_flag) → adminOnly (L4)
+  → Data scope (user_scoped, own/org data only) (L4)
+  → Write operation → human confirmation (L5)
+  → Execute → side-effect record (L5)
+  → Audit hash chain + decision trace (L5)
+  → Revocable (L5)
+```
+
+> Permission decisions happen at **runtime**, not by relying on the AI "remembering rules." A denial is not an anomaly — it is the system working correctly; the denial reason flows structurally into the decision trace and audit.
+
+---
+
+## 5. Relationship with the Application Protocol
+
+KeelBase's Build side generates business modules from the "Application Protocol," and permissions are generated alongside:
+
+```
+Application Protocol → entities/API → CASL ownership → AI tools (read R1 / write R3 confirmation) → audit wiring
+```
+
+Generated modules automatically carry: CASL row-level ownership, AI read/write tools (writes require confirmation), and operation audit. This is the **Authorization Contract direction** — the protocol describing resources/actions/authorization scopes/agent tools/side-effect policies:
+
+```yaml
+resource: Customer
+actions: [read, create, update, delete]
+authorization:
+  scopes: [organization, owner, department]
+agent:
+  allowed_tools: [customer.search, customer.analyze, customer.createTask]
+side_effects:
+  customer.create: { confirmation: required }
+  customer.delete: { allowed: false }
+```
+
+> The Authorization Contract is currently realized as "automatic wiring in generated modules"; explicitly declaring the authorization model (scopes / agent tools / side_effects) in the protocol is a future direction.
+
+---
+
+## 6. Current state vs. backlog
+
+| Item | Status |
+|---|---|
+| L1 Identity (authentication + organization) | ✅ Implemented |
+| L2 Business Authorization (CASL + Explainable Authz) | ✅ Implemented |
+| L3 Agent Authorization (Registry + trust_level + delegation) | ✅ Implemented (minimal) |
+| L4 Tool & Data Governance (risk levels + governance policy + data scope + structured denial) | ✅ Implemented |
+| L5 Side-effect Governance (confirmation + revoke + audit hash chain + decision trace) | ✅ Implemented |
+| Confirmation-artifact destination binding + authorization-layer argument-domain/destination allowlist (AUTHZ-1/AUTHZ-2) | ✅ Implemented (2026-09-24: `audience` column + check at the execution point; governance policy `writableFields` / `allowedDestinations`) — the declaration surface lives in **tool metadata**, not in the protocol; rationale in §7.2 |
+| Confirmation binds **exact arguments**, and a tool may declare a **bound** that relaxes it (CONF-1, 2026-10-13) | ✅ **Implemented, and stated here as a boundary**: the confirmation row binds **exact arguments** (`confirmation.store.ts`, `args = JSON.stringify(args)`), and the execution point uses **the same parsed object** — no drift within a call, by construction. On top of that, a tool may **declare bounds** (governance policy `boundedFields`, e.g. `{ amount: { max: 10000 } }`, living in **tool metadata** like AUTHZ-2 — not in the protocol): values **within** a declared bound share one trust-scope key, so "don't ask again this turn" still applies, while a value **outside** it is refused at the execution point (`field_bound`). So "approve once, then vary within the bound" **is expressible today**, and that approval is attributable **to the bound** — the authorization snapshot carries a `field_bound` check naming it, rather than recording one particular set of values. **Boundary**: one fixed comparison (numeric `≤`), no expressions, no generalised predicates; a non-numeric value is refused (fail-closed); and a **malformed** bound (`max: "x"`) is not a bound at all — the three consumers share one rule, so a configuration typo cannot lock a tool. **The cost is measurable**: `tool_confirmations_total{tool}` (on `/api/v1/metrics`); the repeat count within a window is `sum by (tool) (increase(tool_confirmations_total[1h]))`, and a run-level confirmation is `tool="run"` and counts as **one** ask — so "fatigue" is a reading rather than a phrase. It counts **how often a human was asked**, not what they answered (that lives in the `confirmation_decision` audit) |
+| Self-service confirmation (R3) is **checked by the same body that issues it**; a refusal is **visible only to us** (CONF-2, ruled 2026-10-13 as a **boundary**) | ✅ **Implemented, and stated here as a boundary**: on the R3 path, the service that writes the row and the service that re-checks at execution time are **the same service in the same process** (`confirmation.store.ts` / `tool-execution.service.ts`) — one party holds both halves. **The one path that is not the same body is the escalation path (R4)**: it decides in the **standalone governance service** and calls back into the business system to execute (`POST /ai/confirmations/:token/approve-by` + `/internal/approvals/:token/execute`). Refusals **are counted and audited** (`tool_gate_refusals_total{reason,source}`, public endpoint `/api/v1/metrics`), but that counter is **ours, on our own endpoint** ⇒ by the "visible to a party outside the system" test, the answer is **no**. This is a **choice**, not a gap — sinking the separation (cross-process like R4, with refusals visible outside) is **not scoped** |
+| Authorization Contract protocolization (explicit auth model in Protocol) | ⬜ Direction (currently covered by generated-module auto-wiring) |
+| Frontend capability gating (page / menu / button visibility) | ✅ Implemented (2026-09-15: consumes the `GET /auth/me/permissions` capability list; roles keep the shell, capability is the finer gate — see `docs/web-front.spec.md` §4/§5) |
+| Heavyweight RBAC products (Keycloak / Casbin / Shiro, etc.) | ⬜ **Explicitly not doing** (consistent with differentiation positioning) |
+| External authorization integration (OIDC enterprise SSO available) | ⬜ Direction (per customer, under evaluation) |
+| Generic data scope (own / own dept / own dept and below / org / custom) | ✅ **Implemented and configurable** (2026-09-15: structural where-builder + `ancestors` subtree drill-down + write-time stamping + **per-role configuration via `roles.data_scope`**) — see `docs/data-scope.spec.md` |
+| Dynamic RBAC data (`roles` / `permissions` / `role_permissions` / `user_roles`) | ✅ Tables + seed landed; `CaslAbilityFactory` is now **data-driven** (`RoleRuleRegistry` loaded into memory at boot, the factory stays synchronous); **admin UI not built** (权限-4) |
+
+---
+
+## 7. Comparison with mainstream frameworks / enterprise direction
+
+| Dimension | KeelBase | Spring Security | Spring Auth Server / Keycloak | Sa-Token / Shiro | Casbin / MyBatis-Plus |
+|---|---|---|---|---|---|
+| Authentication | ✅ Strong (lockout/MFA/OIDC built-in) | ⚠️ Framework, configure item by item | ✅ IAM suite | ✅ Lightweight | — |
+| Authorization model | CASL declarative + conditions | @PreAuthorize + SpEL + roles | Authorization server (issues tokens) | RBAC annotations/routes | Model-driven ACL/RBAC/ABAC |
+| Row-level data permission | ✅ Built-in (conditions) | ❌ Not native; needs Filter/interceptor | — | ❌ | ✅ MyBatis-Plus interceptor |
+| Dynamic RBAC / permission points | ❌ None (two hard-coded roles) | ⚠️ Self-built tables | ✅ Keycloak has | ✅ Menu permission tables | ✅ Casbin policies in DB |
+| Menu / button / field-level | ⚠️ Menu + button: capability-contract driven (2026-09-15); field-level ❌ | ⚠️ Self-built | ✅ | ✅ | — |
+| Data scope (own/dept/org) | ⚠️ Own + org (<br>mechanism supports own-dept/subtree; per-role config pending) | ❌ Needs addition | — | ❌ | ✅ Ready-made |
+| Authorization server / IAM | ❌ None (OIDC client) | — | ✅ Is the server | ✅ Has server side | — |
+| Audit | ✅ Hash chain + Explainable | ⚠️ No built-in audit chain | ✅ Events | ⚠️ Weak | — |
+| AI Agent governance | ✅ Unique | ❌ | ❌ | ❌ | ❌ |
+
+**Positioning**: KeelBase is not the same species as mainstream web permission frameworks — it is an **AI Agent governance runtime**. Traditional RBAC (dynamic roles / permission points / menu buttons) is hygiene rather than a selling point for KeelBase (differentiation positioning, §1/§6), so heavyweight RBAC products are explicitly out of scope.
+
+**Enterprise direction (choose per customer)**:
+- **External authorization (recommended for enterprises with existing IAM)**: integrate Keycloak / Spring Authorization Server — KeelBase connects via OIDC enterprise SSO (already supported), keeping IAM/RBAC external and KeelBase as an "AI governance runtime."
+- **Self-built lightweight dynamic RBAC (as a base capability, on demand)**: add roles/permissions tables + admin-side configuration; `CaslAbilityFactory` builds from configuration instead of hard-coded rules; also add a generic data scope (dept/org dimension, reusing the org module). Trigger: a multi-role enterprise customer or on demand after v1.1. Status: under evaluation (2026-08-28).
+
+### 7.1 Component stack: CASL is the authorization core, not "Spring Security for Node"
+
+**Goal**: ordinary enterprise apps generated / run by KeelBase should carry the full **Page → Action → API → Row → Field** authorization chain, with **human and AI authorization entering the same Trust Runtime** (the L1–L5 plane in §2). The **capability must exist; a standalone RBAC product is not urgent** — consistent with this section's positioning (no comparable-scaffold-style platform); build order per §9.
+
+Authorization has two layers — the **security infrastructure below and the authorization semantics above stay apart**:
+
+| Layer | TS | Java |
+|---|---|---|
+| Request entry & authn | NestJS Guards + Interceptor + Passport / JWT / OIDC | Spring Security + OAuth2 / OIDC / JWT |
+| **Enterprise authorization semantics** | **CASL → KeelBase Authorization → Trust** | **KeelBase Authorization → Trust** |
+
+- **CASL stays the core authorization component** (ability + conditions); it is **not replaced**. CASL ≈ authorization/ability; Spring Security ≈ authentication + request security + authorization infrastructure — **different layers**, so "find a Node Spring Security to replace CASL" is a category error.
+- **Do not chase symmetry (a selection trap)**: Java uses Spring Security because of the Spring ecosystem; the idiomatic Node/Nest combination is framework primitives (guard / interceptor) + Passport strategies + an authorization library. Importing a "one-size-fits-all security framework" for symmetry is a trap.
+- **What KeelBase owns keeps moving up**: enterprise authorization semantics + business-safe AI trust (§1–§5 of this document).
+- **Component assessment**: `@nestjs/passport` / `@nestjs/jwt` / `openid-client` ✅ authentication adapters; Auth.js ⚠️ web-app oriented, not a KB core; Keycloak ⚠️ external IdP, per-customer integration (see "enterprise direction" above); OPA ⚠️ not needed now (same ruling as Java-side ADR-0004 Option E).
+
+---
+
+## 8. Empirical comparison: comparable enterprise scaffolds (source-level)
+
+> The "hygiene, not a selling point" judgement in §7 is compared against two mainstream Chinese enterprise scaffolds, **verifiably**. Evidence is taken from upstream source, not second-hand descriptions.
+
+**Key finding: for all three layers — page / button / data row — both projects hand-write their own private implementation; there is no off-the-shelf library.**
+
+| Capability | Platform A | Platform B |
+|---|---|---|
+| Page/menu + button | **Menu and button in one table**: `menu_type` distinguishes dir/menu/button, `perms` permission string, route fields | **Permission and button in one table**: `menuType` distinguishes top menu / sub-menu / button, `perms`, route fields |
+| Button authorization | Hand-written string-based permission matching (own string check API; class comment calls it "original") | Same shape, self-implemented |
+| Data row | AOP aspect that **builds SQL**: all / custom / own dept / own dept and below / self only (**role-level** enum) | AOP aspect + "rule attached to the menu" data-rule table (field + condition + value, configured visually in the UI) |
+| Field-level | **None** | **None** |
+
+**Three conclusions**
+
+1. **Nothing to buy**: both share Spring Security only for authentication and enforcement (the same layer KeelBase uses); the permission model for page/button/data-row is entirely hand-written code. So KeelBase building these three layers is "filling a gap", not "reinventing a wheel" — **self-implementation is simply how this class of capability is built**. §6's "explicitly not doing heavyweight RBAC products" means not building a **productized RBAC**, not declining the **capability**.
+2. **"Not becoming a comparable scaffold-style platform" is empirically grounded**: field-level is **absent in both** — an industry-wide gap; if KeelBase only fills page/button/data-row, it becomes "an AI-ified version of such a platform". The difference must come from the chain in §1 / §5: human + agent dual authorization + risk confirmation + Audit + Revoke + cross-Runtime contract.
+3. **What to borrow**: Platform B's "rule attached to the menu" data-rule table is more expressive than Platform A's five-level enum and is a reference shape for "configure data scope per delivery"; but its **AOP injection + query-side SQL concatenation** must, in KeelBase, be **structured** (scope descriptors, e.g. the frozen `org-membership-scope`) rather than concatenated SQL strings — avoiding an injection surface and preserving Explainable.
+
+---
+
+## 9. Delivery tiers: a capability subset configured per project delivery
+
+> **Nature**: a **project-delivery mode** (the same product semantics with a capability subset configured per project requirement), **not a product-positioning change** — KeelBase's positioning (Business-safe AI Runtime) is unchanged.
+
+The four layers (page / button / data row / field) are **not all required at once**: a subset is configured per delivery target and **managed centrally by KeelBase** — single capability source = the wire contracts `permission-capability-list` / `permission-decision`; `/app/capabilities` exposes the tiers **actually enabled** for this delivery.
+
+| Tier | Typical project | Capabilities enabled | Rule source | Admin surface |
+|---|---|---|---|---|
+| **A · Lightweight single project** | Small-business standalone system | identity + page/menu + button + API + row(own) + audit | role→capability declared at generation time / in config | none (config changes go through delivery) |
+| **B · Standard enterprise app** | ERP / OA class | A + data scope (dept / org tree / custom) + field-level (optional) | data tables (roles / permissions) | KeelBase Admin (role / org / grant matrix) |
+| **C · Gov-enterprise / existing IAM** | Xinchuang, large enterprise | B + external identity (OIDC / LDAP / AD / MaxKey) + field-level | data tables + external identity facts | KeelBase Admin (coordinates the IdP underneath) |
+
+**Priority order**
+
+1. **First make the capability contract the frontend's single source of enforcement** — both page/menu (currently carried by hard-coded frontend `meta.roles`) and button visibility connect to the frozen `permission-capability-list`. This yields the page + button layers **without building RBAC tables**.
+2. Then build the **generic data scope** (own / dept / org tree / custom) — the actual acceptance point for ERP/OA, and real engineering. (**2026-09-15: mechanism landed**, see `docs/data-scope.spec.md`; a configurable level source is a later step.)
+3. Field-level and the admin surface follow from tiers B / C.
+
+**Relation to §7 "Enterprise direction"**: the "external authorization / self-built lightweight dynamic RBAC" there are two choices at the **identity layer vs the authorization layer**, not mutually exclusive — identity via an adapter (which may be an external IAM), authorization data self-held (needed by tiers B / C). The trigger is unchanged: a multi-role enterprise customer, or on demand after v1.1.
+
+---
+
+## 10. Enforcement-Point Matrix
+
+> One table answering: **where in the code is each invariant actually enforced, and does it hold everywhere?**
+> An "enforcement point" is the place a rule is **executed**, not the place it is **declared** — a rule may be
+> declared in several documents, but each invariant has exactly one enforcement point. Rows are invariants; the
+> **Coverage** column answers "everywhere?", and a ⚠ there is a **gap, not an exemption**. This is the enforcement
+> view, complementing §2's responsibility view (L1–L5).
+
+| Invariant | Enforcement point (single source) | Coverage | Gap |
+|---|---|---|---|
+| Identity resolves, else DENY | global `JwtAuthGuard` (HTTP); `HeadlessGuard` + `headlessKey.ownerUserId`; a scoped read or write is denied again at the service entry — `assertCallerIdentity` (`common/scope/scope-resolution.ts`, single source): `EventsService`'s `getEventsForRange` / `search` / `findOne` (the last covering `update` / `remove`), `TodosService`'s `findOne` / `update` / `remove`, `ReportsService`'s `findAll` / `findOne` (the last covering `update` / `remove`; `findAllForAdmin` is unscoped and stays out) | every entry | — |
+| The privileged sentinel `'0'` is produced only by trusted in-process callers | `ToolGateService.assertToolAllowed` (convention-based) | every entry | ⚠ production is not enforced, only conventional (see §3 L1) |
+| Coarse gate: action × subject | `CaslAbilityFactory` + global `PoliciesGuard` | every surface | — |
+| **Fine gate (list): which rows** | `buildScopeWhere` + `resolveScopeDescriptor` | `todos` / `events` / `events/search` / `reports` / generated modules | — |
+| **Fine gate (by id / object level): the same predicate as the list** | **`rowInScope`** (`src/common/scope/scope-where.ts`, the same source as `buildScopeWhere`) | `todos` / `events` / `reports` / generated modules | — (① wired up 2026-10-08, below) |
+| Tool gating (risk level / policy / role allowlist / flags) | `ToolGateService.assertToolAllowed` (**once at issue, once at execution**) | every AI tool call | — |
+| **The governance boundary holds for any model output (③)** | `security-showcase` (deterministic, no LLM, drives the real gate / CASL / risk levels; drift throws) + `src/ai/security/governance-boundary.spec.ts` (a hallucinated tool name cannot execute; positive control) | the four outcomes: execute / confirmation / deny / deny | ⚠ `ai-eval` (real model) measures **model behaviour** — `toolCalls` records *proposals*, not executions ⇒ **a green eval is not evidence that the boundary holds** |
+| Write confirmation / two-person approval | `ConfirmationStore` + approval-requirement recheck at the execution point | every write tool | — |
+| Side effects revocable | `AiToolEffectsService` | every local write | — |
+| Audit tamper-evident | hash chain (`/audit/verify`) | AI audit + operation audit | — |
+
+**① — "list and a by-id read of the same subject must go through one row-level predicate" (wired up 2026-10-08).**
+This row was a gap: on `events`, three row-level predicates ran in parallel with none authoritative —
+`getEventsForRange` used `resolveScopeDescriptor` (up to org), `findOne(id, ability)` used **CASL (owner) only**,
+and `findAll` took a raw `filter.userId` with **no scope at all**. The direction was **over-restriction**, not a
+bypass — a wide-scoped role could list a colleague's event but not `GET` it by id — yet the root cause was the same
+as a bypass: one row-level semantic with three sources. The fix is therefore **not** "add scope to by-id" but
+"**list and by-id must share one predicate**": `EventsService._canAccess` is now structurally identical to
+`TodosService._canAccess` (CASL ownership **or** `rowInScope`), so the detail path and the list agree. `findAll` is
+the read side of `GET /events/admin/all`, which sits behind the admin gate and still filters by `filter.userId` — a
+different question, not this row. AI by-id reads go through `assertCustomerOwner` and are stricter than the HTTP
+path. The same day, `GET /events/search` — the last list surface still hand-rolling owner-only filtering — was
+moved onto the same builder, so list, search and by-id now agree.
+
+---
+
+*Related docs:* [README](../README.md) · [Flagship Applications Spec](flagship-applications-en.md) · [Architecture Boundary](architecture-boundary-en.md)

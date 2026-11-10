@@ -1,0 +1,15 @@
+{
+  "module": "rewards",
+  "label": "奖励",
+  "searchable": true,
+  "fields": [
+    { "name": "title", "type": "string", "label": "奖励名称", "required": true },
+    { "name": "description", "type": "text", "label": "描述" },
+    { "name": "pointsCost", "type": "int", "label": "所需积分", "required": true },
+    { "name": "isActive", "type": "bool", "label": "启用" }
+  ],
+  "aiTools": {
+    "query": true,
+    "create": { "riskLevel": "R3", "requiresConfirmation": true }
+  }
+}

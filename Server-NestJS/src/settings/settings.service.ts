@@ -1,0 +1,153 @@
+// SPDX-License-Identifier: Apache-2.0
+
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
+import { Setting } from './settings.entity';
+
+export const SETTING_KEYS = {
+  MAINTENANCE_MODE: 'maintenance_mode',
+  AI_DAILY_LIMIT: 'ai_daily_limit',
+  CONFIRMATION_TTL: 'confirmation_ttl_seconds',
+  /**
+   * GA 待我确认中心：**离线待办窗口**（秒）。对话内等待（上面那条）结束后，确认行继续保持 pending
+   * 直到本窗口到期，用户可在 Action Center 稍后裁决；到期由维护任务转 timeout。
+   * 两个窗口的语义见 specs/protocol/confirmation-lifecycle-v2-vector.json。
+   */
+  CONFIRMATION_OFFLINE_TTL: 'confirmation_offline_ttl_seconds',
+  // BA 异常行为基线（docs/ai-behavior-baseline.spec.md §4）：阈值与开关，缺失时用规格默认值
+  AI_BEHAVIOR_SCAN_ENABLED: 'ai_behavior_scan_enabled',
+  AI_BEHAVIOR_WINDOW_MINUTES: 'ai_behavior_window_minutes',
+  AI_BEHAVIOR_MAX_TOOLS_PER_CONVERSATION: 'ai_behavior_max_tools_per_conversation',
+  AI_BEHAVIOR_MAX_FAILED_HIGHRISK: 'ai_behavior_max_failed_highrisk',
+  AI_BEHAVIOR_MAX_SIDE_EFFECTS: 'ai_behavior_max_side_effects',
+  AI_BEHAVIOR_COOLDOWN_MINUTES: 'ai_behavior_cooldown_minutes',
+  /** AI Bridge B 路径：proxy 工具配置（JSON：{ baseUrl, audience, tools[] }） */
+  PROXY_TOOLS: 'ai_proxy_tools',
+  /** N-6 AI-23 内容安全配置（JSON：{ enabled, sensitive[], jailbreak[] }，敏感词/越狱词表可配） */
+  CONTENT_SAFETY: 'ai_content_safety',
+} as const;
+
+interface ParsedValue {
+  value: unknown;
+  type: 'string' | 'number' | 'boolean';
+}
+
+/** 内存缓存：避免每次请求读库。写入时失效。 */
+@Injectable()
+export class SettingsService implements OnModuleInit {
+  private readonly logger = new Logger(SettingsService.name);
+  private cache = new Map<string, ParsedValue>();
+  private cacheReady = false;
+  /** 配置变更监听器（观察者模式）：set() 成功后按 key 触发；用于免重启热更新（如 ai_proxy_tools） */
+  private readonly changeListeners: Array<(key: string) => void> = [];
+
+  constructor(
+    @InjectRepository(Setting) private readonly settingsRepo: Repository<Setting>,
+  ) {}
+
+  async onModuleInit() {
+    await this.loadCache();
+  }
+
+  private async loadCache() {
+    try {
+      const rows = await this.settingsRepo.find();
+      this.cache.clear();
+      for (const row of rows) {
+        this.cache.set(row.key, { value: this.parse(row.value, row.type), type: row.type });
+      }
+      this.cacheReady = true;
+      this.logger.log(`Settings 加载完成: ${rows.length} 项`);
+    } catch (err) {
+      // 表未建好（如迁移前）时不阻断启动，读时回退默认值
+      this.logger.warn(`Settings 加载失败，使用默认值: ${(err as Error).message}`);
+      this.cacheReady = false;
+    }
+  }
+
+  private parse(raw: string, type: Setting['type']): unknown {
+    if (type === 'number') {
+      const n = Number(raw);
+      return Number.isNaN(n) ? 0 : n;
+    }
+    if (type === 'boolean') {
+      return raw === 'true' || raw === '1';
+    }
+    return raw;
+  }
+
+  async get(key: string): Promise<unknown> {
+    if (this.cacheReady) {
+      return this.cache.get(key)?.value;
+    }
+    try {
+      const row = await this.settingsRepo.findOne({ where: { key } });
+      return row ? this.parse(row.value, row.type) : undefined;
+    } catch (err) {
+      // 与 loadCache 同一契约：表尚未建好（如迁移前）时**读路径不得抛错**，回退默认值。
+      // 此前这里是裸查询：缓存加载失败恰恰说明表不可用，再查一次必然抛——与 loadCache 注释
+      // 声明的降级意图相反，且把「配置读不到」升级成了调用方看不到的运行时异常。
+      this.logger.warn(`Settings 读取失败，回退默认值: ${(err as Error).message}`);
+      return undefined;
+    }
+  }
+
+  async getWithDefault(key: string, fallback: unknown): Promise<unknown> {
+    const value = await this.get(key);
+    return value === undefined ? fallback : value;
+  }
+
+  async isMaintenanceMode(): Promise<boolean> {
+    // 兼容布尔与字符串 'true'（通用 PUT /settings 未指定 type 时 value 存为 string）
+    const v = await this.getWithDefault(SETTING_KEYS.MAINTENANCE_MODE, false);
+    return v === true || v === 'true';
+  }
+
+  async getAiDailyLimit(): Promise<number> {
+    const v = await this.getWithDefault(SETTING_KEYS.AI_DAILY_LIMIT, 0);
+    return typeof v === 'number' ? v : 0;
+  }
+
+  async set(key: string, value: unknown, type?: Setting['type']): Promise<Setting> {
+    const resolvedType = type ?? (typeof value === 'boolean' ? 'boolean' : typeof value === 'number' ? 'number' : 'string');
+    const raw = String(value);
+    let row = await this.settingsRepo.findOne({ where: { key } });
+    if (row) {
+      row.value = raw;
+      row.type = resolvedType;
+    } else {
+      row = this.settingsRepo.create({ key, value: raw, type: resolvedType });
+    }
+    row = await this.settingsRepo.save(row);
+    this.cache.set(key, { value: this.parse(raw, resolvedType), type: resolvedType });
+    this.notifyChange(key);
+    return row;
+  }
+
+  /** 注册配置变更监听器：每次 set() 成功后触发（fire-and-forget，监听器异常不阻断设置）。 */
+  onChange(listener: (key: string) => void): void {
+    this.changeListeners.push(listener);
+  }
+
+  private notifyChange(key: string): void {
+    for (const listener of this.changeListeners) {
+      try {
+        listener(key);
+      } catch (err) {
+        this.logger.warn(`Settings 变更监听器执行失败 (key=${key}): ${(err as Error).message}`);
+      }
+    }
+  }
+
+  async findAll(): Promise<Setting[]> {
+    return this.settingsRepo.find({ order: { key: 'ASC' } });
+  }
+
+  /** 测试用：重置缓存 */
+  async resetCache() {
+    this.cache.clear();
+    this.cacheReady = false;
+    await this.loadCache();
+  }
+}

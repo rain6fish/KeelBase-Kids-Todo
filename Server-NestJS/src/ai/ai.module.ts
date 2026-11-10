@@ -1,0 +1,685 @@
+// SPDX-License-Identifier: Apache-2.0
+
+/**
+ * AI 模块
+ *
+ * 注册 AI 对话、工具调用、数据洞察等能力。
+ * 使用 TypeORM 持久化对话和审计日志。
+ */
+
+import { Module } from '@nestjs/common';
+import { TypeOrmModule } from '@nestjs/typeorm';
+import { ConfigModule, ConfigService } from '@nestjs/config';
+import { AuthModule } from '../auth/auth.module';
+import { DelegationTokenService } from '../auth/delegation-token.service';
+import { ProxyToolRegistryService } from './proxy/proxy-tool.service';
+import { ProxyToolRevokerService } from './proxy/proxy-revoker.service';
+import { EventsModule } from '../events/events.module';
+import { UsersModule } from '../users/users.module';
+import { TodosModule } from '../todos/todos.module';
+import { TodosService } from '../todos/todos.service';
+import { BadgeAwardsModule } from '../badge_awards/badge_awards.module';
+import { BadgeAwardsService } from '../badge_awards/badge_awards.service';
+import { RewardRedemptionsModule } from '../reward_redemptions/reward_redemptions.module';
+import { RewardRedemptionsService } from '../reward_redemptions/reward_redemptions.service';
+import { TaskNotesModule } from '../task_notes/task_notes.module';
+import { TaskNotesService } from '../task_notes/task_notes.service';
+import { AchievementsModule } from '../achievements/achievements.module';
+import { AchievementsService } from '../achievements/achievements.service';
+import { CheckinsModule } from '../checkins/checkins.module';
+import { CheckinsService } from '../checkins/checkins.service';
+import { BadgesModule } from '../badges/badges.module';
+import { BadgesService } from '../badges/badges.service';
+import { DailyReviewsModule } from '../daily_reviews/daily_reviews.module';
+import { DailyReviewsService } from '../daily_reviews/daily_reviews.service';
+import { RewardsModule } from '../rewards/rewards.module';
+import { RewardsService } from '../rewards/rewards.service';
+import { FamiliesModule } from '../families/families.module';
+import { FamiliesService } from '../families/families.service';
+import { TasksModule } from '../tasks/tasks.module';
+import { TasksService } from '../tasks/tasks.service';
+import { LeaveRequestsModule } from '../leave_requests/leave_requests.module';
+import { LeaveRequestsService } from '../leave_requests/leave_requests.service';
+import { InventoryMovementsModule } from '../inventory_movements/inventory_movements.module';
+import { InventoryMovementsService } from '../inventory_movements/inventory_movements.service';
+import { AssetLoansModule } from '../asset_loans/asset_loans.module';
+import { AssetLoansService } from '../asset_loans/asset_loans.service';
+import { PointsLedgersModule } from '../points_ledgers/points_ledgers.module';
+import { PointsLedgersService } from '../points_ledgers/points_ledgers.service';
+import { PointRecordsModule } from '../point_records/point_records.module';
+import { PointRecordsService } from '../point_records/point_records.service';
+import { PostsModule } from '../posts/posts.module';
+import { PostsService } from '../posts/posts.service';
+import { TagsModule } from '../tags/tags.module';
+import { TagsService } from '../tags/tags.service';
+import { SuppliersModule } from '../suppliers/suppliers.module';
+import { SuppliersService } from '../suppliers/suppliers.service';
+import { NotesModule } from '../notes/notes.module';
+import { NotesService } from '../notes/notes.service';
+import { BooksModule } from '../books/books.module';
+import { BooksService } from '../books/books.service';
+import { ReportsModule } from '../reports/reports.module';
+import { ReportsService } from '../reports/reports.service';
+import { FollowupPlansModule } from '../followup_plans/followup_plans.module';
+import { FollowupPlansService } from '../followup_plans/followup_plans.service';
+import { ContractsModule } from '../contracts/contracts.module';
+import { ContractsService } from '../contracts/contracts.service';
+import { QueueModule } from '../queue/queue.module';
+import { StorageModule } from '../storage/storage.module';
+import { FeatureFlagsModule } from '../feature-flags/feature-flags.module';
+import { EventsService } from '../events/events.service';
+import { UsersService } from '../users/users.service';
+import { AiController } from './ai.controller';
+import { AiService } from './ai.service';
+import { AuditController } from '../governance-shared/controllers/audit.controller';
+import { InsightsController } from './insights/insights.controller';
+import { InsightsService } from './insights/insights.service';
+import { KnowledgeController } from './rag/knowledge.controller';
+import { KnowledgeService } from './rag/knowledge.service';
+import { UploadSignService } from '../upload/upload-sign.service';
+import { KnowledgeArticle } from './rag/knowledge-article.entity';
+import { RagAgent } from './agents/rag-agent.service';
+import { EmbeddingsService } from './embeddings/embeddings.service';
+import { LlmProviderFactory } from './providers/provider-factory';
+import { DemoProvider } from './providers/demo-provider';
+import { ToolRegistry } from './tools/tool-registry';
+import { AuthorizationExplainerService } from './authorization-explainer.service';
+import { ConversationService } from './conversation/conversation.service';
+import { AuditService } from '../governance-shared/services/audit.service';
+import { AiDailyUsageService } from './audit/ai-daily-usage.service';
+import { ToolGateService } from './tools/tool-gate.service';
+import { R4ApprovalService } from './approvals/r4-approval.service';
+import { ToolPresentationService } from './tools/tool-presentation.service';
+import { ToolExposureService } from './tools/tool-exposure.service';
+import { ProviderRoutingService } from './providers/provider-routing.service';
+import { ToolExecutionService } from './tools/tool-execution.service';
+import { AuthzExplainModule } from './authz-explain.module';
+import { AiAuditModule } from './audit/ai-audit.module';
+import { MetricsModule } from '../metrics/metrics.module';
+import { ExternalToolRegistry } from './tools/external-tool-registry';
+import { TOOL_REGISTRY, AUTHORIZATION_EXPLAINER } from '../governance-shared/di-tokens';
+import { AuditStatsService } from '../governance-shared/services/audit-stats.service';
+import { AuditQueryService } from '../governance-shared/services/audit-query.service';
+import { AuditEvidenceService } from '../governance-shared/services/audit-evidence.service';
+import { CoverageService } from '../governance-shared/services/coverage.service';
+import { AiConversation } from './conversation/ai-conversation.entity';
+import { AiMessage } from './conversation/ai-message.entity';
+import { AiAuditLog } from '../governance-shared/entities/ai-audit-log.entity';
+import { AiDailyUsage } from '../governance-shared/entities/ai-daily-usage.entity';
+import { AiConfirmationRequest } from '../governance-shared/entities/ai-confirmation-request.entity';
+import { AiAgent } from '../governance-shared/entities/ai-agent.entity';
+import { GovernanceSharedModule } from '../governance-shared/governance-shared.module';
+import { AgentsController } from '../governance-shared/controllers/agents.controller';
+import { CreateModuleTool } from './tools/create-module.tool';
+import { CreateModuleApplyTool } from './tools/create-module-apply.tool';
+import { QueryEventsTool } from './tools/query-events.tool';
+import { CountEventsByStatusTool } from './tools/count-events-by-status.tool';
+import { QueryUserStatsTool } from './tools/query-user-stats.tool';
+import { QueryEventsByKeywordTool } from './tools/query-events-by-keyword.tool';
+import { NavigatePageTool } from './tools/navigate-page.tool';
+import { AdminNavigatePageTool } from './tools/navigate-admin-page.tool';
+import { CreateEventTool } from './tools/create-event.tool';
+import { CreateTodoTool } from './tools/create-todo.tool';
+import { QueryBadgeAwardsTool } from './tools/query-badge_awards.tool';
+import { CreateBadgeAwardTool } from './tools/create-badge_awards.tool';
+import { QueryRewardRedemptionsTool } from './tools/query-reward_redemptions.tool';
+import { CreateRewardRedemptionTool } from './tools/create-reward_redemptions.tool';
+import { QueryTaskNotesTool } from './tools/query-task_notes.tool';
+import { CreateTaskNoteTool } from './tools/create-task_notes.tool';
+import { QueryAchievementsTool } from './tools/query-achievements.tool';
+import { CreateAchievementTool } from './tools/create-achievements.tool';
+import { QueryCheckinsTool } from './tools/query-checkins.tool';
+import { CreateCheckinTool } from './tools/create-checkins.tool';
+import { QueryBadgesTool } from './tools/query-badges.tool';
+import { CreateBadgeTool } from './tools/create-badges.tool';
+import { QueryDailyReviewsTool } from './tools/query-daily_reviews.tool';
+import { CreateDailyReviewTool } from './tools/create-daily_reviews.tool';
+import { QueryRewardsTool } from './tools/query-rewards.tool';
+import { CreateRewardTool } from './tools/create-rewards.tool';
+import { QueryFamiliesTool } from './tools/query-families.tool';
+import { CreateFamilieTool } from './tools/create-families.tool';
+import { QueryTasksTool } from './tools/query-tasks.tool';
+import { CreateTaskTool } from './tools/create-tasks.tool';
+import { QueryLeaveRequestsTool } from './tools/query-leave_requests.tool';
+import { CreateLeaveRequestTool } from './tools/create-leave_requests.tool';
+import { QueryInventoryMovementsTool } from './tools/query-inventory_movements.tool';
+import { CreateInventoryMovementTool } from './tools/create-inventory_movements.tool';
+import { QueryAssetLoansTool } from './tools/query-asset_loans.tool';
+import { CreateAssetLoanTool } from './tools/create-asset_loans.tool';
+import { QueryPointsLedgersTool } from './tools/query-points_ledgers.tool';
+import { CreatePointsLedgerTool } from './tools/create-points_ledgers.tool';
+import { QueryPointRecordsTool } from './tools/query-point_records.tool';
+import { CreatePointRecordTool } from './tools/create-point_records.tool';
+import { QueryPostsTool } from './tools/query-posts.tool';
+import { CreatePostTool } from './tools/create-posts.tool';
+import { QueryTagsTool } from './tools/query-tags.tool';
+import { CreateTagTool } from './tools/create-tags.tool';
+import { QuerySuppliersTool } from './tools/query-suppliers.tool';
+import { CreateSupplierTool } from './tools/create-suppliers.tool';
+import { QueryNotesTool } from './tools/query-notes.tool';
+import { CreateNoteTool } from './tools/create-notes.tool';
+import { QueryBooksTool } from './tools/query-books.tool';
+import { CreateBookTool } from './tools/create-books.tool';
+import { QueryReportsTool } from './tools/query-reports.tool';
+import { CreateReportTool } from './tools/create-reports.tool';
+import { QueryFollowupPlansTool } from './tools/query-followup_plans.tool';
+import { CreateFollowupPlanTool } from './tools/create-followup_plans.tool';
+import { QueryContractsTool } from './tools/query-contracts.tool';
+import { CreateContractTool } from './tools/create-contract.tool';
+import { WebSearchTool } from './tools/web-search.tool';
+import { GenerateImageTool } from './tools/generate-image.tool';
+import { MemoriesService } from './memory/memory.service';
+import { UserMemory } from './memory/user-memory.entity';
+import { User } from '../common/entities/user.entity';
+import { ConfirmationStore } from './confirmation/confirmation.store';
+import { MyConfirmationService } from './confirmation/my-confirmation.service';
+import { AiBehaviorAlert } from './behavior-baseline/behavior-alert.entity';
+import { BehaviorBaselineService } from './behavior-baseline/behavior-baseline.service';
+import { ConversationCompactor } from './conversation/conversation-compactor';
+import { KnowledgeIngestionService } from './rag/knowledge-ingestion.service';
+import { SubAgentOrchestrator } from './agents/sub-agent-orchestrator.service';
+import { EvalCase } from './eval/eval-case.entity';
+import { AiEvalService } from './eval/ai-eval.service';
+import { AiEvalController } from './eval/ai-eval.controller';
+import { SecurityShowcaseService } from './security-showcase/security-showcase.service';
+import { SecurityShowcaseController } from './security-showcase/security-showcase.controller';
+import { AiToolSideEffect } from '../governance-shared/entities/ai-tool-side-effect.entity';
+import { EffectComparability } from '../governance-shared/entities/effect-comparability.entity';
+import { AiWriteClaim } from '../governance-shared/entities/ai-write-claim.entity';
+import { AiToolEffectsService } from '../governance-shared/services/ai-tool-effects.service';
+import { TrustSandboxService } from './trust-sandbox/trust-sandbox.service';
+import { SideEffectSnapshotCaptor } from '../governance-shared/services/side-effect-snapshot-captor';
+import { LocalEntityRevoker, SIDE_EFFECT_REVOKER } from '../governance-shared/services/side-effect-revoker';
+import { DecisionTraceService } from './trace/decision-trace.service';
+import { AiGovernancePolicy } from '../governance-shared/entities/ai-governance-policy.entity';
+import { AiGovernancePolicyHistory } from '../governance-shared/entities/ai-governance-policy-history.entity';
+import { GovernancePolicyService } from '../governance-shared/services/governance-policy.service';
+import { GovernanceReporter, GOVERNANCE_REPORTER } from '../governance-shared/services/governance-reporter.service';
+import { InternalEffectsController } from './governance-bridge/internal-effects.controller';
+import { ExternalEffectsController } from './governance-bridge/external-effects.controller';
+import { InternalApprovalsController } from './governance-bridge/internal-approvals.controller';
+import { AuditChainModule } from '../common/audit-chain/audit-chain.module';
+import { CacheModule } from '../common/cache/cache.module';
+import { ContentSafetyService } from './security/content-safety.service';
+import { OperationAuditModule } from '../operation-audit/operation-audit.module';
+import { BusinessHistoryService } from './governance-bridge/business-history.service';
+import { OrgModule } from '../org/org.module';
+import { OrgService } from '../org/org.service';
+import { OrgDirectoryService } from '../org/org-directory.service';
+import { QueryOrgAvailabilityTool } from './tools/query-org-availability.tool';
+import { QueryOrgMembersTool } from './tools/query-org-members.tool';
+import { QueryOrgTasksTool } from './tools/query-org-tasks.tool';
+import { QueryCustomersTool } from './tools/query-customers.tool';
+import { QueryCustomerOrdersTool } from './tools/query-customer-orders.tool';
+import { QueryCustomerOpportunitiesTool } from './tools/query-opportunities.tool';
+import { SummarizeCustomerTool } from './tools/summarize-customer.tool';
+import { QueryCustomerContactsTool } from './tools/query-contacts.tool';
+import { AnalyzeSalesPipelineTool } from './tools/analyze-sales-pipeline.tool';
+import { QueryCustomerActivitiesTool } from './tools/query-customer-activities.tool';
+import { AnalyzeCustomerRiskTool } from './tools/analyze-customer-risk.tool';
+import { CreateFollowupTaskTool } from './tools/create-followup-task.tool';
+import { DetectIdleCustomersTool } from './tools/detect-idle-customers.tool';
+import { DeleteCustomerTool } from './tools/delete-customer.tool';
+import { QueryProjectsTool } from './tools/query-projects.tool';
+import { QueryProjectTasksTool } from './tools/query-project-tasks.tool';
+import { AnalyzeProjectRiskTool } from './tools/analyze-project-risk.tool';
+import { CreateProjectTaskTool } from './tools/create-project-task.tool';
+import { CreateProjectWithTasksTool } from './tools/create-project-with-tasks.tool';
+import { CrmModule } from '../crm/crm.module';
+import { CrmService } from '../crm/crm.service';
+import { CrmAnalyticsService } from '../crm/crm-analytics.service';
+import { PmModule } from '../pm/pm.module';
+import { PmService } from '../pm/pm.service';
+import { QueryApprovalRequestsTool } from './tools/query-approval-requests.tool';
+import { QueryApprovalPoliciesTool } from './tools/query-approval-policies.tool';
+import { SubmitApprovalRequestTool } from './tools/submit-approval-request.tool';
+import { ReviewApprovalRequestTool } from './tools/review-approval-request.tool';
+import { ApprovalModule } from '../approval/approval.module';
+import { ApprovalService } from '../approval/approval.service';
+import { SkillsRegistry, DEFAULT_SKILLS } from './skills/skills-registry';
+import { SYSTEM_PROMPT } from './constants/system-prompt';
+import { LlmProviderConfig } from './interfaces/provider-config.interface';
+import { CaslAbilityFactory } from '../common/casl/casl-ability.factory';
+import { SettingsService, SETTING_KEYS } from '../settings/settings.service';
+import { CircuitBreakerService } from '../circuit-breaker/circuit-breaker.service';
+
+@Module({
+  imports: [
+    ConfigModule,
+    // 授权解释面叶子模块（阶段 4 环根治第一刀）：ToolRegistry / explainer 由它提供，
+    // 治理策略经它再导出（唯一提供者仍是 GovernanceSharedModule）；谁需要谁来引，不必经由 AiModule
+    AuthzExplainModule,
+    // 叶子服务（AiAgentService / GovernancePolicyService）的唯一提供者；本模块再导出它
+    GovernanceSharedModule,
+    // 审计写入面叶子模块（阶段 4 环根治第二刀）：flows 只引它，不必经 AiModule
+    AiAuditModule,
+    AuthModule,
+    EventsModule,
+    UsersModule,
+    TodosModule,
+    BadgeAwardsModule,
+    RewardRedemptionsModule,
+    TaskNotesModule,
+    AchievementsModule,
+    CheckinsModule,
+    BadgesModule,
+    DailyReviewsModule,
+    RewardsModule,
+    FamiliesModule,
+    TasksModule,
+    LeaveRequestsModule,
+    InventoryMovementsModule,
+    AssetLoansModule,
+    PointsLedgersModule,
+    PointRecordsModule,
+    PostsModule,
+    TagsModule,
+    SuppliersModule,
+    NotesModule,
+    BooksModule,
+    ReportsModule,
+    FollowupPlansModule,
+    ContractsModule,
+    OrgModule,
+    // 注：本族曾因 org→flows→ai→events→org 间接环而 forwardRef；环已由「授权解释面」
+    // 与「审计写入面」两个叶子模块打断，故三处均降为普通 import（见各自模块头注释）。
+    CrmModule,
+    PmModule,
+    ApprovalModule,
+    QueueModule.register(),
+    StorageModule,
+    FeatureFlagsModule,
+    AuditChainModule,
+    // REV-15：工具闸门的拒绝计数（tool_gate_refusals_total）住在 MetricsService（prom-client 全局
+    // registry，故 /metrics 自动含它）。引 MetricsModule 只是让它的 provider 可见；
+    // 其 configure() 里的 MetricsMiddleware 是按**模块实例**注册一次的，不会因多一个 importer 而重复计数。
+    MetricsModule,
+    CacheModule,
+    OperationAuditModule,
+    TypeOrmModule.forFeature([AiConversation, AiMessage, AiAuditLog, AiDailyUsage, KnowledgeArticle, UserMemory, EvalCase, AiToolSideEffect, EffectComparability, AiWriteClaim, AiConfirmationRequest, AiAgent, AiGovernancePolicy, AiGovernancePolicyHistory, AiBehaviorAlert, User]),
+  ],
+  controllers: [AiController, AuditController, InsightsController, KnowledgeController, AiEvalController, AgentsController, InternalEffectsController, ExternalEffectsController, InternalApprovalsController, SecurityShowcaseController],
+  providers: [
+    ConversationService,
+    AiDailyUsageService,
+    ToolGateService,
+    ToolExecutionService,
+    R4ApprovalService,
+    ToolPresentationService,
+    ToolExposureService,
+    ExternalToolRegistry,
+    AuditEvidenceService,
+    CoverageService,
+    AuditStatsService,
+    AuditQueryService,
+    InsightsService,
+    KnowledgeService,
+    EmbeddingsService,
+    KnowledgeIngestionService,
+    // CR-21 stage C：知识库读侧现签 /uploads 引用（KnowledgeService 依赖它）
+    UploadSignService,
+    MemoriesService,
+    ConfirmationStore,
+    MyConfirmationService,
+    BehaviorBaselineService,
+    AiEvalService,
+    SecurityShowcaseService,
+    AiToolEffectsService,
+    // Trust 沙盘（internal-roadmap §internal.15 可视化 P0）：工作台一键重放 Trust 六场景
+    TrustSandboxService,
+    SideEffectSnapshotCaptor,
+    ContentSafetyService,
+    // D5: the shared side no longer imports AI classes or values; these tokens hand it the business-side
+    // instances. The governance process binds neither, so its optional parameters stay undefined.
+    // D5：共享侧不再 import AI 的类/值；这两个 token 把业务侧实例交给它。治理进程两个都不绑，
+    // 可选参数保持 undefined。
+    { provide: TOOL_REGISTRY, useExisting: ToolRegistry },
+    { provide: AUTHORIZATION_EXPLAINER, useExisting: AuthorizationExplainerService },
+    // D2-1f 副作用撤销执行器：默认本地软删，独立治理控制平面可替换为远程补偿 revoker
+    // useExisting: the class comes from GovernanceSharedModule, so the token is only an alias. Two
+    // provider lines would build two revokers, and they do not share state when resolving or
+    // soft-deleting the same target.
+    // useExisting：类实例来自 GovernanceSharedModule，token 只是它的别名——两条 provider 行会造出
+    // 两个 revoker，而它们对同一目标各自解析/软删并不共享状态。
+    { provide: SIDE_EFFECT_REVOKER, useExisting: LocalEntityRevoker },
+    // D2-3b 治理上报（GOVERNANCE_URL 配置时审计双写；未配置 enabled=false 完全本地）
+    DecisionTraceService,
+    BusinessHistoryService,
+    {
+      provide: AiService,
+      useFactory: (
+        configService: ConfigService,
+        eventsService: EventsService,
+        usersService: UsersService,
+        orgService: OrgService,
+        orgDirectory: OrgDirectoryService,
+        conversationService: ConversationService,
+        auditService: AuditService,
+        aiDailyUsageService: AiDailyUsageService,
+        toolGate: ToolGateService,
+        toolExecution: ToolExecutionService,
+        r4Approval: R4ApprovalService,
+        presentation: ToolPresentationService,
+        toolExposure: ToolExposureService,
+        knowledgeService: KnowledgeService,
+        abilityFactory: CaslAbilityFactory,
+        todosService: TodosService,
+        badge_awardsService: BadgeAwardsService,
+        reward_redemptionsService: RewardRedemptionsService,
+        task_notesService: TaskNotesService,
+        achievementsService: AchievementsService,
+        checkinsService: CheckinsService,
+        badgesService: BadgesService,
+        daily_reviewsService: DailyReviewsService,
+        rewardsService: RewardsService,
+        familiesService: FamiliesService,
+        tasksService: TasksService,
+        leave_requestsService: LeaveRequestsService,
+        inventory_movementsService: InventoryMovementsService,
+        asset_loansService: AssetLoansService,
+        points_ledgersService: PointsLedgersService,
+        point_recordsService: PointRecordsService,
+        postsService: PostsService,
+        tagsService: TagsService,
+        suppliersService: SuppliersService,
+        notesService: NotesService,
+        booksService: BooksService,
+        reportsService: ReportsService,
+        followup_plansService: FollowupPlansService,
+        contractsService: ContractsService,
+        memoryService: MemoriesService,
+        confirmationStore: ConfirmationStore,
+        settingsService: SettingsService,
+        circuitBreaker: CircuitBreakerService,
+        toolEffectsService: AiToolEffectsService,
+        governancePolicy: GovernancePolicyService,
+        crmService: CrmService,
+        crmAnalytics: CrmAnalyticsService,
+        pmService: PmService,
+        approvalService: ApprovalService,
+        delegationTokenService,
+        contentSafety: ContentSafetyService,
+        toolRegistry: ToolRegistry,
+        authorizationExplainer: AuthorizationExplainerService,
+      ) => {
+        // 1. 创建 Provider 工厂并注册 LLM 供应商
+        const factory = new LlmProviderFactory(circuitBreaker);
+        const defaultProvider = configService.get<string>('AI_PROVIDER', 'deepseek');
+
+        const registerProvider = (name: string, defaults: Partial<LlmProviderConfig> & { displayName: string }) => {
+          const key = name.toUpperCase();
+          const apiKey = configService.get<string>(`${key}_API_KEY`);
+          if (!apiKey) return false;
+
+          const config: LlmProviderConfig = {
+            name,
+            displayName: defaults.displayName,
+            baseURL: configService.get<string>(`${key}_BASE_URL`, defaults.baseURL ?? ''),
+            apiKey,
+            defaultModel: configService.get<string>(`AI_CHAT_MODEL`, defaults.defaultModel ?? ''),
+            availableModels: defaults.availableModels ?? [],
+            maxTokens: configService.get<number>('AI_MAX_TOKENS', 4096),
+            temperature: configService.get<number>('AI_TEMPERATURE', 0.7),
+          };
+          factory.register(config);
+          return true;
+        };
+
+        registerProvider('deepseek', {
+          displayName: 'DeepSeek',
+          baseURL: 'https://api.deepseek.com',
+          defaultModel: 'deepseek-v4-flash',
+          availableModels: ['deepseek-v4-flash', 'deepseek-v4-pro'],
+        });
+
+        registerProvider('qwen', {
+          displayName: '通义千问',
+          baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+          defaultModel: 'qwen-max',
+          availableModels: ['qwen-max', 'qwen-plus'],
+        });
+
+        registerProvider('openai', {
+          displayName: 'OpenAI',
+          baseURL: 'https://api.openai.com/v1',
+          defaultModel: 'gpt-4o-mini',
+          availableModels: ['gpt-4o-mini', 'gpt-4o'],
+        });
+
+        registerProvider('anthropic', {
+          displayName: 'Anthropic Claude',
+          baseURL: 'https://api.anthropic.com/v1',
+          defaultModel: 'claude-sonnet-4-6',
+          availableModels: ['claude-opus-5', 'claude-sonnet-4-6', 'claude-haiku-4-5'],
+        });
+
+        registerProvider('gemini', {
+          displayName: 'Google Gemini',
+          baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai',
+          defaultModel: 'gemini-2.5-pro',
+          availableModels: ['gemini-2.5-pro', 'gemini-2.5-flash'],
+        });
+
+        // POV-1 私有化 AI：Ollama 本地模型（无需 API Key，OLLAMA_BASE_URL 判定启用）
+        // 数据不出域；AI_PROVIDER=ollama 时默认走本地，其余仍走云端（降级链）
+        const ollamaBase = configService.get<string>('OLLAMA_BASE_URL', '');
+        if (ollamaBase) {
+          const ollamaModel = configService.get<string>('OLLAMA_MODEL', 'qwen2.5:7b');
+          factory.register({
+            name: 'ollama',
+            displayName: '本地 Ollama',
+            baseURL: `${ollamaBase.replace(/\/+$/, '')}/v1`,
+            apiKey: 'ollama', // 本地无需真实 key，占位
+            defaultModel: ollamaModel, // 本地模型由 OLLAMA_MODEL 决定；AI_CHAT_MODEL 是云模型名（如 deepseek-v4-flash），不适用于 ollama
+            availableModels: [ollamaModel],
+            maxTokens: configService.get<number>('AI_MAX_TOKENS', 4096),
+            temperature: configService.get<number>('AI_TEMPERATURE', 0.7),
+          });
+        }
+
+        // P0-0：注册确定性 Demo Provider（resolveProvider 链尾兜底到 demo）。
+        // 干净环境（无 API Key / 无本地 Ollama）默认即用它跑通 AI 黄金流程；
+        // 配置了云 Provider 时仍可显式 provider:'demo' 使用，供确定性验证/演示。
+        factory.registerCustom(new DemoProvider());
+
+        // 2. 创建工具注册表（ToolRegistry 为模块级 provider，AiService useFactory 注入后在此注册工具；
+        // AuthorizationExplainerService 共享同一实例查询工具风险级，切断 audit/auth → AiService 反向依赖）
+        toolRegistry.register(new QueryEventsTool(eventsService));
+        toolRegistry.register(new CountEventsByStatusTool(eventsService));
+        toolRegistry.register(new QueryUserStatsTool(usersService, eventsService));
+        toolRegistry.register(new QueryEventsByKeywordTool(eventsService));
+        // ORG-5 组织边界 AI 工具（仅返回请求用户所属组织的数据）
+        toolRegistry.register(new QueryOrgAvailabilityTool(orgService, orgDirectory, eventsService));
+        toolRegistry.register(new QueryOrgMembersTool(orgService, orgDirectory));
+        toolRegistry.register(new QueryOrgTasksTool(orgService, orgDirectory));
+        toolRegistry.register(new NavigatePageTool());
+        // System AI Assistant（管理端导航，adminOnly）
+        toolRegistry.register(new AdminNavigatePageTool());
+        // System AI L4 Act（dry-run 预览）：管理端 AI 委托 keelbase init 预览创建模块（adminOnly, R1 读）
+        toolRegistry.register(new CreateModuleTool());
+        // 写的那一半：真生成（需确认 ⇒ R3）· 仅管理员 · 不可撤销
+        toolRegistry.register(new CreateModuleApplyTool());
+        toolRegistry.register(new CreateEventTool(eventsService));
+        toolRegistry.register(new CreateTodoTool(todosService));
+        // 徽章授予（EASY-2 自动生成 AI 工具）
+        toolRegistry.register(new QueryBadgeAwardsTool(badge_awardsService));
+        toolRegistry.register(new CreateBadgeAwardTool(badge_awardsService));
+        // 兑换记录（EASY-2 自动生成 AI 工具）
+        toolRegistry.register(new QueryRewardRedemptionsTool(reward_redemptionsService));
+        toolRegistry.register(new CreateRewardRedemptionTool(reward_redemptionsService));
+        // 任务备注（EASY-2 自动生成 AI 工具）
+        toolRegistry.register(new QueryTaskNotesTool(task_notesService));
+        toolRegistry.register(new CreateTaskNoteTool(task_notesService));
+        // 成就（EASY-2 自动生成 AI 工具）
+        toolRegistry.register(new QueryAchievementsTool(achievementsService));
+        toolRegistry.register(new CreateAchievementTool(achievementsService));
+        // 打卡（EASY-2 自动生成 AI 工具）
+        toolRegistry.register(new QueryCheckinsTool(checkinsService));
+        toolRegistry.register(new CreateCheckinTool(checkinsService));
+        // 徽章（EASY-2 自动生成 AI 工具）
+        toolRegistry.register(new QueryBadgesTool(badgesService));
+        toolRegistry.register(new CreateBadgeTool(badgesService));
+        // 每日评价（EASY-2 自动生成 AI 工具）
+        toolRegistry.register(new QueryDailyReviewsTool(daily_reviewsService));
+        toolRegistry.register(new CreateDailyReviewTool(daily_reviewsService));
+        // 奖励（EASY-2 自动生成 AI 工具）
+        toolRegistry.register(new QueryRewardsTool(rewardsService));
+        toolRegistry.register(new CreateRewardTool(rewardsService));
+        // 家庭（EASY-2 自动生成 AI 工具）
+        toolRegistry.register(new QueryFamiliesTool(familiesService));
+        toolRegistry.register(new CreateFamilieTool(familiesService));
+        // 任务（EASY-2 自动生成 AI 工具）
+        toolRegistry.register(new QueryTasksTool(tasksService));
+        toolRegistry.register(new CreateTaskTool(tasksService));
+        // 请假申请（EASY-2 自动生成 AI 工具）
+        toolRegistry.register(new QueryLeaveRequestsTool(leave_requestsService));
+        toolRegistry.register(new CreateLeaveRequestTool(leave_requestsService));
+        // 库存出入库（EASY-2 自动生成 AI 工具）
+        toolRegistry.register(new QueryInventoryMovementsTool(inventory_movementsService));
+        toolRegistry.register(new CreateInventoryMovementTool(inventory_movementsService));
+        // 资产借用（EASY-2 自动生成 AI 工具）
+        toolRegistry.register(new QueryAssetLoansTool(asset_loansService));
+        toolRegistry.register(new CreateAssetLoanTool(asset_loansService));
+        // 积分台账（EASY-2 自动生成 AI 工具）
+        toolRegistry.register(new QueryPointsLedgersTool(points_ledgersService));
+        toolRegistry.register(new CreatePointsLedgerTool(points_ledgersService));
+        // 积分流水（EASY-2 自动生成 AI 工具）
+        toolRegistry.register(new QueryPointRecordsTool(point_recordsService));
+        toolRegistry.register(new CreatePointRecordTool(point_recordsService));
+        // 帖子（EASY-2 自动生成 AI 工具）
+        toolRegistry.register(new QueryPostsTool(postsService));
+        toolRegistry.register(new CreatePostTool(postsService));
+        // 标签（EASY-2 自动生成 AI 工具）
+        toolRegistry.register(new QueryTagsTool(tagsService));
+        toolRegistry.register(new CreateTagTool(tagsService));
+        // 供应商（EASY-2 自动生成 AI 工具）
+        toolRegistry.register(new QuerySuppliersTool(suppliersService));
+        toolRegistry.register(new CreateSupplierTool(suppliersService));
+        // 笔记（EASY-2 自动生成 AI 工具）
+        toolRegistry.register(new QueryNotesTool(notesService));
+        toolRegistry.register(new CreateNoteTool(notesService));
+        // 图书（EASY-2 自动生成 AI 工具）
+        toolRegistry.register(new QueryBooksTool(booksService));
+        toolRegistry.register(new CreateBookTool(booksService));
+        // 报告（EASY-2 自动生成 AI 工具）
+        toolRegistry.register(new QueryReportsTool(reportsService));
+        toolRegistry.register(new CreateReportTool(reportsService));
+        // 跟进计划（EASY-2 自动生成 AI 工具）
+        toolRegistry.register(new QueryFollowupPlansTool(followup_plansService));
+        toolRegistry.register(new CreateFollowupPlanTool(followup_plansService));
+        // 合同（EASY-2 自动生成 AI 工具：读 + 写需确认）
+        toolRegistry.register(new QueryContractsTool(contractsService));
+        toolRegistry.register(new CreateContractTool(contractsService));
+        // AI-14 联网搜索（TAVILY_API_KEY 配置后启用，未配置降级）
+        toolRegistry.register(new WebSearchTool(configService));
+        // AI-12.1 图像生成（默认 provider 支持 images 端点时生效）
+        toolRegistry.register(new GenerateImageTool(factory, defaultProvider));
+        // AI CRM 旗舰应用：客户/订单/跟进/风险/创建跟进任务
+        toolRegistry.register(new QueryCustomersTool(crmService));
+        toolRegistry.register(new QueryCustomerOrdersTool(crmService));
+        toolRegistry.register(new QueryCustomerActivitiesTool(crmService));
+        toolRegistry.register(new QueryCustomerOpportunitiesTool(crmService));
+        toolRegistry.register(new SummarizeCustomerTool(crmService, factory, defaultProvider));
+        toolRegistry.register(new QueryCustomerContactsTool(crmService));
+        toolRegistry.register(new AnalyzeSalesPipelineTool(crmAnalytics, factory, defaultProvider));
+        toolRegistry.register(new AnalyzeCustomerRiskTool(crmAnalytics));
+        toolRegistry.register(new DetectIdleCustomersTool(crmAnalytics));
+        toolRegistry.register(new CreateFollowupTaskTool(crmService));
+        // R5 阻断演示载体：不可逆删除客户，被系统策略阻断（风险级 R5），永不执行
+        toolRegistry.register(new DeleteCustomerTool());
+        // AI Project Management 旗舰应用：项目/任务/风险/创建项目任务
+        toolRegistry.register(new QueryProjectsTool(pmService));
+        toolRegistry.register(new QueryProjectTasksTool(pmService));
+        toolRegistry.register(new AnalyzeProjectRiskTool(pmService));
+        toolRegistry.register(new CreateProjectTaskTool(pmService));
+        // 复合写载体（docs/cascade-compensation.spec.md）：一次写 pm_projects + N × pm_tasks，
+        // 撤销任一条即级联补偿整组——跨表级联撤销的可演示路径
+        toolRegistry.register(new CreateProjectWithTasksTool(pmService));
+        // AI Approval 旗舰应用：审批请求/政策/提交/预审
+        toolRegistry.register(new QueryApprovalRequestsTool(approvalService));
+        toolRegistry.register(new QueryApprovalPoliciesTool(approvalService));
+        toolRegistry.register(new SubmitApprovalRequestTool(approvalService));
+        toolRegistry.register(new ReviewApprovalRequestTool(approvalService));
+
+        // 3. 创建 RagAgent（依赖 KnowledgeService，同 ToolRegistry 模式手动组装；N-6 注入内容安全）
+        const ragAgent = new RagAgent(knowledgeService, contentSafety);
+
+        // 4. 创建 ConversationCompactor（长对话上下文压缩，手动组装）
+        const aiConfig = {
+          defaultProvider,
+          // ollama 场景默认模型用本地 OLLAMA_MODEL；其余走 AI_CHAT_MODEL（云模型名）
+          defaultModel:
+            defaultProvider === 'ollama'
+              ? configService.get<string>('OLLAMA_MODEL', 'qwen2.5:7b')
+              : configService.get<string>('AI_CHAT_MODEL', 'deepseek-v4-flash'),
+          systemPrompt: SYSTEM_PROMPT,
+        };
+        const compactor = new ConversationCompactor(factory, aiConfig, conversationService);
+        // 4.0 Provider 路由与回退（阶段 3 第六刀拆出；只认 provider 名与失败，故在组装期手动构造，同 compactor）
+        const llmRouter = new ProviderRoutingService(factory, defaultProvider);
+
+        // 4.1 创建 SubAgentOrchestrator（子代理委托 + Skills）
+        const subAgentOrchestrator = new SubAgentOrchestrator(
+          new SkillsRegistry(DEFAULT_SKILLS),
+        );
+
+        // 4.5 B 路径 ProxyTool（AI Bridge §4）：从 Settings ai_proxy_tools 动态注册代理工具
+        // fire-and-forget——启动后注册，LLM 后续对话可见；Settings 变更即热更新（免重启）
+        const proxyRegistry = new ProxyToolRegistryService(
+          settingsService,
+          delegationTokenService,
+          toolRegistry,
+        );
+        // 如实记日志并吞掉：这里不 await，未捕获的 rejection 会变成 unhandled rejection，
+        // 谁也不知道它属于谁（实证：装配冒烟里它被 jest 记在另一个不相干的测试头上）。
+        void proxyRegistry.loadAndRegister().catch((err: Error) => {
+          console.error('[AiModule] ai_proxy_tools 初始注册失败（不影响启动）: %s', err.message);
+        });
+        // 热更新：ai_proxy_tools 配置变更 → 反注册旧工具 + 重新加载（无需重启 KeelBase）
+        settingsService.onChange((key) => {
+          if (key === SETTING_KEYS.PROXY_TOOLS) {
+            void proxyRegistry.reload().catch((err: Error) => {
+              console.error('[AiModule] ai_proxy_tools 热更新失败: %s', err.message);
+            });
+          }
+        });
+
+        // 4.6 B 路径运行时撤销：ProxyTool 写副作用撤销 → 调 Java 补偿端点（revokePath 约定，AI Bridge §4）
+        if (toolEffectsService) {
+          toolEffectsService.setExternalRevoker(
+            new ProxyToolRevokerService(toolRegistry, delegationTokenService),
+          );
+        }
+
+        // 5. 创建 AiService（ConversationService 和 AuditService 由 NestJS 注入）
+        return new AiService(
+          llmRouter,
+          toolRegistry,
+          conversationService,
+          aiConfig,
+          auditService,
+          aiDailyUsageService,
+          toolGate,
+          toolExecution,
+          r4Approval,
+          presentation,
+          toolExposure,
+          ragAgent,
+          abilityFactory,
+          memoryService,
+          confirmationStore,
+          compactor,
+          subAgentOrchestrator,
+          authorizationExplainer,
+          settingsService,
+          governancePolicy,
+          contentSafety,
+          toolEffectsService,
+        );
+      },
+      inject: [ConfigService, EventsService, UsersService, OrgService, OrgDirectoryService, ConversationService, AuditService, AiDailyUsageService, ToolGateService, ToolExecutionService, R4ApprovalService, ToolPresentationService, ToolExposureService, KnowledgeService, CaslAbilityFactory, TodosService, BadgeAwardsService, RewardRedemptionsService, TaskNotesService, AchievementsService, CheckinsService, BadgesService, DailyReviewsService, RewardsService, FamiliesService, TasksService, LeaveRequestsService, InventoryMovementsService, AssetLoansService, PointsLedgersService, PointRecordsService, PostsService, TagsService, SuppliersService, NotesService, BooksService, ReportsService, FollowupPlansService, ContractsService, MemoriesService, ConfirmationStore, SettingsService, CircuitBreakerService, AiToolEffectsService, GovernancePolicyService, CrmService, CrmAnalyticsService, PmService, ApprovalService, DelegationTokenService, ContentSafetyService, ToolRegistry, AuthorizationExplainerService],
+    },
+  ],
+  exports: [ConversationService, AiAuditModule, AiService, KnowledgeIngestionService, AuthzExplainModule, GovernanceSharedModule, ConfirmationStore, BehaviorBaselineService, AuditStatsService, AuditQueryService, AuditEvidenceService, AiDailyUsageService, ToolGateService, ToolExecutionService, R4ApprovalService, ToolPresentationService, ToolExposureService],
+})
+export class AiModule {}

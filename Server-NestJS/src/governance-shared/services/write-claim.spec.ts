@@ -1,0 +1,603 @@
+// SPDX-License-Identifier: Apache-2.0
+
+import { DataSource } from 'typeorm';
+import { AiToolSideEffect } from '../../governance-shared/entities/ai-tool-side-effect.entity';
+import { AiAuditLog } from '../../governance-shared/entities/ai-audit-log.entity';
+import { AiConfirmationRequest } from '../../governance-shared/entities/ai-confirmation-request.entity';
+import { AiWriteClaim, WRITE_CLAIM_STATUS } from '../entities/ai-write-claim.entity';
+import { AiToolEffectsService } from './ai-tool-effects.service';
+import { AuditEvidenceService } from './audit-evidence.service';
+import { ToolExecutionService } from '../../ai/tools/tool-execution.service';
+
+/**
+ * ACT-5/6 切片 1（roadmap §2.1.16）：**本地实体写**在执行前占位，使「这次调用是否已在执行」
+ * 有一个不依赖「写已完成」的答案。
+ *
+ * 为什么必须是真的数据库：仲裁点是 `ai_write_claims.idempotency_key` 的**唯一约束** ——
+ * 它是数据库侧的判定，不是映射层能决定的事。用替身测「谁赢」等于测替身。
+ *
+ * **对旧实现为红**：旧路径是 check-then-act（`findExisting → execute → record`），
+ * 已有人持有时它**照样执行**，且全库没有 `ai_write_claims` 这张表 ——
+ * 故第 2/3/4 条的断言在旧实现下无法成立，不是「差不多的断言」。
+ */
+const CTX = {
+  userId: 'u-alice',
+  conversationId: 'conv-1',
+  toolName: 'create_followup',
+  args: { customerId: 7, title: '跟进' },
+};
+
+describe('ACT-5/6 切片1：本地写 claim → execute → settle', () => {
+  let ds: DataSource;
+  let effects: AiToolEffectsService;
+  let exec: ToolExecutionService;
+  let executeMock: jest.Mock;
+
+  const claims = () => ds.getRepository(AiWriteClaim);
+  const key = () => AiToolEffectsService.buildKey(CTX);
+
+  const build = (): void => {
+    const toolRegistry = {
+      execute: executeMock,
+      getTool: () => ({ name: CTX.toolName }),
+    };
+    const toolGate = {
+      assertToolAllowed: jest.fn().mockResolvedValue(undefined),
+      assertWithinDeclaredScope: jest.fn().mockResolvedValue(undefined),
+      // ACT-7：执行点新增的审批要求复算（闸门接口长大了，替身必须满足）
+      assertApprovalRequirementHolds: jest.fn().mockResolvedValue(undefined),
+      destinationOf: () => 'local',
+    };
+    const externalTools = { current: undefined };
+    // Positional assembly: `dataSource` is the 7th argument and `claimsRepo` the last (11th), so the
+    // other middle slots are undefined. `dataSource` must be supplied: AW-11's paired audit/claim edge
+    // write needs it for the transaction (without it only the claim side is written).
+    // 位置式装配：`dataSource` 在第 7 位、`claimsRepo` 在构造器**末尾**（第 11 位），故其余中间位补 undefined。
+    // 其中 `dataSource` 必给：AW-11 的「审计行正/反向边成对写」靠它开事务（缺它则只写占位侧）。
+    effects = new AiToolEffectsService(
+      ds.getRepository(AiToolSideEffect),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      ds,
+      undefined,
+      undefined,
+      undefined,
+      claims(),
+    );
+    exec = new ToolExecutionService(
+      toolRegistry as any,
+      toolGate as any,
+      externalTools as any,
+      effects,
+      undefined,
+    );
+  };
+
+  beforeEach(async () => {
+    ds = new DataSource({
+      type: 'better-sqlite3',
+      database: ':memory:',
+      entities: [AiToolSideEffect, AiWriteClaim, AiAuditLog, AiConfirmationRequest],
+      synchronize: true,
+    });
+    await ds.initialize();
+    executeMock = jest.fn().mockResolvedValue({ success: true, data: { id: 42 } });
+    build();
+  });
+
+  afterEach(async () => {
+    await ds.destroy();
+  });
+
+  it('正常路径：占位赢得 → 执行一次 → 落定并指回副作用行', async () => {
+    const res = await exec.executeWrite(
+      CTX.toolName,
+      CTX.args,
+      CTX.userId,
+      CTX.conversationId,
+    );
+
+    expect(res.success).toBe(true);
+    expect(executeMock).toHaveBeenCalledTimes(1);
+
+    const row = await claims().findOne({ where: { idempotencyKey: key() } });
+    expect(row?.status).toBe(WRITE_CLAIM_STATUS.SETTLED);
+    expect(row?.settledAt).toBeInstanceOf(Date);
+    // effectId 指向登记下来的副作用行 —— 让占位行**自己**答得出「这次执行产出了哪条副作用」
+    expect(row?.effectId).toBeTruthy();
+    const effect = await ds
+      .getRepository(AiToolSideEffect)
+      .findOne({ where: { idempotencyKey: key() } });
+    expect(row?.effectId).toBe(effect?.id);
+  });
+
+  it('已有人持有 ⇒ **绝不重复执行**（旧实现在此照样执行）', async () => {
+    // 模拟「另一请求已占位、尚未落定」
+    await claims().save(
+      claims().create({
+        idempotencyKey: key(),
+        userId: CTX.userId,
+        conversationId: CTX.conversationId,
+        toolName: CTX.toolName,
+        argsHash: 'h',
+        status: WRITE_CLAIM_STATUS.CLAIMED,
+        claimedAt: new Date(),
+        attempts: 1,
+      }),
+    );
+
+    const res = await exec.executeWrite(
+      CTX.toolName,
+      CTX.args,
+      CTX.userId,
+      CTX.conversationId,
+    );
+
+    expect(res.success).toBe(false);
+    expect(res.error).toContain('已由另一请求接管');
+    // 关键：工具**一次都没执行**。旧实现读不到占位，会照写第二遍。
+    expect(executeMock).not.toHaveBeenCalled();
+  });
+
+  it('本地写失败 ⇒ 释放占位，重试仍可用（不自造「不可重试」）', async () => {
+    executeMock.mockRejectedValueOnce(new Error('校验失败：客户不存在'));
+
+    await expect(
+      exec.executeWrite(CTX.toolName, CTX.args, CTX.userId, CTX.conversationId),
+    ).rejects.toThrow('校验失败');
+
+    const afterFail = await claims().findOne({ where: { idempotencyKey: key() } });
+    expect(afterFail?.status).toBe(WRITE_CLAIM_STATUS.RELEASED);
+    expect(afterFail?.releaseReason).toBe('execute_failed');
+
+    // 重试：同一键重新占位 → 这次执行并落定（若失败被锁成不可重试，此处会「已由另一请求接管」而红）
+    executeMock.mockResolvedValueOnce({ success: true, data: { id: 43 } });
+    const retry = await exec.executeWrite(
+      CTX.toolName,
+      CTX.args,
+      CTX.userId,
+      CTX.conversationId,
+    );
+
+    expect(retry.success).toBe(true);
+    expect(executeMock).toHaveBeenCalledTimes(2);
+    const afterRetry = await claims().findOne({ where: { idempotencyKey: key() } });
+    expect(afterRetry?.status).toBe(WRITE_CLAIM_STATUS.SETTLED);
+    expect(afterRetry?.attempts).toBe(2);
+  });
+
+  it('崩溃残留：仍是 claimed 且已过阈值 ⇒ **可见**；且不自动改写状态', async () => {
+    await claims().save(
+      claims().create({
+        idempotencyKey: 'key-crashed',
+        userId: CTX.userId,
+        toolName: CTX.toolName,
+        argsHash: 'h',
+        status: WRITE_CLAIM_STATUS.CLAIMED,
+        claimedAt: new Date(Date.now() - 60 * 60 * 1000),
+        attempts: 1,
+      }),
+    );
+    await claims().save(
+      claims().create({
+        idempotencyKey: 'key-fresh',
+        userId: CTX.userId,
+        toolName: CTX.toolName,
+        argsHash: 'h',
+        status: WRITE_CLAIM_STATUS.CLAIMED,
+        claimedAt: new Date(),
+        attempts: 1,
+      }),
+    );
+
+    const stale = await effects.listStaleClaims(10 * 60 * 1000);
+    expect(stale.map((c) => c.idempotencyKey)).toEqual(['key-crashed']);
+
+    // 读**不改**状态：KeelBase 不知道那次执行是否落了库，自动改写就是拿猜测冒充事实
+    const still = await claims().findOne({ where: { idempotencyKey: 'key-crashed' } });
+    expect(still?.status).toBe(WRITE_CLAIM_STATUS.CLAIMED);
+  });
+
+  it('未装配仓库（既有单测装配形态）⇒ 退回旧行为，不因缺仓库而崩', async () => {
+    const bare = new AiToolEffectsService(ds.getRepository(AiToolSideEffect));
+    await expect(bare.claimWrite(CTX)).resolves.toEqual({ won: true });
+  });
+
+  it('**反向对照**：挡住第二次的是**占位**，不是「已登记」—— 工具不登记副作用时，没有占位就会再写一次', async () => {
+    // 工具返回的 data **没有 id** ⇒ 不产生副作用行 ⇒ 下一次调用的 `findExisting` 探测必然落空。
+    // 于是同一条序列在两态下给出相反的结果：有占位 ⇒ 第二次被挡；无占位 ⇒ 第二次照样执行。
+    // **全程顺序执行，不靠并发** —— 真并发在 sqlite 单连接下的胜负取决于调度，那条断言会 flaky，
+    // 而它要说的并不是「谁赢」，是「没有占位时会怎样」。
+    executeMock.mockResolvedValue({ success: true, data: {} });
+
+    // ① 有占位（本套件的常规装配）：第一次落定后，第二次被 `settled` 挡住
+    await exec.executeWrite(CTX.toolName, CTX.args, CTX.userId, CTX.conversationId);
+    executeMock.mockClear();
+    const blocked = await exec.executeWrite(CTX.toolName, CTX.args, CTX.userId, CTX.conversationId);
+    expect(blocked.success).toBe(false);
+    expect(executeMock).not.toHaveBeenCalled();
+
+    // ② 无占位仓储：同一序列下第二次**照样执行**（这就是旧实现的行为，也是本项存在的理由）
+    const noClaims = new ToolExecutionService(
+      { execute: executeMock, getTool: () => ({ name: CTX.toolName }) } as any,
+      {
+        assertToolAllowed: jest.fn().mockResolvedValue(undefined),
+        assertWithinDeclaredScope: jest.fn().mockResolvedValue(undefined),
+      // ACT-7：执行点新增的审批要求复算（闸门接口长大了，替身必须满足）
+      assertApprovalRequirementHolds: jest.fn().mockResolvedValue(undefined),
+        destinationOf: () => 'local',
+      } as any,
+      { current: undefined } as any,
+      new AiToolEffectsService(ds.getRepository(AiToolSideEffect)) as any,
+      undefined,
+    );
+    executeMock.mockClear();
+    await noClaims.executeWrite(CTX.toolName, CTX.args, CTX.userId, CTX.conversationId);
+    await noClaims.executeWrite(CTX.toolName, CTX.args, CTX.userId, CTX.conversationId);
+    expect(executeMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('消费者②（REV-7）：`authorizationRef` 落进占位行；免确认的自动写为 `null`', async () => {
+    await exec.executeWrite(CTX.toolName, CTX.args, CTX.userId, CTX.conversationId, undefined, {
+      authorizationRef: 'tok-1',
+    });
+    await exec.executeWrite(
+      CTX.toolName,
+      { ...CTX.args, title: '另一件事' },
+      CTX.userId,
+      CTX.conversationId,
+    );
+
+    const withAuth = await claims().findOne({ where: { idempotencyKey: key() } });
+    const auto = await claims().findOne({
+      where: { idempotencyKey: AiToolEffectsService.buildKey({ ...CTX, args: { ...CTX.args, title: '另一件事' } }) },
+    });
+    expect(withAuth?.authorizationRef).toBe('tok-1');
+    // 没有授权参与 ⇒ `null` 是**答案**（没有审批，也就没有窗口），不是「未知」
+    expect(auto?.authorizationRef ?? null).toBeNull();
+  });
+
+  describe('AW-11 形状 A：审计行 → 占位行的正向边（成对写）', () => {
+    const REF = {
+      userId: CTX.userId,
+      conversationId: CTX.conversationId,
+      toolName: CTX.toolName,
+      argsJson: JSON.stringify(CTX.args),
+    };
+
+    const seedClaim = (): Promise<AiWriteClaim> =>
+      claims().save(
+        claims().create({
+          idempotencyKey: key(),
+          userId: CTX.userId,
+          conversationId: CTX.conversationId,
+          toolName: CTX.toolName,
+          argsHash: 'h',
+          status: WRITE_CLAIM_STATUS.SETTLED,
+          claimedAt: new Date(),
+          attempts: 1,
+        }),
+      );
+
+    const seedAudit = (): Promise<AiAuditLog> => {
+      const repo = ds.getRepository(AiAuditLog);
+      return repo.save(
+        repo.create({
+          userId: CTX.userId,
+          conversationId: CTX.conversationId,
+          action: 'tool_call',
+          isError: false,
+        }),
+      );
+    };
+
+    it('claim.audit_row_id 与 audit.write_claim_id 成对写入', async () => {
+      const claim = await seedClaim();
+      const audit = await seedAudit();
+
+      await effects.attachAuditRow(REF, audit.id);
+
+      expect((await claims().findOne({ where: { id: claim.id } }))?.auditRowId).toBe(audit.id);
+      const linkedAudit = await ds.getRepository(AiAuditLog).findOne({ where: { id: audit.id } });
+      // The forward edge: from the audit row one reaches **this** claim (not one guessed by tool name + time).
+      // 正向边：从审计行出发能走到**这条**占位行（不是靠工具名 + 时间猜出来的）。
+      expect(linkedAudit?.writeClaimId).toBe(claim.id);
+    });
+
+    it('没有占位行 ⇒ 审计侧**不写**（宁可少一条链接，也不挂错行）', async () => {
+      const audit = await seedAudit();
+
+      await effects.attachAuditRow(REF, audit.id);
+
+      const untouched = await ds.getRepository(AiAuditLog).findOne({ where: { id: audit.id } });
+      expect(untouched?.writeClaimId ?? null).toBeNull();
+      expect(await claims().count()).toBe(0);
+    });
+
+    it('事务性：审计行不存在 ⇒ 占位侧回滚（两侧都保持 null，不留半条边）', async () => {
+      const claim = await seedClaim();
+
+      // A non-existent audit row id throws inside the transaction, so the claim side rolls back.
+      // 不存在的审计行 id ⇒ 事务内抛出并回滚。
+      await effects.attachAuditRow(REF, 999_999);
+
+      expect((await claims().findOne({ where: { id: claim.id } }))?.auditRowId ?? null).toBeNull();
+    });
+  });
+
+  describe('ACT-6 第 2 片：外部写也认领，失败**留 `claimed`** 待对账', () => {
+    const EXT_CTX = { ...CTX, toolName: 'mcp_vendor_create_ticket' };
+    let callTool: jest.Mock;
+
+    /** 外部写装配：`isExternal` 为真 ⇒ 走外呼分支；账本仍是本套件的真 `effects`（含真占位仓储）。 */
+    const buildExternal = (): ToolExecutionService => {
+      callTool = jest.fn();
+      const external = { current: { isExternal: () => true, callTool } };
+      return new ToolExecutionService(
+        { execute: executeMock, getTool: () => ({ name: EXT_CTX.toolName }) } as any,
+        {
+          assertToolAllowed: jest.fn().mockResolvedValue(undefined),
+          assertWithinDeclaredScope: jest.fn().mockResolvedValue(undefined),
+          assertApprovalRequirementHolds: jest.fn().mockResolvedValue(undefined),
+        } as any,
+        external as any,
+        effects,
+        undefined,
+      );
+    };
+
+    it('外部写**失败** ⇒ 占位留 `claimed`（不释放、不落定），第二次被拒 —— 外呼只发生一次', async () => {
+      const svc = buildExternal();
+      callTool.mockResolvedValue({ executed: false, error: '目标系统请求超时（30000ms）' });
+
+      const first = await svc.executeWrite(
+        EXT_CTX.toolName,
+        EXT_CTX.args,
+        EXT_CTX.userId,
+        EXT_CTX.conversationId,
+      );
+      expect(first.success).toBe(false);
+      // 不谎报成功、也不谎报失败：只说「可能已到达、以目标系统为准」
+      expect(first.error).toContain('可能已到达');
+      expect(first.error).toContain('本次不重试');
+
+      const row = await claims().findOne({
+        where: { idempotencyKey: AiToolEffectsService.buildKey(EXT_CTX) },
+      });
+      // **释放**才等于允许重试；请求可能已到达目标，故这里不释放
+      expect(row?.status).toBe(WRITE_CLAIM_STATUS.CLAIMED);
+      expect(row?.settledAt ?? null).toBeNull();
+
+      const second = await svc.executeWrite(
+        EXT_CTX.toolName,
+        EXT_CTX.args,
+        EXT_CTX.userId,
+        EXT_CTX.conversationId,
+      );
+      expect(second.success).toBe(false);
+      // 最强的观测面：真实外呼只发生过**一次**（旧实现此处会再发一次 —— 真双写）
+      expect(callTool).toHaveBeenCalledTimes(1);
+    });
+
+    it('外部写**成功** ⇒ 落定，且占位指回锚行', async () => {
+      const svc = buildExternal();
+      callTool.mockResolvedValue({ executed: true, content: '{"id":955}' });
+
+      const res = await svc.executeWrite(
+        EXT_CTX.toolName,
+        EXT_CTX.args,
+        EXT_CTX.userId,
+        EXT_CTX.conversationId,
+      );
+
+      expect(res.success).toBe(true);
+      const row = await claims().findOne({
+        where: { idempotencyKey: AiToolEffectsService.buildKey(EXT_CTX) },
+      });
+      expect(row?.status).toBe(WRITE_CLAIM_STATUS.SETTLED);
+      expect(row?.effectId).toBeTruthy();
+    });
+
+    it('**进对账**：失败的那条占位过阈值后由 `listStaleClaims` 冒出（可见，但不自动解决）', async () => {
+      const svc = buildExternal();
+      callTool.mockResolvedValue({ executed: false, error: '目标系统不可达: ECONNRESET' });
+      await svc.executeWrite(EXT_CTX.toolName, EXT_CTX.args, EXT_CTX.userId, EXT_CTX.conversationId);
+
+      // 把它放老一点，再按阈值读 —— 陈旧读者看见它，状态**原样**（没人替它改写结论）
+      const k = AiToolEffectsService.buildKey(EXT_CTX);
+      await claims().update({ idempotencyKey: k }, { claimedAt: new Date(Date.now() - 10 * 60 * 1000) });
+
+      const stale = await effects.listStaleClaims(5 * 60 * 1000);
+      expect(stale.map((s) => s.idempotencyKey)).toContain(k);
+      expect((await claims().findOne({ where: { idempotencyKey: k } }))?.status).toBe(
+        WRITE_CLAIM_STATUS.CLAIMED,
+      );
+    });
+  });
+
+  describe('卡住的占位行经 `?stale=true` 那条车道露出（ACT-6 第 2 片缺口的收口）', () => {
+    it('陈旧占位行出现在 `staleClaims`；**没问就不带该字段**', async () => {
+      const seed = (key: string, minutesAgo: number, attempts: number) =>
+        claims().save(
+          claims().create({
+            idempotencyKey: key,
+            userId: CTX.userId,
+            conversationId: CTX.conversationId,
+            toolName: CTX.toolName,
+            argsHash: 'h',
+            status: WRITE_CLAIM_STATUS.CLAIMED,
+            claimedAt: new Date(Date.now() - minutesAgo * 60_000),
+            attempts,
+          }),
+        );
+      // 90 分钟（阈值默认 60）⇒ 陈旧；刚占的 ⇒ 不陈旧
+      await seed('k-old', 90, 2);
+      await seed('k-fresh', 0, 1);
+
+      const asked = (await effects.list({ stale: true })) as unknown as {
+        staleClaims: Array<Record<string, unknown>>;
+      };
+      // 只有陈旧那条冒出来；且投影只陈述「谁的、哪一次、多久了、几次」——**没有**成功/失败字段
+      expect(asked.staleClaims.map((c) => c.idempotencyKey)).toEqual(['k-old']);
+      expect(asked.staleClaims[0]).toMatchObject({
+        toolName: CTX.toolName,
+        status: WRITE_CLAIM_STATUS.CLAIMED,
+        attempts: 2,
+      });
+      expect(asked.staleClaims[0].ageMinutes as number).toBeGreaterThanOrEqual(89);
+      expect(Object.keys(asked.staleClaims[0])).not.toContain('success');
+
+      // **「没问」与「问了但没有」必须分得开** —— 故不问 `stale` 时该字段根本不出现，
+      // 而不是给一个空数组让人读成「没有卡住的写」。
+      const notAsked = (await effects.list({})) as unknown as Record<string, unknown>;
+      expect('staleClaims' in notAsked).toBe(false);
+    });
+  });
+
+  describe('AW-11 B1：RELEASED 重占位时更新 authorization_ref，解释面因此指对批准人', () => {
+    /**
+     * The claim's `authorizationRef` is the **only** precise key between an action and who approved
+     * it: the interpretation surface (`AuditEvidenceService.getInterpretation`) resolves the
+     * confirmation through it, and an audit row carries no confirmation id of its own. So when a
+     * failed attempt is released and a retry is authorized by a **different** confirmation, the ref
+     * must move to the attempt that actually executed — otherwise the page names a person who never
+     * authorized this execution.
+     *
+     * 占位行的 `authorizationRef` 是一次动作与「谁批准」之间**唯一精确**的键：解释面
+     * （`AuditEvidenceService.getInterpretation`）靠它找到确认行，而审计行本身不带确认 id。故当失败的
+     * 那次被释放、重试由**另一次**确认放行时，引用必须跟到**实际执行**的那次 —— 否则页面上写的是一个
+     * 从没管过这次执行的人。
+     */
+    const confirmations = () => ds.getRepository(AiConfirmationRequest);
+
+    const seedConfirmation = (token: string, approverId: string) =>
+      confirmations().save(
+        confirmations().create({
+          token,
+          toolName: CTX.toolName,
+          args: JSON.stringify(CTX.args),
+          operatorId: CTX.userId,
+          conversationId: CTX.conversationId,
+          riskLevel: 'R3',
+          status: 'approved',
+          kind: 'single',
+          approverId,
+          decidedAt: new Date(),
+        }),
+      );
+
+    const seedReleased = (authorizationRef?: string) =>
+      claims().save(
+        claims().create({
+          idempotencyKey: key(),
+          userId: CTX.userId,
+          conversationId: CTX.conversationId,
+          toolName: CTX.toolName,
+          argsHash: 'h',
+          status: WRITE_CLAIM_STATUS.RELEASED,
+          claimedAt: new Date(),
+          attempts: 1,
+          authorizationRef,
+        }),
+      );
+
+    /** The explanation surface, over the same database the claim was written to. */
+    const interpretationOf = () =>
+      new AuditEvidenceService(
+        ds.getRepository(AiAuditLog),
+        ds.getRepository(AiToolSideEffect),
+        {} as any, // auditChain — not read by getInterpretation
+        { forFacts: jest.fn() } as any, // coverage — `/4` only
+        undefined, // cacheService
+        undefined, // authorizationExplainer
+        undefined, // agentService
+        undefined, // operationAudit
+        undefined, // governancePolicy
+        claims(), // claimsRepo
+        confirmations(), // confirmationsRepo
+      );
+
+    it('带新授权 ⇒ 指向**实际执行**的那一次，attempts 仍 +1', async () => {
+      await seedReleased('tok-old');
+
+      const res = await effects.claimWrite({ ...CTX, authorizationRef: 'tok-new' });
+
+      expect(res.won).toBe(true);
+      const row = await claims().findOne({ where: { idempotencyKey: key() } });
+      expect(row?.status).toBe(WRITE_CLAIM_STATUS.CLAIMED);
+      expect(row?.attempts).toBe(2);
+      expect(row?.authorizationRef).toBe('tok-new');
+    });
+
+    it('不带授权 ⇒ **保留**原值（「调用方没给」不等于「没有授权」）', async () => {
+      await seedReleased('tok-old');
+
+      const res = await effects.claimWrite({ ...CTX });
+
+      expect(res.won).toBe(true);
+      const row = await claims().findOne({ where: { idempotencyKey: key() } });
+      expect(row?.attempts).toBe(2);
+      expect(row?.authorizationRef).toBe('tok-old');
+    });
+
+    it('归属：tok-A 放行失败 → tok-B 放行成功 ⇒ 解释面的批准人是 tok-B 那位', async () => {
+      await seedConfirmation('tok-A', 'approver-a');
+      await seedConfirmation('tok-B', 'approver-b');
+
+      // Attempt 1 — authorized by tok-A, the local write throws ⇒ claim released.
+      executeMock.mockRejectedValueOnce(new Error('db write failed'));
+      await expect(
+        exec.executeWrite(CTX.toolName, CTX.args, CTX.userId, CTX.conversationId, undefined, {
+          authorizationRef: 'tok-A',
+        }),
+      ).rejects.toThrow('db write failed');
+      expect((await claims().findOne({ where: { idempotencyKey: key() } }))?.status).toBe(
+        WRITE_CLAIM_STATUS.RELEASED,
+      );
+
+      // Attempt 2 — authorized by tok-B, it executes.
+      executeMock.mockResolvedValueOnce({ success: true, data: { id: 7 } });
+      const second = await exec.executeWrite(
+        CTX.toolName,
+        CTX.args,
+        CTX.userId,
+        CTX.conversationId,
+        undefined,
+        { authorizationRef: 'tok-B' },
+      );
+      expect(second.success).toBe(true);
+
+      // The audit row (what `ai.service` writes on the success branch) and its link to the claim.
+      const auditRepo = ds.getRepository(AiAuditLog);
+      const audit = await auditRepo.save(
+        auditRepo.create({
+          userId: CTX.userId,
+          conversationId: CTX.conversationId,
+          action: 'tool_call',
+          detail: `${CTX.toolName}(${JSON.stringify(CTX.args)})`,
+          isError: false,
+        }),
+      );
+      await effects.attachAuditRow(
+        {
+          userId: CTX.userId,
+          conversationId: CTX.conversationId,
+          toolName: CTX.toolName,
+          argsJson: JSON.stringify(CTX.args),
+        },
+        audit.id,
+      );
+
+      const res = await interpretationOf().getInterpretation(audit.id);
+
+      // The token, then the attribution it stands for: `approver-a` approved the attempt that
+      // failed and never touched the one that landed.
+      // 先是 token，再是它代表的归属：`approver-a` 批准的是失败的那次，从没管过真正落库的那次。
+      expect(res.approval?.token).toBe('tok-B');
+      expect(res.approval?.approverId).toBe('approver-b');
+    });
+  });
+});

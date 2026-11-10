@@ -1,0 +1,1309 @@
+// SPDX-License-Identifier: Apache-2.0
+
+import 'dart:async';
+import 'package:flutter/cupertino.dart';
+import 'package:flutter/foundation.dart';
+
+/// 国际化支持：中/英文。
+/// 遵循 Flutter 标准 Localizations 管线：注册 AppLocalizations.delegate
+/// 后，通过 AppLocalizations.of(context) 获取实例。
+class AppLocalizations {
+  final Locale locale;
+
+  AppLocalizations(this.locale);
+
+  /// 标准查找方法，由 Localizations widget 提供缓存。
+  static AppLocalizations of(BuildContext context) {
+    return Localizations.of<AppLocalizations>(context, AppLocalizations)!;
+  }
+
+  /// Flutter 本地化委托，注册到 CupertinoApp.localizationsDelegates。
+  static const LocalizationsDelegate<AppLocalizations> delegate =
+      _AppLocalizationsDelegate();
+
+  /// 简体中文判定：仅 zh_CN / 无地区 zh / Hans 脚本视为简体中文。
+  /// zh_TW / zh_HK 等繁体地区无对应译文，按未支持处理（回退英文）。
+  bool get isZh =>
+      locale.languageCode == 'zh' &&
+      (locale.countryCode == null ||
+          locale.countryCode == 'CN' ||
+          locale.scriptCode == 'Hans');
+
+  String _t(String en, String zh) => isZh ? zh : en;
+
+  // --- General ---
+  String get appName => _t('KeelBase', 'KeelBase');
+  String get ok => _t('OK', '确定');
+  String get cancel => _t('Cancel', '取消');
+  String get confirm => _t('Confirm', '确认');
+  String get save => _t('Save', '保存');
+  String get delete => _t('Delete', '删除');
+  String get edit => _t('Edit', '编辑');
+  String get create => _t('Create', '创建');
+  String get update => _t('Update', '更新');
+  String get loading => _t('Loading...', '加载中...');
+  String get retry => _t('Retry', '重试');
+  String get submit => _t('Submit', '提交');
+  String get done => _t('Done', '完成');
+  String get approve => _t('Approve', '通过');
+  String get reject => _t('Reject', '驳回');
+  String get back => _t('Back', '返回');
+  String get gotIt => _t('Got it', '知道了');
+
+  // --- AI CRM 旗舰应用 ---
+  String get crmTitle => _t('AI CRM', '客户管理');
+  String get crmExploreEntry => _t('AI CRM', 'AI 客户管理');
+  String get crmAddCustomer => _t('Add customer', '新增客户');
+  String get crmCustomerName => _t('Customer name', '客户/公司名称');
+  String get crmCustomerCompany => _t('Company (optional)', '公司（可选）');
+  String get crmNameRequired => _t('Customer name is required', '请输入客户名称');
+  String get crmCreated => _t('Saved', '已保存');
+  String get crmEmpty => _t('No customers yet — add one, or ask the AI to analyze your customers.', '暂无客户——新增一个，或让 AI 帮你分析客户。');
+  String get crmOrders => _t('Orders', '订单');
+  String get crmActivities => _t('Activities', '跟进记录');
+  String get crmTasks => _t('Tasks', '任务');
+  String get crmRisks => _t('Risks', '风险');
+  String get crmNoOrders => _t('No orders', '暂无订单');
+  String get crmNoActivities => _t('No activities', '暂无跟进记录');
+  String get crmNoTasks => _t('No tasks', '暂无任务');
+  String get crmNoRisks => _t('No risks', '暂无风险记录');
+  String get crmAddOrder => _t('Add order', '新增订单');
+  String get crmOrderAmountHint => _t('Amount (e.g. 450000)', '金额（如 450000）');
+  String get crmAddActivity => _t('Add activity', '新增跟进记录');
+  String get crmActivitySummaryHint => _t('Summary (call / meeting / email)', '跟进内容（电话/会议/邮件）');
+  String get crmAddTask => _t('Add follow-up task', '新增跟进任务');
+  String get crmTaskTitleHint => _t('Task title', '任务标题');
+  String get crmAnalyzeRisk => _t('Analyze risk', '风险分析');
+  String get crmAnalysisDone => _t('Analysis complete', '分析完成');
+  String get crmRiskLevel => _t('Risk level', '风险等级');
+  String get crmStatusLead => _t('Lead', '潜在');
+  String get crmStatusActive => _t('Active', '合作中');
+  String get crmStatusChurnRisk => _t('Churn risk', '流失风险');
+  String get crmStatusInactive => _t('Inactive', '已停止');
+
+  String crmStatusLabel(String status) {
+    switch (status) {
+      case 'active':
+        return crmStatusActive;
+      case 'churn_risk':
+        return crmStatusChurnRisk;
+      case 'inactive':
+        return crmStatusInactive;
+      default:
+        return crmStatusLead;
+    }
+  }
+
+  // --- AI Project Management 旗舰应用 ---
+  String get pmTitle => _t('AI Project', '项目管理');
+  String get pmExploreEntry => _t('AI Project', 'AI 项目管理');
+  String get pmAddProject => _t('Add project', '新增项目');
+  String get pmProjectName => _t('Project name', '项目名称');
+  String get pmNameRequired => _t('Project name is required', '请输入项目名称');
+  String get pmEmpty => _t('No projects yet — add one, or ask the AI to analyze project risk.', '暂无项目——新增一个，或让 AI 分析项目风险。');
+  String get pmMilestones => _t('Milestones', '里程碑');
+  String get pmTasks => _t('Tasks', '任务');
+  String get pmRisks => _t('Risks', '风险');
+  String get pmMembers => _t('members', '成员');
+  String get pmNoMilestones => _t('No milestones', '暂无里程碑');
+  String get pmNoTasks => _t('No tasks', '暂无任务');
+  String get pmNoRisks => _t('No risks', '暂无风险记录');
+  String get pmAddMilestone => _t('Add milestone', '新增里程碑');
+  String get pmMilestoneTitleHint => _t('Milestone title', '里程碑标题');
+  String get pmAddTask => _t('Add task', '新增任务');
+  String get pmTaskTitleHint => _t('Task title', '任务标题');
+
+  // --- AI Approval 旗舰应用 ---
+  String get apTitle => _t('AI Approval', '审批中心');
+  String get apExploreEntry => _t('AI Approval', 'AI 审批');
+  String get apSubmitRequest => _t('Submit request', '提交审批');
+  String get apTitleHint => _t('Title (e.g. Q3 travel reimbursement)', '标题（如 Q3 差旅报销）');
+  String get apTypeReimbursement => _t('Reimbursement', '报销');
+  String get apTypePurchase => _t('Purchase', '采购');
+  String get apTypeLeave => _t('Leave', '请假');
+  String get apAmountHint => _t('Amount (yuan)', '金额（元）');
+  String get apReasonHint => _t('Reason', '事由');
+  String get apRequired => _t('Fill in title, amount and reason', '请填写标题、金额和事由');
+  String get apEmpty => _t('No requests yet — submit one, or ask the AI to review a reimbursement.', '暂无审批——提交一个，或让 AI 帮你预审批。');
+  String get apReview => _t('AI review (apply policy)', 'AI 预审（按政策分级）');
+  String get apApprove => _t('Approve', '通过');
+  String get apReject => _t('Reject', '驳回');
+  String get apReviewed => _t('AI review complete', 'AI 预审完成');
+  String get apDecided => _t('Decision saved', '已决定');
+  String get apReason => _t('Reason:', '事由：');
+  String get apAiRecommendation => _t('AI recommendation', 'AI 预审建议');
+  String get apStatusPending => _t('Pending', '待预审');
+  String get apStatusNeedsReview => _t('Needs review', '待人工复核');
+  String get apStatusApproved => _t('Approved', '已通过');
+  String get apStatusRejected => _t('Rejected', '已驳回');
+  String get apStatusAutoApproved => _t('Auto approved', '已自动通过');
+
+  String apStatusLabel(String status) {
+    switch (status) {
+      case 'needs_review':
+        return apStatusNeedsReview;
+      case 'approved':
+        return apStatusApproved;
+      case 'rejected':
+        return apStatusRejected;
+      case 'auto_approved':
+        return apStatusAutoApproved;
+      default:
+        return apStatusPending;
+    }
+  }
+
+  String pmStatusLabel(String status) {
+    switch (status) {
+      case 'active':
+        return _t('Active', '进行中');
+      case 'on_hold':
+        return _t('On hold', '暂停');
+      case 'completed':
+        return _t('Completed', '已完成');
+      default:
+        return _t('Planned', '规划中');
+    }
+  }
+
+  String crmRiskLabel(String level) {
+    switch (level) {
+      case 'critical':
+        return _t('Critical', '极危');
+      case 'high':
+        return _t('High', '高');
+      case 'medium':
+        return _t('Medium', '中');
+      default:
+        return _t('Low', '低');
+    }
+  }
+
+  // --- EASY-5 首启预设引导（MOD-4 capabilities） ---
+  String get presetGuideTitle => _t('Deployment preset', '部署预设模式');
+  String get presetGuideFull => _t(
+      'This deployment runs in full mode — all modules and AI capabilities are enabled.',
+      '当前部署为全功能模式（full）：所有模块与 AI 能力均已开启。');
+  String get presetGuideSmall => _t(
+      'This deployment runs in small mode — push, SMS and third-party login are disabled to keep it lightweight.',
+      '当前部署为精简模式（small）：推送、短信、第三方登录等功能已关闭，保持轻量。');
+  String get presetGuideLite => _t(
+      'This deployment runs in lite mode — only core modules are enabled; search and sample modules are disabled.',
+      '当前部署为极简模式（lite）：仅核心模块开启，搜索与示例模块已关闭。');
+
+  // --- Notifications ---
+  String get notifications => _t('Notifications', '通知');
+  String get markAllRead => _t('Mark all read', '全部已读');
+  String get noNotifications => _t('No notifications', '暂无通知');
+
+  // --- Auth ---
+  String get login => _t('Login', '登录');
+  String get register => _t('Register', '注册');
+  String get logout => _t('Logout', '退出登录');
+  String get username => _t('Username', '用户名');
+  String get password => _t('Password', '密码');
+
+  // --- UX-9 登录页 Slogan + 演示账号 ---
+  String get loginSlogan => _t('Small goals, done together', '每天的小目标，一起完成');
+  String get loginSloganSub => _t('A daily plan for parents and children', '家长和孩子共同使用的每日计划');
+  String get demoAccounts => _t('Demo accounts:', '演示账号：');
+  String get demoAccountUser => _t('User alex / Alex@2026\$Demo', '普通用户 alex / Alex@2026\$Demo');
+  String get demoAccountAdmin => _t('Admin admin / Admin@2026\$KeelBase', '管理员 admin / Admin@2026\$KeelBase');
+  String get nickname => _t('Nickname', '昵称');
+  String get loginSuccess => _t('Login successful', '登录成功');
+  String get registerSuccess => _t('Registration successful', '注册成功');
+  String get logoutConfirm => _t('Are you sure to logout?', '确定要退出登录吗？');
+  String get passwordLogin => _t('Password Login', '密码登录');
+  String get childLoginTitle => _t('Child Sign In', '孩子登录');
+  String get childLoginHint => _t(
+      'Enter your login account and PIN to start. The invite code is only needed the first time.',
+      '输入登录账号和 PIN 即可开始；家庭邀请码仅在首次登录时填写');
+  String get inviteCode => _t('Family invite code', '家庭邀请码');
+  String get inviteCodeOptional =>
+      _t('Family invite code (optional)', '家庭邀请码（选填）');
+  String get childLoginUsername => _t('Login account', '登录账号');
+  String get childNickname => _t('Nickname', '昵称');
+  String get childPin => _t('4-6 digit PIN', '4-6 位 PIN');
+  String get backToParentLogin => _t('Back to parent sign in', '返回家长登录');
+  String get phoneLogin => _t('Phone Login', '手机号登录');
+  String get phoneNumber => _t('Phone number', '手机号');
+  String get sendCode => _t('Send code', '获取验证码');
+  String get phoneOrCodeInvalid => _t('Enter valid phone and 6-digit code', '请输入正确手机号和 6 位验证码');
+  String get phoneRequired => _t('Enter phone number first', '请先输入手机号');
+  String get smsCodeSent => _t('Code sent to your phone', '验证码已发送到您的手机');
+  String get bindPhone => _t('Bind phone', '绑定手机号');
+  String get phoneBound => _t('Phone bound', '手机号已绑定');
+  String get deactivateAccount => _t('Deactivate account', '注销账号');
+  String get deactivateConfirm => _t('This permanently deletes your account and all data. Enter password to confirm.', '此操作将永久删除您的账号及所有数据，请输入密码确认。');
+  String get accountDeactivated => _t('Account deactivated', '账号已注销');
+  String get exportData => _t('Export my data', '导出我的数据');
+  String get dataExported => _t('Data exported', '数据已导出');
+  String get deactivateFailed => _t('Deactivate failed', '注销失败');
+  String get noAccount => _t("Don't have an account? ", '还没有账号？');
+  String get hasAccount => _t('Already have an account? ', '已有账号？');
+  String get usernameRequired => _t('Username is required', '请输入用户名');
+  String get passwordRequired => _t('Password is required', '请输入密码');
+  String get nicknameRequired => _t('Nickname is required', '请输入昵称');
+  String get usernameHint => _t('3-32 chars, letters/numbers/_', '3-32位，字母/数字/下划线');
+  String get passwordHint => _t('8+ chars, must include letters & numbers', '至少8位，需包含字母和数字');
+  String get nicknameHint => _t('Your display name', '您的显示名称');
+
+  // --- OAuth ---
+  String get or => _t('or', '或');
+  String get signInWithApple => _t('Sign in with Apple', '使用 Apple 登录');
+  String get internationalLogin => _t('International', '国际');
+  String get chinaLogin => _t('China', '国内');
+
+  // --- OAuth 失败（种类由数据层给 key，句子在这里说） ---
+  String get oauthNativeOnly =>
+      _t('This sign-in method only works in the mobile app', '此登录方式只能在手机 App 内使用');
+  String get oauthNotAvailableBrowser => _t(
+      'Apple Sign-In is not available in this browser — use Safari, or an iOS/macOS device',
+      '此浏览器不支持 Apple 登录 —— 请用 Safari，或 iOS/macOS 设备');
+  String get oauthNotAvailableDevice =>
+      _t('Apple Sign-In is not available on this device', '此设备不支持 Apple 登录');
+  String get oauthCancelled => _t('Sign-in cancelled', '已取消登录');
+  String get oauthNoCredential =>
+      _t('The sign-in provider returned no credential', '登录未返回凭据');
+  String get oauthSdkNotConfigured =>
+      _t('This sign-in method is not configured yet', '该登录方式尚未完成配置');
+  String get oauthUnsupportedProvider => _t('That sign-in method is not supported', '不支持该登录方式');
+  String oauthFailed(String detail) => detail.isEmpty
+      ? _t('Sign-in failed', '登录失败')
+      : _t('Sign-in failed: $detail', '登录失败：$detail');
+
+  // --- Agreement ---
+  String get agreeLabel => _t('Agree to', '已阅读并同意');
+  String get termsOfServiceLink => _t('Terms of Service', '《服务条款》');
+  String get privacyPolicyLink => _t('Privacy Policy', '《隐私政策》');
+  String get and => _t('and', '和');
+  String get agreementRequired => _t('Please agree to the terms first', '请先阅读并同意相关协议');
+
+  // --- Tabs ---
+  String get tabHome => _t('Home', '首页');
+  String get tabEvents => _t('Events', '事件');
+  String get tabToday => _t('Today', '今日');
+  String get tabTasks => _t('Tasks', '任务');
+  String get tabFamily => _t('Family', '家庭');
+  String get tabRewards => _t('Rewards', '奖励');
+  String get tabMe => _t('Me', '我的');
+  String get todayTitle => _t('Today', '今日');
+  String get todayProgress => _t('completed', '已完成');
+  String get todayTasks => _t('Today\'s tasks', '今日任务');
+  String get noTasksToday => _t('No tasks today', '今天还没有任务');
+  String get pointsLabel => _t('family points', '家庭积分');
+  String get streakDays => _t('day streak', '连签');
+  String get tabMore => _t('More', '更多');
+  String get tabExplore => _t('Explore', '发现');
+  String get tabProfile => _t('Profile', '我的');
+  String get tabTodos => _t('Todos', '待办');
+
+  // --- Todos ---
+  String get todoInputHint => _t('Add a todo...', '新增待办…');
+  String get todoEmpty => _t('No todos yet', '暂无待办');
+  String get deleteTodoConfirm => _t('Delete this todo?', '删除该待办？');
+
+  // --- 徽章授予 · 字段占位符 / field placeholders ---
+  String get badge_awardsFieldBadgeId => _t('badgeId', '徽章');
+  String get badge_awardsFieldEarnedOn => _t('earnedOn', '获得日期');
+
+
+  // --- 徽章授予（EASY-2 生成） ---
+  String get badge_awardsTitle => _t('BadgeAward', '徽章授予');
+  String get badge_awardsAddTitle => _t('New BadgeAward', '新增徽章授予');
+  String get badge_awardsEmpty => _t('No BadgeAward yet', '暂无徽章授予');
+  String get badge_awardsDeleteConfirm => _t('Delete this badgeaward?', '删除该徽章授予？');
+
+  // --- 兑换记录 · 字段占位符 / field placeholders ---
+  String get reward_redemptionsFieldRewardId => _t('rewardId', '奖励');
+  String get reward_redemptionsFieldPointsSpent => _t('pointsSpent', '消耗积分');
+  String get reward_redemptionsFieldIsCancelled => _t('isCancelled', '已取消');
+  String get reward_redemptionsFieldNote => _t('note', '备注');
+
+
+  // --- 兑换记录（EASY-2 生成） ---
+  String get reward_redemptionsTitle => _t('RewardRedemption', '兑换记录');
+  String get reward_redemptionsAddTitle => _t('New RewardRedemption', '新增兑换记录');
+  String get reward_redemptionsEmpty => _t('No RewardRedemption yet', '暂无兑换记录');
+  String get reward_redemptionsDeleteConfirm => _t('Delete this rewardredemption?', '删除该兑换记录？');
+
+  // --- 任务备注 · 字段占位符 / field placeholders ---
+  String get task_notesFieldTaskId => _t('taskId', '任务');
+  String get task_notesFieldContent => _t('content', '内容');
+  String get task_notesFieldContentType => _t('contentType', '类型');
+  String get task_notesFieldMediaUrl => _t('mediaUrl', '媒体地址');
+
+
+  // --- 任务备注（EASY-2 生成） ---
+  String get task_notesTitle => _t('TaskNote', '任务备注');
+  String get task_notesAddTitle => _t('New TaskNote', '新增任务备注');
+  String get task_notesEmpty => _t('No TaskNote yet', '暂无任务备注');
+  String get task_notesDeleteConfirm => _t('Delete this tasknote?', '删除该任务备注？');
+
+  // --- 成就 · 字段占位符 / field placeholders ---
+  String get achievementsFieldTotalPoints => _t('totalPoints', '累计积分');
+  String get achievementsFieldCurrentStreak => _t('currentStreak', '当前连签');
+  String get achievementsFieldLongestStreak => _t('longestStreak', '最长连签');
+  String get achievementsFieldLastActiveDate => _t('lastActiveDate', '最后活跃日');
+
+
+  // --- 成就（EASY-2 生成） ---
+  String get achievementsTitle => _t('Achievement', '成就');
+  String get achievementsAddTitle => _t('New Achievement', '新增成就');
+  String get achievementsEmpty => _t('No Achievement yet', '暂无成就');
+  String get achievementsDeleteConfirm => _t('Delete this achievement?', '删除该成就？');
+
+  // --- 打卡 · 字段占位符 / field placeholders ---
+  String get checkinsFieldCheckDate => _t('checkDate', '打卡日期');
+  String get checkinsFieldTotalTasks => _t('totalTasks', '任务总数');
+  String get checkinsFieldDoneTasks => _t('doneTasks', '完成数');
+  String get checkinsFieldIsPerfect => _t('isPerfect', '全部完成');
+  String get checkinsFieldPointsEarned => _t('pointsEarned', '获得积分');
+
+
+  // --- 打卡（EASY-2 生成） ---
+  String get checkinsTitle => _t('Checkin', '打卡');
+  String get checkinsAddTitle => _t('New Checkin', '新增打卡');
+  String get checkinsEmpty => _t('No Checkin yet', '暂无打卡');
+  String get checkinsDeleteConfirm => _t('Delete this checkin?', '删除该打卡？');
+
+  // --- 徽章 · 字段占位符 / field placeholders ---
+  String get badgesFieldName => _t('name', '徽章名称');
+  String get badgesFieldDescription => _t('description', '描述');
+  String get badgesFieldBadgeType => _t('badgeType', '徽章类型');
+  String get badgesFieldThreshold => _t('threshold', '达成阈值');
+  String get badgesFieldIconUrl => _t('iconUrl', '图标地址');
+
+
+  // --- 徽章（EASY-2 生成） ---
+  String get badgesTitle => _t('Badge', '徽章');
+  String get badgesAddTitle => _t('New Badge', '新增徽章');
+  String get badgesEmpty => _t('No Badge yet', '暂无徽章');
+  String get badgesDeleteConfirm => _t('Delete this badge?', '删除该徽章？');
+
+  // --- 每日评价 · 字段占位符 / field placeholders ---
+  String get daily_reviewsFieldReviewDate => _t('reviewDate', '评价日期');
+  String get daily_reviewsFieldContent => _t('content', '评价内容');
+  String get daily_reviewsFieldRating => _t('rating', '评分');
+
+
+  // --- 每日评价（EASY-2 生成） ---
+  String get daily_reviewsTitle => _t('DailyReview', '每日评价');
+  String get daily_reviewsAddTitle => _t('New DailyReview', '新增每日评价');
+  String get daily_reviewsEmpty => _t('No DailyReview yet', '暂无每日评价');
+  String get daily_reviewsDeleteConfirm => _t('Delete this dailyreview?', '删除该每日评价？');
+
+  // --- 奖励 · 字段占位符 / field placeholders ---
+  String get rewardsFieldTitle => _t('title', '奖励名称');
+  String get rewardsFieldDescription => _t('description', '描述');
+  String get rewardsFieldPointsCost => _t('pointsCost', '所需积分');
+  String get rewardsFieldIsActive => _t('isActive', '启用');
+
+
+  // --- 奖励（EASY-2 生成） ---
+  String get rewardsTitle => _t('Reward', '奖励');
+  String get rewardsAddTitle => _t('New Reward', '新增奖励');
+  String get rewardsEmpty => _t('No Reward yet', '暂无奖励');
+  String get rewardsDeleteConfirm => _t('Delete this reward?', '删除该奖励？');
+
+  // --- 家庭 · 字段占位符 / field placeholders ---
+  String get familiesFieldName => _t('name', '家庭名称');
+  String get familiesFieldInviteCode => _t('inviteCode', '邀请码');
+  String get familiesFieldApprovalMode => _t('approvalMode', '审批模式');
+  String get familiesFieldUseTimeStart => _t('useTimeStart', '可用开始');
+  String get familiesFieldUseTimeEnd => _t('useTimeEnd', '可用结束');
+
+
+  // --- 家庭（EASY-2 生成） ---
+  String get familiesTitle => _t('Familie', '家庭');
+  String get familiesAddTitle => _t('New Familie', '新增家庭');
+  String get familiesEmpty => _t('No Familie yet', '暂无家庭');
+  String get familiesDeleteConfirm => _t('Delete this familie?', '删除该家庭？');
+
+  // --- 家庭 · 添加孩子 / add child ---
+  String get addChild => _t('Add Child', '添加孩子');
+  String get childNicknameRequired => _t('Please enter a nickname', '请输入昵称');
+  String get childPinInvalid =>
+      _t('PIN must be 4-6 digits', 'PIN 必须是 4-6 位数字');
+  String get childAdded => _t('Child added', '孩子已添加');
+  String get childUsernameHint =>
+      _t('Login account (optional, auto-generated if blank)', '登录账号（可选，不填自动生成）');
+  String get childUsernameInvalid => _t(
+      'Use 3-32 letters, digits or underscores',
+      '登录账号只能包含字母、数字和下划线，3-32 位');
+
+  // --- 任务 · 字段占位符 / field placeholders ---
+  String get tasksFieldTitle => _t('title', '标题');
+  String get tasksFieldDescription => _t('description', '描述');
+  String get tasksFieldPriority => _t('priority', '优先级');
+  String get tasksFieldStatus => _t('status', '状态');
+  String get tasksFieldTaskDate => _t('taskDate', '任务日期');
+  String get tasksFieldEstimatedMinutes => _t('estimatedMinutes', '预计分钟');
+  String get tasksFieldRepeatRule => _t('repeatRule', '重复规则');
+  String get tasksFieldApprovalStatus => _t('approvalStatus', '审批状态');
+  String get tasksFieldHelpRequested => _t('helpRequested', '请求帮助');
+  String get tasksFieldHelpRequestNote => _t('helpRequestNote', '求助说明');
+  String get tasksFieldSortOrder => _t('sortOrder', '排序');
+
+  /// 枚举值的中文/英文显示名（数据库仍存英文值）
+  String enumLabel(String value) {
+    switch (value) {
+      case 'low':
+        return _t('Low', '低');
+      case 'medium':
+        return _t('Medium', '中');
+      case 'high':
+        return _t('High', '高');
+      case 'todo':
+        return _t('To do', '待办');
+      case 'doing':
+        return _t('In progress', '进行中');
+      case 'done':
+        return _t('Done', '已完成');
+      case 'cancelled':
+        return _t('Cancelled', '已取消');
+      case 'none':
+        return _t('None', '无');
+      case 'daily':
+        return _t('Daily', '每天');
+      case 'weekly':
+        return _t('Weekly', '每周');
+      case 'monthly':
+        return _t('Monthly', '每月');
+      case 'pending':
+        return _t('Pending', '待审批');
+      case 'approved':
+        return _t('Approved', '已通过');
+      case 'rejected':
+        return _t('Rejected', '已驳回');
+      case 'text':
+        return _t('Text', '文字');
+      case 'voice':
+        return _t('Voice', '语音');
+      case 'image':
+        return _t('Image', '图片');
+      case 'streak_3':
+        return _t('3-day streak', '连续 3 天');
+      case 'streak_7':
+        return _t('7-day streak', '连续 7 天');
+      case 'streak_30':
+        return _t('30-day streak', '连续 30 天');
+      case 'streak_100':
+        return _t('100-day streak', '连续 100 天');
+      case 'points_50':
+        return _t('50 points', '累计 50 分');
+      case 'points_200':
+        return _t('200 points', '累计 200 分');
+      case 'points_500':
+        return _t('500 points', '累计 500 分');
+      case 'perfect_day':
+        return _t('Perfect day', '完美一天');
+      case 'perfect_week':
+        return _t('Perfect week', '完美一周');
+      default:
+        return value;
+    }
+  }
+
+  String priorityLabel(String value) => value == 'low'
+      ? _t('Low', '低')
+      : value == 'high'
+          ? _t('High', '高')
+          : _t('Medium', '中');
+
+  String repeatRuleLabel(String value) => value == 'daily'
+      ? _t('Daily', '每天')
+      : value == 'weekly'
+          ? _t('Weekly', '每周')
+          : value == 'monthly'
+              ? _t('Monthly', '每月')
+              : _t('No repeat', '不重复');
+
+  String get fieldEnabled => _t('Enabled', '启用');
+  String get fieldRequiresApproval => _t('Requires approval', '需要审批');
+  String get fieldRequestHelp => _t('Request help', '请求帮助');
+  String get fieldPerfect => _t('All done', '全部完成');
+  String get fieldCancelled => _t('Cancelled', '已取消');
+
+
+  // --- 任务（EASY-2 生成） ---
+  String get tasksTitle => _t('Task', '任务');
+  String get tasksAddTitle => _t('New Task', '新增任务');
+  String get tasksEditTitle => _t('Edit task', '编辑任务');
+  String get tasksEmpty => _t('No Task yet', '暂无任务');
+  String get tasksDeleteConfirm => _t('Delete this task?', '删除该任务？');
+  String get taskDetailTitle => _t('Task details', '任务详情');
+  String get taskNotesTitle => _t('Notes & updates', '备注与说明');
+  String get taskNoteHint => _t('Write a note…', '写点什么…');
+  String get taskNoteSend => _t('Send', '发送');
+  String get taskNoteEmpty => _t('No notes yet', '还没有备注，聊两句吧');
+  String get noteAuthorMe => _t('Me', '我');
+  String get noteAuthorUnknown => _t('Family member', '家庭成员');
+  String newNotes(int count) =>
+      _t('$count new note${count == 1 ? '' : 's'}', '$count 条新备注');
+  String get taskUpdated => _t('Updated', '有更新');
+  String get taskDone => _t('Done', '完成了');
+  String get taskMarkUndone => _t('Mark as not done', '标记未完成');
+  String get taskCreatedByParent =>
+      _t('Created by a parent', '家长创建 · 仅家长可改');
+  String get taskUndone => _t('Marked as not done', '已标记为未完成');
+
+  // 任务列表排序
+  String get taskSort => _t('Sort', '排序');
+  String get taskSortDefault => _t('Default', '默认');
+  String get taskSortPriority => _t('Priority', '优先级');
+  String get taskSortStatus => _t('Status', '状态');
+  String get taskSortCreated => _t('Newest', '创建时间');
+  String get taskSortDefaultFull => _t('Default order', '默认顺序');
+  String get taskSortPriorityFull =>
+      _t('Priority · high first', '按优先级 · 高在前');
+  String get taskSortStatusFull =>
+      _t('Status · unfinished first', '按状态 · 未完成在前');
+  String get taskSortCreatedFull =>
+      _t('Created time · newest first', '按创建时间 · 新在前');
+  String get taskAttachment => _t('Attachment', '附件');
+  String get attachPhoto => _t('Take photo', '拍照');
+  String get attachFromAlbum => _t('Choose from album', '从相册选择');
+  String get attachRemove => _t('Remove', '移除');
+  String get attachAdd => _t('Add attachment', '添加附件');
+  String get attachChooseFile => _t('Choose file', '选择文件');
+  String get attachUploading => _t('Uploading…', '上传中…');
+  String get attachmentPreview => _t('Preview', '预览');
+  String get attachmentOpenFailed =>
+      _t('Could not open this attachment', '打不开这个附件');
+  String get noteImagePlaceholder => _t('Image', '图片');
+  String get taskHistoryTitle => _t('Activity history', '操作历史');
+  String get taskHistoryEmpty => _t('No activity yet', '暂无操作记录');
+  String get taskHistorySystem => _t('System', '系统');
+
+  String taskHistoryAction(String action) {
+    if (action == 'insert') return _t('Created', '创建任务');
+    if (action == 'delete') return _t('Deleted', '删除任务');
+    return _t('Updated', '更新任务');
+  }
+
+  // --- 请假申请 · 字段占位符 / field placeholders ---
+  String get leave_requestsFieldRequestNo => _t('requestNo', '申请单号');
+  String get leave_requestsFieldLeaveType => _t('leaveType', '请假类型');
+  String get leave_requestsFieldStartDate => _t('startDate', '开始日期');
+  String get leave_requestsFieldEndDate => _t('endDate', '结束日期');
+  String get leave_requestsFieldDays => _t('days', '请假天数');
+  String get leave_requestsFieldReason => _t('reason', '请假事由');
+  String get leave_requestsFieldStatus => _t('status', '审批状态');
+
+
+  // --- 请假申请（EASY-2 生成） ---
+  String get leave_requestsTitle => _t('LeaveRequest', '请假申请');
+  String get leave_requestsAddTitle => _t('New LeaveRequest', '新增请假申请');
+  String get leave_requestsEmpty => _t('No LeaveRequest yet', '暂无请假申请');
+  String get leave_requestsDeleteConfirm => _t('Delete this leaverequest?', '删除该请假申请？');
+
+  // --- 库存出入库 · 字段占位符 / field placeholders ---
+  String get inventory_movementsFieldDocumentNo => _t('documentNo', '单据号');
+  String get inventory_movementsFieldSku => _t('sku', '商品编码');
+  String get inventory_movementsFieldItemName => _t('itemName', '商品名称');
+  String get inventory_movementsFieldDirection => _t('direction', '出入库方向');
+  String get inventory_movementsFieldQuantity => _t('quantity', '数量');
+  String get inventory_movementsFieldUnit => _t('unit', '单位');
+  String get inventory_movementsFieldPartner => _t('partner', '往来单位');
+  String get inventory_movementsFieldOccurredAt => _t('occurredAt', '业务日期');
+  String get inventory_movementsFieldNote => _t('note', '备注');
+
+
+  // --- 库存出入库（EASY-2 生成） ---
+  String get inventory_movementsTitle => _t('InventoryMovement', '库存出入库');
+  String get inventory_movementsAddTitle => _t('New InventoryMovement', '新增库存出入库');
+  String get inventory_movementsEmpty => _t('No InventoryMovement yet', '暂无库存出入库');
+  String get inventory_movementsDeleteConfirm => _t('Delete this inventorymovement?', '删除该库存出入库？');
+
+  // --- 资产借用 · 字段占位符 / field placeholders ---
+  String get asset_loansFieldAssetName => _t('assetName', '设备名称');
+  String get asset_loansFieldAssetTag => _t('assetTag', '资产编号');
+  String get asset_loansFieldPurpose => _t('purpose', '借用事由');
+  String get asset_loansFieldDueDate => _t('dueDate', '计划归还日');
+  String get asset_loansFieldStatus => _t('status', '状态');
+
+
+  // --- 资产借用（EASY-2 生成） ---
+  String get asset_loansTitle => _t('AssetLoan', '资产借用');
+  String get asset_loansAddTitle => _t('New AssetLoan', '新增资产借用');
+  String get asset_loansEmpty => _t('No AssetLoan yet', '暂无资产借用');
+  String get asset_loansDeleteConfirm => _t('Delete this assetloan?', '删除该资产借用？');
+
+  // --- 积分台账 · 字段占位符 / field placeholders ---
+  String get points_ledgersFieldPoints => _t('points', '积分');
+  String get points_ledgersFieldCheckinDate => _t('checkinDate', '签到日期');
+  String get points_ledgersFieldReason => _t('reason', '流水原因');
+  String get points_ledgersFieldDescription => _t('description', '说明');
+
+
+  // --- 积分台账（EASY-2 生成） ---
+  String get points_ledgersTitle => _t('PointsLedger', '积分台账');
+  String get points_ledgersAddTitle => _t('New PointsLedger', '新增积分台账');
+  String get points_ledgersEmpty => _t('No PointsLedger yet', '暂无积分台账');
+  String get points_ledgersDeleteConfirm => _t('Delete this pointsledger?', '删除该积分台账？');
+
+  // --- 积分流水 · 字段占位符 / field placeholders ---
+  String get point_recordsFieldPoints => _t('points', 'points');
+  String get point_recordsFieldCheckinDate => _t('checkinDate', 'checkinDate');
+  String get point_recordsFieldReason => _t('reason', 'reason');
+  String get point_recordsFieldDescription => _t('description', 'description');
+
+
+  // --- 积分流水（EASY-2 生成） ---
+  String get point_recordsTitle => _t('PointRecord', '积分流水');
+  String get point_recordsAddTitle => _t('New PointRecord', '新增积分流水');
+  String get point_recordsEmpty => _t('No PointRecord yet', '暂无积分流水');
+  String get point_recordsDeleteConfirm => _t('Delete this pointrecord?', '删除该积分流水？');
+
+  // --- 帖子 · 字段占位符 / field placeholders ---
+  String get postsFieldTitle => _t('title', 'title');
+  String get postsFieldContent => _t('content', 'content');
+
+
+  // --- 标签 · 字段占位符 / field placeholders ---
+  String get tagsFieldName => _t('name', 'name');
+
+
+  // --- 供应商 · 字段占位符 / field placeholders ---
+  String get suppliersFieldName => _t('name', 'name');
+  String get suppliersFieldContact => _t('contact', 'contact');
+  String get suppliersFieldStatus => _t('status', 'status');
+  String get suppliersFieldRiskLevel => _t('riskLevel', 'riskLevel');
+  String get suppliersFieldAnnualSpend => _t('annualSpend', 'annualSpend');
+
+
+  // --- 报告 · 字段占位符 / field placeholders ---
+  String get reportsFieldTitle => _t('title', 'title');
+  String get reportsFieldSummary => _t('summary', 'summary');
+  String get reportsFieldStatus => _t('status', 'status');
+  String get reportsFieldAmount => _t('amount', 'amount');
+
+
+  // --- 笔记 · 字段占位符 / field placeholders ---
+  String get notesFieldTitle => _t('title', 'title');
+  String get notesFieldContent => _t('content', 'content');
+  String get notesFieldCategory => _t('category', 'category');
+
+
+  // --- 合同 · 字段占位符 / field placeholders ---
+  String get contractsFieldName => _t('name', 'name');
+  String get contractsFieldCounterparty => _t('counterparty', 'counterparty');
+  String get contractsFieldStatus => _t('status', 'status');
+  String get contractsFieldAmount => _t('amount', 'amount');
+
+
+  // --- 图书 · 字段占位符 / field placeholders ---
+  String get booksFieldTitle => _t('title', 'title');
+  String get booksFieldAuthor => _t('author', 'author');
+  String get booksFieldStatus => _t('status', 'status');
+  String get booksFieldRating => _t('rating', 'rating');
+
+
+  // --- 报告（EASY-2 生成） ---
+  String get reportsTitle => _t('Report', '报告');
+  String get reportsAddTitle => _t('New Report', '新增报告');
+  String get reportsEmpty => _t('No Report yet', '暂无报告');
+  String get reportsDeleteConfirm => _t('Delete this report?', '删除该报告？');
+  // --- 跟进计划（EASY-2 生成） ---
+  String get followup_plansTitle => _t('FollowupPlan', '跟进计划');
+  String get followup_plansAddTitle => _t('New FollowupPlan', '新增跟进计划');
+  String get followup_plansEmpty => _t('No FollowupPlan yet', '暂无跟进计划');
+  String get followup_plansDeleteConfirm => _t('Delete this followupplan?', '删除该跟进计划？');
+
+  // --- 合同（EASY-2 生成） ---
+  String get contractsTitle => _t('Contract', '合同');
+  String get contractsAddTitle => _t('New Contract', '新增合同');
+  String get contractsEmpty => _t('No Contract yet', '暂无合同');
+  String get contractsDeleteConfirm => _t('Delete this contract?', '删除该合同？');
+
+  // --- 供应商（EASY-2 生成） ---
+  String get suppliersTitle => _t('Supplier', '供应商');
+  String get suppliersAddTitle => _t('New Supplier', '新增供应商');
+  String get suppliersEmpty => _t('No Supplier yet', '暂无供应商');
+  String get suppliersDeleteConfirm => _t('Delete this supplier?', '删除该供应商？');
+
+  // --- 审批待办（FLOW-7） ---
+  String get flowTasksTitle => _t('Approval Tasks', '审批待办');
+  String get flowTasksEmpty => _t('No approval tasks', '暂无审批任务');
+  String get flowTaskTitle => _t('Approval Task', '审批任务');
+  String get flowApprove => _t('Approve', '通过');
+  String get flowReject => _t('Reject', '驳回');
+  String get flowNote => _t('Note (optional)', '意见（可选）');
+  String get flowOpFailed => _t('Operation failed', '操作失败');
+
+  // ORG-7 我的组织 / 通讯录
+  String get myOrgTitle => _t('My Organization', '我的组织');
+  String get notInOrg => _t('You are not in any organization yet', '您尚未加入任何组织');
+  String get myOrgDept => _t('Departments', '部门');
+  String get myOrgMembers => _t('Members', '成员');
+  String get noDept => _t('No departments', '暂无部门');
+  String get noMember => _t('No members', '暂无成员');
+  String get roleOwner => _t('Owner', '所有者');
+  String get roleAdmin => _t('Admin', '管理员');
+  String get roleMember => _t('Member', '成员');
+
+  // GROWTH-3 积分 / 签到
+  String get pointsTitle => _t('Points & Check-in', '积分签到');
+  String get pointsBalance => _t('Points', '当前积分');
+  String get pointsStreak => _t('Check-in streak', '连续签到');
+  String get pointsCheckIn => _t('Check in', '签到');
+  String get pointsCheckedInToday => _t('Checked in today', '今日已签到');
+  String get pointsAchievements => _t('Achievements', '我的成就');
+  String get pointsLeaderboard => _t('Leaderboard', '积分排行榜');
+  String get pointsNoPoints => _t('No points yet — check in to start earning', '还没有积分，签到开始赚取吧');
+  String pointsStreakDays(int days) => _t(
+        days == 1 ? '1 day' : '$days days',
+        '已连签 $days 天',
+      );
+  String pointsCheckInGained(int points) => _t('Check-in successful! +$points points', '签到成功！获得 +$points 积分');
+  String get pointsCheckInFailed => _t('Check-in failed', '签到失败');
+  String get pointsLoadFailed => _t('Failed to load points', '积分数据加载失败');
+  String get pointsLeaderboardEmpty => _t('No one on the leaderboard yet', '排行榜暂无数据');
+
+  // --- 标签（EASY-2 生成） ---
+  String get tagsTitle => _t('Tag', '标签');
+  String get tagsAddTitle => _t('New Tag', '新增标签');
+  String get tagsEmpty => _t('No Tag yet', '暂无标签');
+  String get tagsDeleteConfirm => _t('Delete this tag?', '删除该标签？');
+
+  // --- 笔记（EASY-2 生成） ---
+  String get notesTitle => _t('Note', '笔记');
+  String get notesAddTitle => _t('New Note', '新增笔记');
+  String get notesEmpty => _t('No Note yet', '暂无笔记');
+  String get notesDeleteConfirm => _t('Delete this note?', '删除该笔记？');
+
+  // --- 图书（EASY-2 生成） ---
+  String get booksTitle => _t('Book', '图书');
+  String get booksAddTitle => _t('New Book', '新增图书');
+  String get booksEmpty => _t('No Book yet', '暂无图书');
+  String get booksDeleteConfirm => _t('Delete this book?', '删除该图书？');
+  String get author => _t('Author', '作者');
+
+  // --- 帖子（EASY-2 生成） ---
+  String get postsTitle => _t('Post', '帖子');
+  String get postsAddTitle => _t('New Post', '新增帖子');
+  String get postsEmpty => _t('No Post yet', '暂无帖子');
+  String get postsDeleteConfirm => _t('Delete this post?', '删除该帖子？');
+  String get postsCommentHint => _t('Add a comment...', '写评论…');
+  String get postsSendComment => _t('Send', '发送');
+
+  // --- Dashboard ---
+  String welcome(String name) => _t('Welcome, $name', '欢迎回来，$name');
+  String get dashboardDesc => _t('This is your dashboard.', '这是您的仪表盘。');
+  String get quickActions => _t('Quick Actions', '快捷操作');
+  String get createEvent => _t('Create Event', '创建事件');
+  String get uploadFile => _t('Upload File', '上传文件');
+  String get editProfile => _t('Edit Profile', '编辑信息');
+  String get todaySchedule => _t("Today's Schedule", '今日日程');
+  String get noEventsToday => _t('No events today', '今天没有事件');
+
+  // --- UX-10 Dashboard 快速开始卡（空态引导）---
+  String get quickStartTitle => _t('Get Started', '快速开始');
+  String get quickStartSubtitle => _t('A few things to try:', '几个可以马上试的：');
+  String get quickStartCreateFirst => _t('Create your first event', '创建第一个事件');
+  String get quickStartTryAi => _t('Try an AI conversation', '试一次 AI 对话');
+  String get quickStartImportTemplate => _t('One-click import sample data', '一键导入示例数据');
+  String get templateImported => _t('Sample data imported!', '示例数据已导入！');
+  String get templateImportFailed => _t('Import failed', '导入失败');
+  // UX-5 数据洞察
+  String get insightsTitle => _t('My Insights', '数据洞察');
+  String get insightsError => _t('Failed to load insights', '数据洞察加载失败');
+  String get insightsEmpty => _t('Create events to see your insights', '创建事件后可查看你的数据洞察');
+  String get insightsTotal => _t('Total', '全部');
+  String get insightsActive => _t('Active', '进行中');
+  String get insightsCancelled => _t('Cancelled', '已取消');
+  String get insightsRecent => _t('Recent', '近30天');
+  String get eventsByMonth => _t('Events by month', '每月事件分布');
+  // UX-6 公告
+  String get announcementDismiss => _t('Got it', '知道了');
+  // PL-10 动态表单
+  String get formLoading => _t('Form', '表单');
+  String get formSubmit => _t('Submit', '提交');
+  String get formSubmitting => _t('Submitting…', '提交中…');
+  String get formSubmitted => _t('Submitted', '提交成功');
+  String get formCheckFields => _t('Please check the form', '请检查表单填写');
+  String get formPleaseSelect => _t('Please select', '请选择');
+  String formFieldRequired(String label) => _t('"$label" is required', '「$label」为必填');
+  // G-1 应用内反馈
+  String get feedbackTitle => _t('Feedback', '意见反馈');
+  String get feedbackTypeLabel => _t('Type', '反馈类型');
+  String get feedbackTypeSuggestion => _t('Suggestion', '建议');
+  String get feedbackTypeBug => _t('Bug', '问题');
+  String get feedbackTypePraise => _t('Praise', '好评');
+  String get feedbackContentHint => _t('Describe your feedback...', '请描述你的建议或遇到的问题…');
+  String get feedbackContactHint => _t('Contact (optional)', '联系方式（选填）');
+  String get feedbackContentRequired => _t('Please enter feedback content', '请填写反馈内容');
+  String get feedbackSubmit => _t('Submit', '提交');
+  String get feedbackSubmitted => _t('Feedback submitted, thanks!', '反馈已提交，感谢你的支持！');
+  String get feedbackSubmitFailed => _t('Submit failed, please retry', '提交失败，请重试');
+  // UX-8 Onboarding
+  String get onboardingSkip => _t('Skip', '跳过');
+  String get onboardingNext => _t('Next', '下一步');
+  String get onboardingStart => _t('Get Started', '开始使用');
+  String get onboardingWelcomeTitle => _t('Welcome to Little Plan', '欢迎来到小计划');
+  String get onboardingWelcomeDesc => _t('Plan the day together — small goals, done together.', '和孩子一起安排每一天的小目标。');
+  String get onboardingEventsTitle => _t('Parents & Children', '家长与孩子');
+  String get onboardingEventsDesc => _t('Parents create and approve tasks; children finish them with a PIN.', '家长创建、审批任务；孩子用 PIN 登录完成。');
+  String get onboardingAiTitle => _t('Points & Rewards', '积分与奖励');
+  String get onboardingAiDesc => _t('Earn points for every finished task and redeem family rewards.', '完成任务得积分，兑换家庭奖励。');
+  // UX-2 Dev Menu
+  String get devMenuTitle => _t('Developer Menu', '开发调试');
+  String get devCurrentEnv => _t('Current', '当前环境');
+  String get devEnvironment => _t('Environment', '环境');
+  String get devEnvSwitched => _t('Environment switched', '已切换环境');
+  String get devEnvRestart => _t('Restart the app to apply.', '请重启应用使配置生效。');
+  String get devClearData => _t('Clear All Data', '清除所有数据');
+  String get devDataCleared => _t('All local data cleared', '本地数据已清除');
+  String get mondayShort => _t('Mon', '一');
+  String get tuesdayShort => _t('Tue', '二');
+  String get wednesdayShort => _t('Wed', '三');
+  String get thursdayShort => _t('Thu', '四');
+  String get fridayShort => _t('Fri', '五');
+  String get saturdayShort => _t('Sat', '六');
+  String get sundayShort => _t('Sun', '日');
+
+  // --- Profile ---
+  String get personalInfo => _t('Personal Info', '个人信息');
+  String get settings => _t('Settings', '设置');
+  String memberSince(String date) => _t('Member since $date', '注册于 $date');
+  String get sectionAccount => _t('Account', '账户');
+  String get sectionGrowth => _t('Growth', '成长');
+  String get sectionLegal => _t('Legal', '法律');
+
+  // --- Settings ---
+  String get themeMode => _t('Theme', '主题');
+  String get lightMode => _t('Light', '浅色');
+  String get darkMode => _t('Dark', '深色');
+  String get systemMode => _t('System', '跟随系统');
+  String get language => _t('Language', '语言');
+  String get version => _t('Version', '版本');
+  String get about => _t('About', '关于');
+  String get provenanceTitle => _t('Runtime provenance', '运行时来源指纹');
+  /// FE-1：来源指纹摘要（来源身份 · 预设 · N 模块 · N 工具）
+  String Function(String identity, String preset, int modules, int tools) get provenanceMeta =>
+      (identity, preset, modules, tools) => _t(
+            '$identity · preset $preset · $modules modules · $tools tools',
+            '$identity · 预设 $preset · $modules 模块 · $tools 工具',
+          );
+  String get sectionAppearance => _t('APPEARANCE', '外观');
+  String get sectionRegion => _t('REGION', '地区');
+  String get sectionAbout => _t('ABOUT', '关于');
+  String get updateAvailable => _t('Update Available', '发现新版本');
+  String get forceUpdateTitle => _t('New Version Required', '请升级到新版本');
+  String get forceUpdateMessage => _t('The current version is too old to continue. Please update to continue using the app.', '当前版本过低，无法继续使用。请更新到最新版本后继续。');
+  String get newVersionAvailable => _t('A new version is available. Check what is new:', '发现新版本，看看有什么新功能：');
+  String get updateNow => _t('Update Now', '立即更新');
+  String get later => _t('Later', '稍后');
+  String get upToDate => _t('You are up to date', '已是最新版本');
+
+  // --- Sessions ---
+  String get sessionManagement => _t('Login Devices', '登录设备');
+
+  // --- UX-4 应用锁 ---
+  String get appLock => _t('App Lock', '应用锁');
+  String get appLockSubtitle => _t('Verify with FaceID / fingerprint on app start', '启动时用 FaceID / 指纹验证');
+  String get appLockUnsupported => _t('This device does not support biometrics', '此设备不支持生物识别');
+  String get appLockDisabled => _t('App lock disabled', '应用锁已关闭');
+  String get sessionEntry => _t('Manage login devices', '登录设备管理');
+  String get currentDevice => _t('This device', '当前设备');
+  String get noSessions => _t('No active sessions', '暂无登录设备');
+  String get revoke => _t('Revoke', '远程登出');
+  String get revokeSessionConfirmTitle => _t('Revoke session?', '远程登出该设备？');
+  String get revokeSessionConfirmBody => _t('This device will be signed out immediately.', '该设备将被立即登出。');
+  String get revokeSuccess => _t('Session revoked', '已远程登出');
+
+  // --- Events ---
+  String get eventTitle => _t('Title', '标题');
+  String get eventDescription => _t('Description', '描述');
+  String get startTime => _t('Start Time', '开始时间');
+  String get endTime => _t('End Time', '结束时间');
+  String get location => _t('Location', '地点');
+  String get noEvents => _t('No events found', '暂无事件');
+  String get eventCreated => _t('Event created', '事件创建成功');
+  String get eventUpdated => _t('Event updated', '事件更新成功');
+  String get eventDeleted => _t('Event deleted', '事件删除成功');
+  String get deleteConfirm => _t('Are you sure to delete this event?', '确定要删除此事件吗？');
+  String get selectDate => _t('Select date', '选择日期');
+  String get newEvent => _t('New Event', '新建事件');
+  String get editEvent => _t('Edit Event', '编辑事件');
+  String get titleRequired => _t('Title is required', '请输入标题');
+  String get titleHint => _t('Up to 200 characters', '最多200字');
+  String get color => _t('Color', '颜色');
+  String get apply => _t('Apply', '应用');
+  String get noTitle => _t('(No Title)', '无标题');
+  String get recurringEvent => _t('Recurring Event', '重复事件');
+  String get reminder => _t('Reminder', '提醒');
+  String get reminderNone => _t('None', '不提醒');
+  String get reminder5m => _t('5 minutes before', '提前 5 分钟');
+  String get reminder30m => _t('30 minutes before', '提前 30 分钟');
+  String get reminder1h => _t('1 hour before', '提前 1 小时');
+  String get reminder1d => _t('1 day before', '提前 1 天');
+
+  // --- Explore ---
+  String get exploreTitle => _t('Explore', '发现');
+  String get exploreDesc => _t('Quick access to all features.', '快速访问所有功能。');
+
+  // --- Upload ---
+  String get uploadTitle => _t('Upload File', '上传文件');
+  String get selectFile => _t('Select File', '选择文件');
+  String get uploading => _t('Uploading...', '上传中...');
+  String get uploadSuccess => _t('Upload successful', '上传成功');
+  String get uploadFailed => _t('Upload failed', '上传失败');
+  String get fileSizeLimit => _t('File too large (max 10MB)', '文件过大（最大10MB）');
+  String get uploadFileLabel => _t('File', '文件');
+  String get uploadSizeLabel => _t('Size', '大小');
+  String get uploadTypeLabel => _t('Type', '类型');
+
+  // --- More Menu ---
+  String get moreActions => _t('Quick Actions', '快捷操作');
+  String get moreAccount => _t('Account', '账户');
+  String get moreLegal => _t('Legal', '法律');
+  String get privacyPolicy => _t('Privacy Policy', '隐私政策');
+  String get termsOfService => _t('Terms of Service', '服务条款');
+  String get appInfo => _t('About', '关于');
+  String get moreUploadFile => _t('Upload File', '上传文件');
+
+  // --- Profile fields ---
+  String get email => _t('Email', '邮箱');
+  String get emailHint => _t('your@email.com', 'your@email.com');
+  String get emailRequired => _t('Email is required', '请输入邮箱');
+  String get invalidEmail => _t('Invalid email address', '邮箱格式不正确');
+  String get registerSubtitle => _t('Create your account', '创建你的账号');
+  String get firstName => _t('First Name', '名');
+  String get lastName => _t('Last Name', '姓');
+  String get firstNameHint => _t('Given name', '名');
+  String get lastNameHint => _t('Family name', '姓');
+  String get phone => _t('Phone', '手机号');
+  String get phoneHint => _t('+86 138 0013 8000', '+86 138 0013 8000');
+  String get dateOfBirth => _t('Date of Birth', '生日');
+  String get bio => _t('Bio', '个人简介');
+  String get bioHint => _t('Tell us about yourself', '介绍一下你自己');
+  String get saveProfile => _t('Save Profile', '保存资料');
+
+  // --- Rate limit ---
+  String retryIn(int seconds) => _t(
+        seconds == 1 ? 'Retry in 1 second' : 'Retry in $seconds seconds',
+        '$seconds秒后重试',
+      );
+
+  // --- Password recovery ---
+  String get forgotPassword => _t('Forgot password?', '忘记密码？');
+  String get resetPassword => _t('Reset Password', '重置密码');
+  String get sendResetLink => _t('Send Reset Link', '发送重置链接');
+  String get checkEmail => _t('Check your email', '请查看您的邮箱');
+  String get resetEmailSent => _t('If that email is registered, a reset link has been sent.', '如果该邮箱已注册，重置链接已发送。');
+  String get backToLogin => _t('Back to login', '返回登录');
+  String get newPassword => _t('New Password', '新密码');
+  String get confirmPassword => _t('Confirm Password', '确认密码');
+  String get passwordMismatch => _t('Passwords do not match', '两次输入的密码不一致');
+  String get resetPasswordHint => _t('At least 8 characters, letters and numbers', '至少 8 位，包含字母和数字');
+  String get resetSuccess => _t('Password reset. Please login.', '密码已重置，请登录。');
+
+  // --- Email verification ---
+  String get verifyEmail => _t('Verify Email', '验证邮箱');
+  String get verificationCode => _t('Verification Code', '验证码');
+  String get verificationCodeHint => _t('Enter 6-digit code', '输入 6 位验证码');
+  String get resendCode => _t('Resend code', '重新发送');
+  String get codeSent => _t('A verification code has been sent to your email.', '验证码已发送到您的邮箱。');
+  String get emailVerifiedSuccess => _t('Email verified successfully', '邮箱验证成功');
+  String get emailUnverified => _t('Email not verified', '邮箱未验证');
+  String get verifyNow => _t('Verify now', '去验证');
+
+  // --- Global search ---
+  String get globalSearchHint => _t('Search events, people...', '搜索事件、用户…');
+  String get searchEventsTab => _t('Events', '事件');
+  String get searchUsersTab => _t('Users', '用户');
+  String get searchConversationsTab => _t('Chats', '对话');
+  String get noSearchResults => _t('No results found', '未找到结果');
+  String get searchHistoryTitle => _t('Recent', '最近搜索');
+  String get searchHotTitle => _t('Hot', '热门搜索');
+  String get clearSearchHistory => _t('Clear', '清空');
+
+  // --- Errors ---
+  String get unknownError => _t('Something went wrong', '出了点问题');
+  String get networkError => _t('Network error, please check connection', '网络错误，请检查连接');
+  String get sessionExpired => _t('Session expired, please login again', '会话已过期，请重新登录');
+  String get emptyData => _t('No data', '暂无数据');
+
+  // --- AI ---
+  String get tabAi => _t('AI', 'AI');
+  String get aiTitle => _t('AI Assistant', 'AI 助手');
+  String get aiNotConfiguredTitle => _t('AI not configured', 'AI 尚未配置');
+  String get aiNotConfiguredBody => _t(
+        'Add an API key (AI_PROVIDER + matching key) or local Ollama, then restart the backend. Diagnose: keelbase doctor --env',
+        '配置 API Key（AI_PROVIDER + 对应 Key）或本地 Ollama 后重启后端即可用。环境排查：keelbase doctor --env',
+      );
+  String get aiInputHint => _t('Type a message...', '输入消息...');
+  String get aiThinking => _t('Thinking...', '思考中…');
+  String get aiSearching => _t('Searching data...', '正在查询数据…');
+  String get aiError => _t('Sorry, an error occurred. Please try again.', '抱歉，出错了，请重试。');
+  String Function(String) get aiErrorWithDetail => (String msg) => _t('Sorry, an error occurred: \$msg', '抱歉，出错了：\$msg');
+  String get aiConfirmFailed => _t('Confirmation request failed, please retry.', '确认请求失败，请重试');
+  /// 流式不可用、本轮改走非流式时的提示（不静默降级）。
+  String get aiStreamFallbackNotice => _t(
+        'Streaming is unavailable right now, so this reply was delivered in standard mode.',
+        '流式通道当前不可用，本次回复已改用普通模式。',
+      );
+  String get aiRegenerate => _t('Regenerate', '重新生成');
+  String get aiClearConversation => _t('Clear conversation', '清空对话');
+  String get aiModelSelect => _t('Switch model', '切换模型');
+  String get aiModelPickerTitle => _t('Select model', '选择模型');
+
+  /// 对话没有首条用户消息时的标题兜底。
+  String get newConversation => _t('New conversation', '新对话');
+
+  /// AI 提供商的**显示名**（按 id）。id 本身就是英文名的地方（deepseek）照原样，中文品牌名
+  /// （qwen = 通义千问）才需要译。未知 id 原样返回，免得凭空造名。
+  ///
+  /// Display name for an AI provider id; unknown ids pass through rather than getting an invented
+  /// name.
+  String aiProviderName(String id) => switch (id) {
+        'qwen' => _t('Qwen', '通义千问'),
+        'deepseek' => 'DeepSeek',
+        _ => id,
+      };
+  String get aiWelcomeTitle => _t('Hello! How can I help you?', '你好！有什么可以帮助你的？');
+  String get aiSuggested1 => _t("What events do I have this month?", "本月有哪些事件？");
+  String get aiSuggested2 => _t("Analyze my event trends", "分析我的事件趋势");
+  String get aiSuggested3 => _t("Give me a summary of my data", "给我一份数据概览");
+
+  // --- UX-11 AI 示例 chips（agent 能力发现：真实触发句）---
+  String get aiExampleChipsTitle => _t('Try:', '试试：');
+  String get aiExampleWeekPlan => _t('Plan my week', '帮我安排本周');
+  String get aiExampleCreateMeeting => _t('Create a meeting at 3pm tomorrow', '创建明天下午 3 点的会议');
+  String get aiExampleTrend => _t('Analyze my event trends', '分析我的事件趋势');
+  String get aiConfirmTitle => _t('Confirmation required', '确认操作');
+  String get aiConfirmBody => _t('The AI would like to perform the following action:', 'AI 想要执行以下操作，请确认：');
+  String get aiConfirmApprove => _t('Confirm', '确认');
+  String get aiConfirmReject => _t('Decline', '拒绝');
+  String get aiConfirming => _t('Processing...', '处理中…');
+  String get aiWaitingConfirm => _t('Awaiting your confirmation...', '等待确认…');
+  String get aiConfirmTrustTool => _t('Trust this tool for this round (skip confirmation)', '本轮信任此工具（不再询问）');
+  // KB-5 run-level approval：一次授权整批（run 卡）
+  String Function(int) get aiConfirmRunCount => (int n) => _t('Approve $n operations in this batch', '一次批准本批 $n 个操作');
+  String get aiConfirmRunWillExecute => _t('The AI will execute all of the following:', 'AI 将一次执行以下全部操作：');
+  // spec §2.2/§2.5：run 卡须显示批级最高风险（runRisk），用户据此做整批授权决定
+  String Function(String) get aiConfirmRunRisk => (String level) => _t('Batch risk: $level', '本批最高风险：$level');
+  /// §22.17 ④ 影响预览：写动作数；对象类型按机器标识追加，不翻译（与撤销/审计口径一致）
+  String Function(int) get aiConfirmImpact => (int n) => _t('Estimated impact: $n write action(s)', '预计影响：$n 个写动作');
+  String get aiConfirmArgsTitle => _t('Details', '操作详情');
+  // W5-⑦ Explainable Authz：确认卡展示「为何需确认」（风险级/策略/检查清单）
+  String get aiAuthzTitle => _t('Authorization', '授权依据');
+  String get aiAuthzRiskLevel => _t('Risk level', '风险等级');
+  String get aiAuthzChecksTitle => _t('Why this needs confirmation', '为何需要确认');
+  String get aiAuthzConfirmRequired => _t('Confirmation required', '需人工确认');
+  String get aiAuthzAllowed => _t('Allowed', '允许');
+  String get aiToolRunning => _t('Working...', '正在执行…');
+  String get aiToolSuccess => _t('Done', '已完成');
+  String get aiToolFailed => _t('Failed', '执行失败');
+  // ADT（P0-14）：工具读/写与确认态标注
+  String get aiToolRead => _t('Read', '读');
+  String get aiToolWrite => _t('Write', '写');
+  String get aiToolReadOnly => _t('Read-only', '只读');
+  String get aiToolWriteNeedsConfirm => _t('Needs your confirm', '需你确认');
+  String get aiToolConfirmedRevocable => _t('Confirmed · revocable', '已确认 · 可撤销');
+  String get aiHistory => _t('Chat history', '历史对话');
+  String get conversationHistory => _t('Chat history', '对话历史');
+  String get noConversationHistory => _t('No chat history yet', '暂无历史对话');
+  String get aiLoadFailed => _t('Failed to load conversation', '加载对话失败');
+  String get deleteFailed => _t('Delete failed, please try again', '删除失败，请重试');
+  String Function(String) get deleteConversationConfirm => (String title) => _t('Delete "$title"?', '确定删除「$title」？');
+  // P0-14 Agent Decision Trace：用户可见的 AI 执行轨迹
+  String get aiTrace => _t('Execution trace', '执行轨迹');
+  String get aiTraceLoading => _t('Loading execution trace…', '加载执行轨迹…');
+  String get aiTraceEmpty => _t('No execution trace for this conversation', '该对话暂无执行轨迹');
+  String get traceStepInput => _t('Your input', '你的提问');
+  String get traceStepAssistant => _t('AI reply', 'AI 回复');
+  String get traceStepToolCall => _t('Tool call', '工具调用');
+  String get traceStepConfirmation => _t('Confirmation', '确认决策');
+  String get traceStepEffect => _t('Created record', '创建记录');
+  String get traceStepNotice => _t('AI action', 'AI 处理');
+  String get traceSuccess => _t('Success', '成功');
+  String get traceFailed => _t('Failed', '失败');
+  String get traceApproved => _t('Approved', '已批准');
+  String get traceDeclined => _t('Declined', '已拒绝');
+  String get traceTimedOut => _t('Timed out', '已超时');
+  String get tracePendingApproval => _t('Pending approval', '转人工审批');
+  String get traceTrusted => _t('Trusted this round', '本轮免确认');
+  String get traceRevoke => _t('Revoke', '撤销');
+  String get traceRevoked => _t('Revoked, restorable from trash', '已撤销，可经回收站恢复');
+  String get traceRevokeFailed => _t('Revoke failed', '撤销失败');
+  String get aiConfirmArgTitle => _t('Title', '标题');
+  String get aiConfirmArgStart => _t('Start', '开始');
+  String get aiConfirmArgEnd => _t('End', '结束');
+  String get aiConfirmArgDueDate => _t('Due', '截止');
+  String get aiConfirmArgLocation => _t('Location', '地点');
+  String get aiConfirmArgDescription => _t('Description', '描述');
+  String get aiConfirmArgReminder => _t('Reminder', '提醒');
+
+  // --- Profile (more menu) ---
+  String get profileEntry => _t('Profile', '个人资料');
+
+  // --- Calendar ---
+  String get calendarDay => _t('Day', '日');
+  String get calendarWeek => _t('Week', '周');
+  String get calendarMonth => _t('Month', '月');
+  String get noEventsForDate => _t('No events on this date', '此日期暂无事件');
+  String get searchEvents => _t('Search', '搜索');
+  String get searchHint => _t('Title or description...', '标题或描述...');
+  String get allEvents => _t('All', '全部');
+  String get loadMore => _t('Load more', '加载更多');
+  String get noMoreEvents => _t('All events loaded', '已加载全部事件');
+  String eventsCount(int n) => _t(
+        n == 1 ? '1 event' : '$n events',
+        '$n 个事件',
+      );
+  String get searchResults => _t('Search Results', '搜索结果');
+  String get today => _t('Today', '今天');
+
+  // --- 相对时间（会话列表） ---
+  String get justNow => _t('Just now', '刚刚');
+  String minutesAgo(int n) => _t(n == 1 ? '1 minute ago' : '$n minutes ago', '$n 分钟前');
+  String hoursAgo(int n) => _t(n == 1 ? '1 hour ago' : '$n hours ago', '$n 小时前');
+
+  // --- AI 工具标签（`ai.tool.*`：与服务端 tool-metadata.ts 同规则派生）---
+
+  /// Tool name → the label a person reads. The key is **derived the same way the backend derives it**
+  /// (`ai.tool.<camelCase(toolName)>`, see `Server-NestJS/src/ai/audit/tool-metadata.ts`), so both
+  /// ends speak about the same keys and `scripts/check-tool-label-parity.mjs` can hold the backend's
+  /// metadata table against this map (as it already does for the console's two dictionaries).
+  ///
+  /// Each value is `[en, zh]` — the same order as `_t(en, zh)` above. It is a map rather than 44
+  /// getters because the tool name only arrives at runtime, so the lookup is by key.
+  ///
+  /// 工具名 → 人读的标签。key 与后端**同规则派生**（`ai.tool.<camelCase(工具名)>`，见
+  /// `Server-NestJS/src/ai/audit/tool-metadata.ts`），于是两端说的是同一批 key，
+  /// `scripts/check-tool-label-parity.mjs` 就能拿服务端元数据表来对本表（它已经这样对管理台那两份字典）。
+  ///
+  /// 每条的值是 `[en, zh]`，顺序与上面的 `_t(en, zh)` 一致。这里用 map 而不是 44 个 getter，
+  /// 因为工具名到运行时才拿到，只能按 key 查。
+  static const Map<String, List<String>> _toolLabels = <String, List<String>>{
+    'ai.tool.analyzeCustomerRisk': ['Analyze customer risk', '客户风险分析'],
+    'ai.tool.analyzeProjectRisk': ['Analyze project risk', '项目延期风险分析'],
+    'ai.tool.analyzeSalesPipeline': ['Analyze sales pipeline', '销售管道分析'],
+    'ai.tool.countEventsByStatus': ['Count events by status', '事件状态统计'],
+    'ai.tool.createContract': ['Create contract', '创建合同'],
+    'ai.tool.createEvent': ['Create event', '创建事件'],
+    'ai.tool.createFollowupPlan': ['Create follow-up plan', '创建跟进计划'],
+    'ai.tool.createFollowupTask': ['Create follow-up task', '创建跟进任务'],
+    'ai.tool.createModule': ['Create module', '创建模块'],
+    'ai.tool.createModuleApply': ['Apply generated module', '生成业务模块'],
+    'ai.tool.createProjectTask': ['Create project task', '创建项目任务'],
+    'ai.tool.createProjectWithTasks': ['Create project with tasks', '创建项目并拆解任务'],
+    'ai.tool.createReport': ['Create report', '创建报告'],
+    'ai.tool.createTodo': ['Create todo', '创建待办'],
+    'ai.tool.deleteCustomer': ['Delete customer', '删除客户'],
+    'ai.tool.detectIdleCustomers': ['Detect idle customers', '未跟进客户检测'],
+    'ai.tool.generateImage': ['Generate image', '生成图片'],
+    'ai.tool.getUserStats': ['Query user stats', '查询用户统计'],
+    'ai.tool.navigateAdminPage': ['Navigate admin page', '管理页导航'],
+    'ai.tool.navigatePage': ['Navigate page', '页面导航'],
+    'ai.tool.queryApprovalPolicies': ['Query approval policies', '查询审批政策'],
+    'ai.tool.queryApprovalRequests': ['Query approval requests', '查询审批请求'],
+    'ai.tool.queryContracts': ['Query contracts', '查询合同'],
+    'ai.tool.queryBooks': ['Query books', '查询图书'],
+    'ai.tool.createBook': ['Create book', '创建图书'],
+    'ai.tool.queryNotes': ['Query notes', '查询笔记'],
+    'ai.tool.createNote': ['Create note', '创建笔记'],
+    'ai.tool.queryPosts': ['Query posts', '查询帖子'],
+    'ai.tool.createPost': ['Create post', '创建帖子'],
+    'ai.tool.querySuppliers': ['Query suppliers', '查询供应商'],
+    'ai.tool.createSupplier': ['Create supplier', '创建供应商'],
+    'ai.tool.queryTags': ['Query tags', '查询标签'],
+    'ai.tool.createTag': ['Create tag', '创建标签'],
+    'ai.tool.queryCustomerActivities': ['Query customer activities', '查询客户跟进'],
+    'ai.tool.queryCustomerContacts': ['Query contacts', '查询联系人'],
+    'ai.tool.queryCustomerOpportunities': ['Query opportunities', '查询销售机会'],
+    'ai.tool.queryCustomerOrders': ['Query customer orders', '查询客户订单'],
+    'ai.tool.queryCustomers': ['Query customers', '查询客户'],
+    'ai.tool.queryEvents': ['Query events', '查询事件'],
+    'ai.tool.queryEventsByKeyword': ['Search events', '搜索事件'],
+    'ai.tool.queryFollowupPlans': ['Query follow-up plans', '查询跟进计划'],
+    'ai.tool.queryOrgAvailability': ['Check availability', '查询可用性'],
+    'ai.tool.queryOrgMembers': ['Query org members', '查询组织成员'],
+    'ai.tool.queryOrgTasks': ['Query org tasks', '查询组织任务'],
+    'ai.tool.queryProjectTasks': ['Query project tasks', '查询项目任务'],
+    'ai.tool.queryProjects': ['Query projects', '查询项目'],
+    'ai.tool.queryReports': ['Query reports', '查询报告'],
+    'ai.tool.reviewApprovalRequest': ['Review approval request', '审批复核'],
+    'ai.tool.submitApprovalRequest': ['Submit approval request', '提交审批'],
+    'ai.tool.summarizeCustomer_360': ['Summarize customer', '客户摘要'],
+    'ai.tool.updateCustomerStatus': ['Update customer status', '更新客户状态'],
+    'ai.tool.webSearch': ['Web search', '联网搜索'],
+    // Generated-module tools: registered and visible through `/ai/tools`, but until 2026-10-16 they
+    // had no metadata and no entry here, so a tool card for one showed a bare name.
+    // 生成模块的工具：注册了、在 `/ai/tools` 里看得见；2026-10-16 之前既无元数据、也无本表条目，
+    // 于是工具卡上只显示裸名字。
+    'ai.tool.queryAssetLoans': ['Query asset loans', '查询资产借用'],
+    'ai.tool.createAssetLoan': ['Create asset loan', '创建资产借用'],
+    'ai.tool.queryInventoryMovements': ['Query inventory movements', '查询库存出入库'],
+    'ai.tool.createInventoryMovement': ['Create inventory movement', '登记库存出入库'],
+    'ai.tool.queryLeaveRequests': ['Query leave requests', '查询请假申请'],
+    'ai.tool.createLeaveRequest': ['Create leave request', '提交请假申请'],
+    'ai.tool.queryPointRecords': ['Query point records', '查询积分记录'],
+    'ai.tool.createPointRecord': ['Create point record', '创建积分记录'],
+    'ai.tool.queryPointsLedgers': ['Query points ledgers', '查询积分台账'],
+    'ai.tool.createPointsLedger': ['Create points ledger', '创建积分台账'],
+    // B-path (external systems) tools: the names belong to the other side and are not in the backend
+    // metadata table; the parity gate is one-way, so extra dictionary entries are allowed.
+    // B 路径（外部系统）工具：名字由对方定义、不在服务端元数据表里；对账闸是单向的，允许多出条目。
+    'ai.tool.listCustomers': ['Query external customers', '查询外部客户'],
+    'ai.tool.getCustomer': ['View external customer', '查看外部客户'],
+    'ai.tool.listCustomerOrders': ['Query external customer orders', '查询外部客户订单'],
+    'ai.tool.updateOrderAmount': ['Update order amount', '更新订单金额'],
+  };
+
+  /// `create_followup_task` → `ai.tool.createFollowupTask`（与后端 `toolLabelKey` 同一规则）。
+  static String toolLabelKey(String toolName) =>
+      'ai.tool.${toolName.replaceAllMapped(RegExp(r'_([a-z])'), (m) => m[1]!.toUpperCase())}';
+
+  /// Shown when a tool call carries no usable name. 工具调用没有可用名字时的占位。
+  String get aiAction => _t('AI action', 'AI 操作');
+
+  /// Label for a tool name; an unknown name falls back to the raw name so anything can be shown.
+  /// 按工具名取标签；未命中回退原始工具名，保证任何工具都可展示。
+  String aiToolLabel(String? toolName) {
+    if (toolName == null || toolName.isEmpty) return aiAction;
+    final pair = _toolLabels[toolLabelKey(toolName)];
+    if (pair == null) return toolName;
+    return isZh ? pair[1] : pair[0];
+  }
+
+  // --- AI 工具调用的参数摘要（原 `ai_tool_label.dart` 里的中文片段）---
+  String Function(String) get aiArgsKeyword => (String v) => _t('keyword "$v"', '关键词「$v」');
+  String Function(String) get aiArgsRisk => (String v) => _t('risk: $v', '风险：$v');
+  String Function(String) get aiArgsStatus => (String v) => _t('status: $v', '状态：$v');
+  String Function(String) get aiArgsQuoted => (String v) => _t('"$v"', '「$v」');
+
+  /// 参数摘要的外层括号与分隔（中英标点不同，故一并放这里）。
+  String Function(List<String>) get aiArgsJoined =>
+      (List<String> parts) => _t(' (${parts.join(' · ')})', '（${parts.join(' · ')}）');
+}
+
+/// LocalizationsDelegate 实现，将 AppLocalizations 接入 Flutter 管线。
+class _AppLocalizationsDelegate
+    extends LocalizationsDelegate<AppLocalizations> {
+  const _AppLocalizationsDelegate();
+
+
+  @override
+  bool isSupported(Locale locale) =>
+      locale.languageCode == 'en' ||
+      (locale.languageCode == 'zh' &&
+          (locale.countryCode == null ||
+              locale.countryCode == 'CN' ||
+              locale.scriptCode == 'Hans'));
+
+  @override
+  Future<AppLocalizations> load(Locale locale) =>
+      SynchronousFuture<AppLocalizations>(AppLocalizations(locale));
+
+  @override
+  bool shouldReload(_AppLocalizationsDelegate old) => false;
+}
+
+/// 扩展方法：context.l10n 便捷访问。
+extension AppLocalizationsContext on BuildContext {
+  AppLocalizations get l10n => AppLocalizations.of(this);
+}

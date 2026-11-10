@@ -1,0 +1,70 @@
+// SPDX-License-Identifier: Apache-2.0
+
+import {
+  Entity,
+  PrimaryGeneratedColumn,
+  Column,
+  Index,
+  CreateDateColumn,
+  UpdateDateColumn,
+  DeleteDateColumn,
+} from 'typeorm';
+
+/** 项目状态 */
+export const PROJECT_STATUSES = ['planned', 'active', 'on_hold', 'completed'] as const;
+export type ProjectStatus = (typeof PROJECT_STATUSES)[number];
+
+// Default for new rows, typed by the table above: removing that value stops compiling.
+// 新建行的默认值，由上面的词表定型 —— 从表里删掉该值就编译不过。
+const DEFAULT_STATUS: ProjectStatus = 'planned';
+
+/**
+ * AI Project Management 旗舰应用：项目主实体。
+ * owner 归属（userId）+ 软删除（RG-3），AI 工具按 userId 限定数据范围。
+ */
+@Entity('pm_projects')
+@Index(['userId'])
+@Index(['status'])
+@Index('IDX_scope_pm_projects_org_dept', ['orgId', 'deptId'])
+export class PmProject {
+  @PrimaryGeneratedColumn()
+  id!: number;
+
+  @Column({ length: 200 })
+  name!: string;
+
+  @Column({ type: 'text', nullable: true })
+  description?: string | null;
+
+  @Column({ length: 16, default: DEFAULT_STATUS })
+  status!: string;
+
+  @Column({ length: 16, default: 'low' })
+  riskLevel!: string;
+
+  @Column({ type: Date, nullable: true })
+  startDate?: Date | null;
+
+  @Column({ type: Date, nullable: true })
+  endDate?: Date | null;
+
+  @Column({ nullable: true, name: 'user_id' })
+  userId?: number;
+
+  /** 权限-2 数据范围：所属组织/部门（null = 仅 owner 可见；写入时盖章） */
+  @Column({ type: 'int', nullable: true, name: 'org_id' })
+  orgId?: number | null;
+
+  @Column({ type: 'int', nullable: true, name: 'dept_id' })
+  deptId?: number | null;
+
+  @CreateDateColumn()
+  createdAt!: Date;
+
+  @UpdateDateColumn()
+  updatedAt!: Date;
+
+  /** RG-3 软删除 */
+  @DeleteDateColumn({ type: Date, name: 'deleted_at' })
+  deletedAt?: Date | null;
+}

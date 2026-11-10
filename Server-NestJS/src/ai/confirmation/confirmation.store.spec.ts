@@ -1,0 +1,468 @@
+// SPDX-License-Identifier: Apache-2.0
+
+import {
+  ConfirmationStore,
+  CONFIRMATION_STATUS,
+  CONFIRMATION_OUTCOME,
+  CONFIRMATION_DEFAULT_TTL_MS,
+  CONFIRMATION_DEFAULT_OFFLINE_TTL_MS,
+  offlineWindowCutoff,
+  isWithinOfflineWindow,
+} from './confirmation.store';
+import { CONFIRMATION_RENDER_VERSION } from './confirmation-render';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+
+/**
+ * A tiny in-memory repository whose `update` **evaluates the criteria** (equalities + the two
+ * TypeORM range operators the store uses) instead of returning a canned `affected`. CONF-7 is a
+ * condition on the write itself, so a mock that ignores criteria cannot tell the fixed code from
+ * the broken one.
+ * 一个会**真正求值条件**的内存仓库（等值 + store 用到的两个区间操作符），而不是返回写死的
+ * `affected`。CONF-7 的条件就在这次写里，忽略条件的假仓库分不出修好与没修。
+ */
+function inMemoryRepo(rows: Array<Record<string, any>>) {
+  const matches = (row: Record<string, any>, criteria: Record<string, any>): boolean =>
+    Object.entries(criteria).every(([key, expected]) => {
+      if (expected && typeof expected === 'object' && typeof expected.type === 'string' && expected.value instanceof Date) {
+        const actual = row[key] instanceof Date ? row[key].getTime() : new Date(row[key]).getTime();
+        const bound = expected.value.getTime();
+        if (expected.type === 'moreThanOrEqual') return actual >= bound;
+        if (expected.type === 'lessThan') return actual < bound;
+        throw new Error(`unsupported operator ${expected.type}`);
+      }
+      return row[key] === expected;
+    });
+  return {
+    findOne: jest.fn(async ({ where }: { where: Record<string, any> }) => rows.find((r) => matches(r, where)) ?? null),
+    update: jest.fn(async (criteria: Record<string, any>, patch: Record<string, any>) => {
+      const hit = rows.filter((r) => matches(r, criteria));
+      for (const r of hit) Object.assign(r, patch);
+      return { affected: hit.length };
+    }),
+  };
+}
+
+describe('ConfirmationStore', () => {
+  let repo: { save: jest.Mock; create: jest.Mock; update: jest.Mock; findOne: jest.Mock };
+  let store: ConfirmationStore;
+
+  beforeEach(() => {
+    repo = {
+      save: jest.fn().mockResolvedValue({ id: 1 }),
+      create: jest.fn((input: unknown) => input),
+      update: jest.fn().mockResolvedValue({ affected: 1 }),
+      findOne: jest.fn(),
+    };
+    store = new ConfirmationStore(repo as any, 1000);
+  });
+
+  it('§确认生命周期 绑定：状态集 / 决策集 / 双窗口默认 TTL == 冻结语料（v2）', () => {
+    const vec = JSON.parse(
+      readFileSync(resolve(__dirname, '../../../specs/protocol/confirmation-lifecycle-v2-vector.json'), 'utf8'),
+    ) as { states: string[]; outcomes: string[]; defaultTtlSeconds: number; defaultOfflineTtlSeconds: number };
+    expect(Object.values(CONFIRMATION_STATUS).sort()).toEqual([...vec.states].sort());
+    expect(Object.values(CONFIRMATION_OUTCOME).sort()).toEqual([...vec.outcomes].sort());
+    expect(CONFIRMATION_DEFAULT_TTL_MS).toBe(vec.defaultTtlSeconds * 1000);
+    // v2 的第二个窗口：对话内等待（上）结束后，行继续保持 pending 到离线窗口到期
+    expect(CONFIRMATION_DEFAULT_OFFLINE_TTL_MS).toBe(vec.defaultOfflineTtlSeconds * 1000);
+  });
+
+  it('should resolve approve for the owning user', async () => {
+    const { token, decision } = await store.create('1', 'create_event', { title: 'T' });
+
+    expect(await store.resolve(token, '1', 'approve')).toBe(true);
+    await expect(decision).resolves.toMatchObject({ outcome: 'approve' });
+    expect(store.pendingCount).toBe(0);
+    // 落库：create 写 pending，resolve 更新 approved
+    expect(repo.create).toHaveBeenCalledWith(
+      expect.objectContaining({ riskLevel: 'R3', status: 'pending', operatorId: '1' }),
+    );
+    expect(repo.update).toHaveBeenCalledWith(
+      { token, operatorId: '1', status: 'pending' },
+      expect.objectContaining({ status: 'approved' }),
+    );
+  });
+
+  it('AUTHZ-1: create 把签发时的目的地记进确认行（audience 绑定）', async () => {
+    await store.create('1', 'create_invoice', { amount: 1 }, 1000, 'conv-1', 'legacy-erp');
+
+    expect(repo.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toolName: 'create_invoice',
+        conversationId: 'conv-1',
+        audience: 'legacy-erp',
+      }),
+    );
+  });
+
+  it('AUTHZ-1: 未给目的地时不留空串——列保持缺席（历史行/run 行的口径）', async () => {
+    await store.create('1', 'create_event', { title: 'T' });
+
+    expect(repo.create.mock.calls[0][0]).not.toHaveProperty('audience');
+  });
+
+  it('CONF-3: create 把**下发的那份**呈现文案的渲染哈希与代次记进行', async () => {
+    const summary = {
+      key: 'ai.present.write.createEvent',
+      fallback: 'Create event: 评审 (10:00 – 11:00)',
+      params: { title: '评审', startTime: '10:00', endTime: '11:00' },
+    };
+    await store.create('1', 'create_event', { title: '评审' }, 1000, 'conv-1', 'legacy-erp', summary);
+
+    const row = repo.create.mock.calls[0][0] as Record<string, unknown>;
+    expect(row.renderVersion).toBe(CONFIRMATION_RENDER_VERSION);
+    expect(row.renderHash).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('CONF-3: 未提供下发文案的调用不猜——渲染凭据缺席而非伪造', async () => {
+    await store.create('1', 'create_event', { title: 'T' });
+
+    expect(repo.create.mock.calls[0][0]).toMatchObject({ renderHash: null, renderVersion: null });
+  });
+
+  it('CONF-3: createRun 用批内逐条摘要生成 run 的渲染哈希', async () => {
+    await store.createRun(
+      '1',
+      [
+        { toolName: 'create_event', args: { title: 'A' }, summary: { key: 'k', fallback: 'A' }, riskLevel: 'R3' },
+        { toolName: 'create_todo', args: { title: 'B' }, summary: { key: 'k', fallback: 'B' }, riskLevel: 'R3' },
+      ],
+      'R3',
+    );
+
+    const row = repo.create.mock.calls[0][0] as Record<string, unknown>;
+    expect(row.renderVersion).toBe(CONFIRMATION_RENDER_VERSION);
+    expect(row.renderHash).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('CONF-1 可观测性：每次「询问」各记一次、按工具名分；run 只算一次（tool="run"）', async () => {
+    const inc = jest.fn();
+    const metered = new ConfirmationStore(repo as any, 1000, undefined, {
+      toolConfirmationsTotal: { inc },
+    } as any);
+
+    await metered.create('1', 'create_event', { title: 'T' });
+    await metered.create('1', 'create_event', { title: 'T2' });
+    await metered.createRun(
+      '1',
+      [
+        { toolName: 'create_todo', args: { title: 'A' }, summary: { key: 'k', fallback: 'A' }, riskLevel: 'R3' },
+        { toolName: 'create_event', args: { title: 'B' }, summary: { key: 'k', fallback: 'B' }, riskLevel: 'R3' },
+      ],
+      'R3',
+    );
+
+    // 同一工具被问了两次 ⇒ 两次读数（窗口内的重复次数由 Prometheus 侧 `sum by (tool)` 得到）；
+    // 那次 run 覆盖两个动作，但**只算一次询问** —— 按动作数记会把疲劳放大成假读数。
+    expect(inc.mock.calls.map((c) => c[0].tool)).toEqual(['create_event', 'create_event', 'run']);
+  });
+
+  it('CONF-1 可观测性：metrics 缺席（单测直接 new）时不抛、确认流照常', async () => {
+    await expect(store.create('1', 'create_event', { title: 'T' })).resolves.toHaveProperty('token');
+  });
+
+  it('should resolve decline for the owning user', async () => {
+    const { token, decision } = await store.create('1', 'create_event', { title: 'T' });
+
+    expect(await store.resolve(token, '1', 'decline')).toBe(true);
+    await expect(decision).resolves.toMatchObject({ outcome: 'decline' });
+  });
+
+  it('legacy reject 归一为 decline（CE-1 B3b 决策词统一兼容别名）', async () => {
+    const { token, decision } = await store.create('1', 'create_event', { title: 'T' });
+
+    expect(await store.resolve(token, '1', 'reject')).toBe(true);
+    await expect(decision).resolves.toMatchObject({ outcome: 'decline' });
+    expect(repo.update).toHaveBeenCalledWith(
+      { token, operatorId: '1', status: 'pending' },
+      expect.objectContaining({ status: 'declined' }),
+    );
+  });
+
+  it('落库携带 conversationId（docs/run-level-approval.spec.md §2.4：重启后按会话可查可裁决）', async () => {
+    await store.create('1', 'create_event', { title: 'T' }, undefined, 'conv-single');
+    expect(repo.create).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: 'single', conversationId: 'conv-single' }),
+    );
+
+    repo.create.mockClear();
+    await store.createRun(
+      '1',
+      [{ toolName: 'create_event', args: {}, summary: { key: 'ai.present.write.generic', fallback: 's' }, riskLevel: 'R3' }],
+      'R3',
+      undefined,
+      'conv-run',
+    );
+    expect(repo.create).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: 'run', conversationId: 'conv-run' }),
+    );
+  });
+
+  it('should reject a different user (cross-user attempt)', async () => {
+    const { token, decision } = await store.create('1', 'create_event', { title: 'T' });
+
+    expect(await store.resolve(token, '2', 'approve')).toBe(false);
+    // 原 pending 未被消费，仍可被本人确认
+    expect(await store.resolve(token, '1', 'approve')).toBe(true);
+    await expect(decision).resolves.toMatchObject({ outcome: 'approve' });
+  });
+
+  it('should reject an unknown token', async () => {
+    expect(await store.resolve('nope', '1', 'approve')).toBe(false);
+  });
+
+  // 回归：落库失败曾「照常 resolve 放行执行」→ 行仍 pending 而工具已执行 → 再裁决即二次执行
+  // （外部 MCP 写工具无幂等键，那第二次是真重放）。现在与 decideOutOfBand 同口径 fail-closed。
+  it('落库失败 → fail-closed：不放行、不消费内存等待（可重试）', async () => {
+    const { token } = await store.create('1', 'create_event', { title: 'T' });
+    repo.update.mockRejectedValueOnce(new Error('db down'));
+
+    expect(await store.resolve(token, '1', 'approve')).toBe(false);
+    // 内存等待未被消费 —— 没拿到「已落库」的证据就不放行
+    expect(store.pendingCount).toBe(1);
+    expect(repo.update).toHaveBeenCalledTimes(1);
+
+    // 收尾：DB 恢复后同一次等待仍可正常裁决（一次抖动不该让确认永久卡死）
+    expect(await store.resolve(token, '1', 'approve')).toBe(true);
+    expect(store.pendingCount).toBe(0);
+  });
+
+  it('等待窗口到期：只结束对话内等待，**不**改 DB（v2 两个窗口——行仍 pending 等离线窗口）', async () => {
+    store = new ConfirmationStore(repo as any, 20);
+    const { token, decision } = await store.create('1', 'create_event', { title: 'T' });
+    expect(store.pendingCount).toBe(1);
+
+    await expect(decision).resolves.toMatchObject({ outcome: 'timeout' });
+    expect(store.pendingCount).toBe(0);
+    // 内存等待已结束 → 对话内不能再裁决
+    expect(await store.resolve(token, '1', 'approve')).toBe(false);
+    // 但**不动 DB**：行保持 pending，供离线窗口内经 Action Center 裁决（v2 的核心变更；
+    // 转 timeout 的职责移交给 expireStale 定时任务）
+    expect(repo.update).not.toHaveBeenCalled();
+  });
+
+  describe('GA 离线裁决（confirmation-lifecycle v2：via out_of_band）', () => {
+    it('本人离线 approve：条件更新命中 → ok；**不**替对话内等待 resolve（防二次执行）', async () => {
+      const { token, decision } = await store.create('1', 'create_event', { title: 'T' });
+      repo.findOne.mockResolvedValue({ token, operatorId: '1', status: 'pending' });
+
+      const res = await store.decideOutOfBand(token, '1', 'approve');
+
+      expect(res).toMatchObject({ ok: true, status: 'approved' });
+      expect(repo.update).toHaveBeenCalledWith(
+        // CONF-7：窗口与 pending 同在一个条件里
+        expect.objectContaining({ token, operatorId: '1', status: 'pending', createdAt: expect.anything() }),
+        expect.objectContaining({ status: 'approved' }),
+      );
+      // 对话内的等待仍挂着（不被替它 resolve）——否则对话流会再执行一次
+      expect(store.pendingCount).toBe(1);
+      // 对话里此时再点：条件更新未命中 → false，不二次执行
+      repo.update.mockResolvedValueOnce({ affected: 0 });
+      expect(await store.resolve(token, '1', 'approve')).toBe(false);
+      void decision; // 该等待由「对话内等待窗口」定时器负责收尾（store 构造时给了 1000ms）
+    });
+
+    it('幂等：行已非 pending（重复点击 / 与对话内裁决并发）→ already_decided，绝不再次执行', async () => {
+      repo.findOne.mockResolvedValue({ token: 'x'.repeat(8), operatorId: '1', status: 'approved' });
+      repo.update.mockResolvedValue({ affected: 0 });
+
+      const res = await store.decideOutOfBand('x'.repeat(8), '1', 'approve');
+
+      expect(res).toMatchObject({ ok: false, reason: 'already_decided', status: 'approved' });
+    });
+
+    it('越权：他人 token → not_found（与不存在同形，不泄露存在性）且不改状态', async () => {
+      repo.findOne.mockResolvedValue({ token: 'y'.repeat(8), operatorId: '2', status: 'pending' });
+
+      const res = await store.decideOutOfBand('y'.repeat(8), '1', 'approve');
+
+      expect(res).toMatchObject({ ok: false, reason: 'not_found' });
+      expect(repo.update).not.toHaveBeenCalled();
+    });
+
+    it('legacy reject 归一为 decline：离线拒绝同样落 declined', async () => {
+      const { token } = await store.create('1', 'create_event', { title: 'T' });
+      repo.findOne.mockResolvedValue({ token, operatorId: '1', status: 'pending' });
+
+      const res = await store.decideOutOfBand(token, '1', 'reject');
+
+      expect(res).toMatchObject({ ok: true, status: 'declined' });
+    });
+
+    it('对话内等待已过期（内存无该 token）时仍可离线裁决——那正是「离线」的意义', async () => {
+      repo.findOne.mockResolvedValue({ token: 'z'.repeat(8), operatorId: '1', status: 'pending' });
+
+      const res = await store.decideOutOfBand('z'.repeat(8), '1', 'approve');
+
+      expect(res).toMatchObject({ ok: true, status: 'approved' });
+    });
+  });
+
+  describe('CONF-7 离线窗口进入仲裁条件', () => {
+    const NOW = 1_700_000_100_000;
+    let clock: jest.SpyInstance;
+
+    beforeEach(() => {
+      clock = jest.spyOn(Date, 'now').mockReturnValue(NOW);
+    });
+
+    afterEach(() => {
+      clock.mockRestore();
+    });
+
+    it('过了截止时刻（清扫还没跑）：裁决被拒、行仍 pending——窗口在条件更新里，不是先读再判', async () => {
+      const token = 'late-1';
+      const rows = [
+        {
+          token,
+          operatorId: '1',
+          status: CONFIRMATION_STATUS.PENDING,
+          // Just 1ms before the cutoff ⇒ outside the closed interval.
+          // 早 1ms 于截止时刻 ⇒ 闭区间之外
+          createdAt: new Date(NOW - CONFIRMATION_DEFAULT_OFFLINE_TTL_MS - 1),
+          decidedAt: undefined,
+        },
+      ];
+      const memory = inMemoryRepo(rows);
+      const lateStore = new ConfirmationStore(memory as never, 1000);
+
+      const res = await lateStore.decideOutOfBand(token, '1', 'approve');
+
+      // Same shape as "already non-pending"; the row is not touched at all.
+      // 与「已非 pending」同形；行一个字节都不动
+      expect(res).toMatchObject({ ok: false, reason: 'already_decided', status: 'pending' });
+      expect(rows[0].status).toBe(CONFIRMATION_STATUS.PENDING);
+      expect(rows[0].decidedAt).toBeUndefined();
+      // The condition really carries the window (reverse proof: drop the time condition ⇒ the
+      // two assertions above turn red).
+      // 条件确实带上了窗口（反向可证：删掉时间条件 ⇒ 上面两条变红）
+      const [criteria] = memory.update.mock.calls[0];
+      expect(criteria.createdAt).toBeDefined();
+      expect(criteria.createdAt.value.getTime()).toBe(
+        offlineWindowCutoff(CONFIRMATION_DEFAULT_OFFLINE_TTL_MS, NOW).getTime(),
+      );
+    });
+
+    it('恰好等于截止时刻：裁决放行、清扫不扫——与读侧闭区间同口径', async () => {
+      const token = 'edge-1';
+      const atCutoff = new Date(NOW - CONFIRMATION_DEFAULT_OFFLINE_TTL_MS);
+      const rows = [
+        { token, operatorId: '1', status: CONFIRMATION_STATUS.PENDING, createdAt: atCutoff },
+        {
+          token: 'just-out',
+          operatorId: '1',
+          status: CONFIRMATION_STATUS.PENDING,
+          createdAt: new Date(atCutoff.getTime() - 1),
+        },
+      ];
+      const memory = inMemoryRepo(rows);
+      const edgeStore = new ConfirmationStore(memory as never, 1000);
+
+      // Decision: exactly at the cutoff still counts as in-window (>=).
+      // 裁决：恰好在截止时刻仍算窗口内（>=）
+      await expect(edgeStore.decideOutOfBand(token, '1', 'approve')).resolves.toMatchObject({
+        ok: true,
+        status: 'approved',
+      });
+      // Sweep: the row at that instant is not matched by `< cutoff` (only the 1ms-earlier row is).
+      // 清扫：那一刻的行不被 `< cutoff` 命中（只有早 1ms 的那条被扫）
+      await expect(edgeStore.expireStale(CONFIRMATION_DEFAULT_OFFLINE_TTL_MS)).resolves.toBe(1);
+      expect(rows[0].status).toBe(CONFIRMATION_STATUS.APPROVED);
+      expect(rows[1].status).toBe(CONFIRMATION_STATUS.TIMEOUT);
+    });
+
+    it('两条裁决入口竞争同一条行：只有一方命中（唯一的仲裁点仍是条件更新）', async () => {
+      const token = 'race-1';
+      const rows = [
+        {
+          token,
+          operatorId: '1',
+          status: CONFIRMATION_STATUS.PENDING,
+          createdAt: new Date(NOW - 60_000),
+        },
+      ];
+      const memory = inMemoryRepo(rows);
+      const raceStore = new ConfirmationStore(memory as never, 1000);
+
+      const [a, b] = await Promise.all([
+        raceStore.decideOutOfBand(token, '1', 'approve'),
+        raceStore.decideOutOfBand(token, '1', 'decline'),
+      ]);
+
+      expect([a.ok, b.ok].filter(Boolean)).toHaveLength(1);
+      expect(rows[0].status).toBe(a.ok ? CONFIRMATION_STATUS.APPROVED : CONFIRMATION_STATUS.DECLINED);
+    });
+  });
+
+  it('expireStale：把超离线窗口的 pending 行转 timeout，返回受影响行数', async () => {
+    repo.update.mockResolvedValue({ affected: 3 });
+
+    const n = await store.expireStale(60_000);
+
+    expect(n).toBe(3);
+    const [criteria, patch] = repo.update.mock.calls[0];
+    expect(criteria).toMatchObject({ status: 'pending' });
+    expect(patch).toMatchObject({ status: 'timeout' });
+  });
+
+  it('离线窗口判据单源：清扫用的 cutoff 就是共享函数的 cutoff（两处不可能各算一份）', async () => {
+    // 原先读取路径在内存里自算 cutoff、清扫任务在 SQL 里另算一份，只靠一句注释维持一致。
+    // 现两处都走 offlineWindowCutoff：本断言把清扫传进 SQL 的那个时刻钉到共享实现上。
+    const now = 1_700_000_000_000;
+    const spy = jest.spyOn(Date, 'now').mockReturnValue(now);
+    try {
+      await store.expireStale(60_000);
+      const [criteria] = repo.update.mock.calls[0];
+      const cutoff = (criteria as { createdAt: { value: Date } }).createdAt.value;
+      expect(cutoff.getTime()).toBe(offlineWindowCutoff(60_000, now).getTime());
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('离线窗口边界：谓词「>= 保留」与清扫「< 清扫」互补（同一行不会既显示可裁决又已超时）', () => {
+    const ttl = CONFIRMATION_DEFAULT_OFFLINE_TTL_MS;
+    const now = 1_700_000_000_000;
+    const cutoff = offlineWindowCutoff(ttl, now).getTime();
+
+    expect(isWithinOfflineWindow(new Date(cutoff), ttl, now)).toBe(true); // 恰好到期仍算在内
+    expect(isWithinOfflineWindow(new Date(cutoff - 1), ttl, now)).toBe(false); // 早 1ms 已在窗外
+    expect(isWithinOfflineWindow(undefined, ttl, now)).toBe(false); // 缺 createdAt → 不在窗口内
+  });
+
+  // KB-5 run-level approval（docs/run-level-approval.spec.md §2.4）
+  it('createRun：落库 kind=run + run_items 快照 + runRisk，一次授权放行整批', async () => {
+    const items = [
+      { toolName: 'create_event', args: { title: 'A' }, summary: { key: 'ai.present.write.createEvent', fallback: 'A' }, riskLevel: 'R3' },
+      { toolName: 'create_todo', args: { title: 'B' }, summary: { key: 'ai.present.write.createTodo', fallback: 'B' }, riskLevel: 'R3' },
+    ];
+    const { token, decision } = await store.createRun('1', items, 'R3');
+
+    expect(repo.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        token,
+        toolName: 'run',
+        kind: 'run',
+        riskLevel: 'R3',
+        runItems: JSON.stringify(items),
+        status: 'pending',
+        operatorId: '1',
+      }),
+    );
+    // 一次 resolve（run token）→ decision 放行整批
+    expect(await store.resolve(token, '1', 'approve')).toBe(true);
+    await expect(decision).resolves.toMatchObject({ outcome: 'approve' });
+    expect(store.pendingCount).toBe(0);
+  });
+
+  it('createRun：拒绝整批（decline）', async () => {
+    const items = [
+      { toolName: 'create_event', args: { title: 'A' }, summary: { key: 'ai.present.write.createEvent', fallback: 'A' }, riskLevel: 'R3' },
+      { toolName: 'create_todo', args: { title: 'B' }, summary: { key: 'ai.present.write.createTodo', fallback: 'B' }, riskLevel: 'R3' },
+    ];
+    const { token, decision } = await store.createRun('1', items, 'R3');
+    expect(await store.resolve(token, '1', 'reject')).toBe(true);
+    await expect(decision).resolves.toMatchObject({ outcome: 'decline' });
+  });
+});

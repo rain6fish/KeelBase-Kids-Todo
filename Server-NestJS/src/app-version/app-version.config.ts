@@ -1,0 +1,111 @@
+// SPDX-License-Identifier: Apache-2.0
+
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+/**
+ * 运行时版本：**单一真源 = package.json**（发版 bump 只需改包版本，不需再"五处同步"）。
+ *
+ * 历史（2026-09-11 修）：`latestVersion` 曾手写在下方常量里、靠发版时的人工纪律同步——1.0.7 / 1.0.8
+ * 两次 bump 均漏更新此处，于是 `GET /app/version`（PL-5 更新决策）、管理台「应用版本」行、AI 评测
+ * 与系统 AI 上下文全部对外显示 **1.0.6**（落后两个已发布版本）。改为读 package.json 后结构上不可能再漂
+ * （`src/app-version/` 与 `dist/app-version/` 到包根的相对深度一致，同一路径两种运行方式都成立）。
+ */
+function readPackageVersion(): string {
+  try {
+    const pkg = JSON.parse(readFileSync(join(__dirname, '../../package.json'), 'utf8')) as {
+      version?: string;
+    };
+    return pkg.version ?? '0.0.0';
+  } catch {
+    return '0.0.0';
+  }
+}
+
+/** Current product version — the **single read point**. The release notes below are keyed by it too,
+ *  so the two can never disagree by reading the manifest twice.
+ *  当前产品版本 —— **唯一读取点**；下面的更新要点也按它索引，两处不会因各读一次而漂。 */
+const PRODUCT_VERSION = readPackageVersion();
+
+/**
+ * Release notes keyed by version — the "what's new" the upgrade prompt shows the user.
+ *
+ * **Why keyed by version**: this used to be a flat array replaced by hand at release time. Both the
+ * 1.0.10 and 1.0.11 releases forgot to replace it, so the upgrade prompt kept advertising **1.0.9**
+ * features — the same shape of accident as the `latestVersion` one above, only this time the stale
+ * part was the prose. With a map, a version that has no entry yields an **empty list** (an honest
+ * "no notes"), and an old version's notes can never be presented as the current release's. A unit
+ * test pins "the current product version has an entry", so bumping the version without writing notes
+ * turns red immediately (see `app-version.service.spec.ts`).
+ *
+ * Only versions still in service are kept: older notes live in `CHANGELOG.md` (the authoritative
+ * history), and unreachable data is dead weight here.
+ *
+ * 按版本索引的对外更新要点（PL-5 升级提示里给用户看的「这版有什么」）。
+ *
+ * **为什么按版本索引**：原先是**一个平铺数组**、靠发版时人工替换 —— 1.0.10 与 1.0.11 两次发版都忘了，
+ * 于是升级提示一直在讲 **1.0.9** 的功能（与上面 `latestVersion` 那起事故同型，只是漏的是文案）。
+ * 改成 map 后：当前版本没有条目 → 返回**空列表**（诚实地「没有要点」），**绝不会把旧版要点当新版展示**。
+ * 配套单测卡住「产品版本在 map 里没有条目」，bump 了版本却没写要点会立刻变红。
+ *
+ * 只保留**当前仍在服务**的版本；更早的要点由 `CHANGELOG.md` 承载（权威历史），此处不留不可达的旧数据。
+ */
+const RELEASE_NOTES: Record<string, readonly string[]> = {
+  '1.3.0': [
+    '审计行与写占位双向挂链，并给出可达性读数：哪些审计行查得到它的那次写入，查不到的有多少',
+    '解释面指向真正放行的那次授权，重试后的写入不再把前一次的批准人报成这一次的',
+    '被扣下的 MCP 调用留下可裁决的凭据；没发生的调用不再被记成失败，参数单独成一列',
+    '读数仪器：七类动作的审计/生命周期读数一条命令复跑，每夜在 CI 里跑、只告警',
+    '审计读者按字段白名单与组织/期间范围取行，操作审计页进入其导航',
+    '契约钉到 v1.16.0；管理台新增首次信任配置向导与 AI 执行轨迹图',
+  ],
+  '1.2.0': [
+    '授权成为可见的面：能力清单、决策依据、数据权限边界视图',
+    '一次 AI 动作一条时间线、一个状态；审计行带上结局',
+    '拒绝自带「为什么 + 下一步」，按请求语言本地化',
+    '第一份从业务规格端到端交付的模块（asset_loans）',
+    '生成模块带生成的前端与受范围约束的身份守卫',
+    'S3 对象改为私有，取用走有时效的 presigned URL',
+  ],
+  '1.1.0': [
+    '撤销更诚实：动作只完成了一部分时不再说「已完成」；卡住的补偿可被人认领，并记下是谁认领的',
+    '写入台账：每次写入先认领一次，可指回它自己那行审计与是谁授权了它',
+    '确认执行轴：批准了但没跑成的动作，在控制台可见、可重试',
+    '协议扩充：字段可以是小数、可以引用另一个模块、可以声明为个人数据；模块附件独立成表',
+    '移动端界面文案全面双语（工具名、页面弹层、兜底标题等）',
+    '更快：nginx 启用 brotli、CanvasKit 的 wasm 压缩、中文字体改为 woff2 子集',
+  ],
+  '1.0.11': [
+    '业务级补偿：确认卡说明「将动到什么、事后能不能收回」，一个业务动作的多表副作用可一次补偿',
+    '访客标识：共用同一账号的演示访客，在审计轨迹上也能区分',
+    '审计行可下钻到它来自的那次对话（先给结构，正文须再显式请求）',
+    '证据包支持国密 SM2 签名，且不使旧包失效',
+    'AI 异常行为基线：对异常行为告警但不阻断',
+    '「等我处理」中心：待确认的写操作可在对话之外裁决',
+  ],
+  '1.0.10': [
+    '通用数据范围 + 角色数据范围配置化（改配置即生效）',
+    '审计归因层：真实客户端 IP 与入口来源可追溯',
+    '证据交付物：离线自包含 HTML 报告（单动作 / 期间 / 人读决策说明）',
+    'wire 契约收口：CASL 决策、审计查询行、数据范围、MCP 投影等入契约',
+  ],
+};
+
+/**
+ * 应用版本元数据。
+ * `latestVersion` 自动取自 package.json（不可手写）；`changelog` 按当前版本自动取（不可手写）；
+ * 需强制升级时提升 minRequiredVersion。
+ */
+export const APP_VERSION = {
+  latestVersion: PRODUCT_VERSION,
+  minRequiredVersion: '1.0.0',
+  updateUrl: 'https://example.com/download',
+  changelog: RELEASE_NOTES[PRODUCT_VERSION] ?? [],
+};
+
+export type AppVersionInfo = {
+  latestVersion: string;
+  minRequiredVersion: string;
+  updateUrl: string;
+  changelog: readonly string[];
+};
