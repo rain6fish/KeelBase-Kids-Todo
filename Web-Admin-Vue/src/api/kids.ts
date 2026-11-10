@@ -10,6 +10,7 @@ export interface KidsTask {
   status: string
   taskDate: string
   approvalStatus: string
+  repeatRule?: string
   assigneeId?: number | null
   familyId?: number | null
   userId?: number | null

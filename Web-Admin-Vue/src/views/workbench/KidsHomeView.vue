@@ -91,6 +91,11 @@
         <el-form-item label="日期">
           <el-date-picker v-model="editForm.taskDate" type="date" value-format="YYYY-MM-DD" style="width: 100%" />
         </el-form-item>
+        <el-form-item label="重复">
+          <el-select v-model="editForm.repeatRule" style="width: 100%">
+            <el-option v-for="r in repeatOptions" :key="r.value" :label="r.label" :value="r.value" />
+          </el-select>
+        </el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="editOpen = false">取消</el-button>
@@ -117,6 +122,11 @@
         </el-form-item>
         <el-form-item label="日期">
           <el-date-picker v-model="form.taskDate" type="date" value-format="YYYY-MM-DD" style="width: 100%" />
+        </el-form-item>
+        <el-form-item label="重复">
+          <el-select v-model="form.repeatRule" style="width: 100%">
+            <el-option v-for="r in repeatOptions" :key="r.value" :label="r.label" :value="r.value" />
+          </el-select>
         </el-form-item>
         <el-form-item label="预计分钟">
           <el-input-number v-model="form.estimatedMinutes" :min="5" :max="480" />
@@ -160,11 +170,18 @@ const selectedDate = ref(todayLocal.value)
 const cardTitle = computed(() =>
   selectedDate.value === todayLocal.value ? '今日任务' : `${selectedDate.value} 任务`,
 )
+const repeatOptions = [
+  { label: '不重复', value: 'none' },
+  { label: '每天', value: 'daily' },
+  { label: '每周', value: 'weekly' },
+  { label: '每月', value: 'monthly' },
+]
 const form = reactive({
   title: '',
   priority: 'medium',
   assigneeId: undefined as number | undefined,
   taskDate: selectedDate.value,
+  repeatRule: 'none',
   estimatedMinutes: 20,
 })
 const editForm = reactive({
@@ -173,6 +190,7 @@ const editForm = reactive({
   priority: 'medium',
   assigneeId: undefined as number | undefined,
   taskDate: selectedDate.value,
+  repeatRule: 'none',
 })
 const children = computed(() => members.value.filter((m) => m.familyRole === 'child'))
 
@@ -232,6 +250,7 @@ function openCreate() {
   form.priority = 'medium'
   form.assigneeId = children.value[0]?.id
   form.taskDate = selectedDate.value
+  form.repeatRule = 'none'
   form.estimatedMinutes = 20
   createOpen.value = true
 }
@@ -249,7 +268,7 @@ async function submitCreate() {
       status: 'todo',
       taskDate: form.taskDate,
       estimatedMinutes: form.estimatedMinutes,
-      repeatRule: 'none',
+      repeatRule: form.repeatRule,
       approvalStatus: 'none',
       assigneeId: form.assigneeId,
       sortOrder: 0,
@@ -271,6 +290,7 @@ function openEdit(row: KidsTask) {
   editForm.priority = row.priority
   editForm.assigneeId = row.assigneeId ?? undefined
   editForm.taskDate = (row.taskDate ?? todayLocal.value).slice(0, 10)
+  editForm.repeatRule = row.repeatRule ?? 'none'
   editOpen.value = true
 }
 
@@ -289,6 +309,7 @@ async function submitEdit() {
       priority: editForm.priority,
       assigneeId: editForm.assigneeId,
       taskDate: editForm.taskDate,
+      repeatRule: editForm.repeatRule,
       version: row.version,
     })
     editOpen.value = false
