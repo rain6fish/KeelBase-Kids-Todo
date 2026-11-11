@@ -54,16 +54,16 @@
         <el-button circle @click="toggleRail">
           <AppIcon :icon="rail ? 'mdi-menu-open' : 'mdi-menu'" />
         </el-button>
-        <el-breadcrumb separator="/" class="flex-grow-1">
+        <el-breadcrumb separator="/" class="flex-grow-1" style="min-width: 0; overflow: hidden">
           <el-breadcrumb-item v-for="b in breadcrumbs" :key="b.title">{{ b.title }}</el-breadcrumb-item>
         </el-breadcrumb>
         <!-- AI 助手：管理员=系统助手，普通用户=本人数据作用域助手（抽屉内按角色分流） -->
-        <el-button class="ai-btn" @click="aiDrawerOpen = true">
+        <el-button class="ai-btn topbar-optional" @click="aiDrawerOpen = true">
           <template #icon><AppIcon icon="mdi-robot-happy-outline" size="18" /></template>
           AI
         </el-button>
-        <ThemeSwitcher />
-        <LangToggle />
+        <span class="topbar-optional"><ThemeSwitcher /></span>
+        <span class="topbar-optional"><LangToggle /></span>
         <el-dropdown trigger="click" @command="onUserCommand">
           <span class="d-flex align-center ga-1 user-menu" tabindex="0">
             <el-avatar :size="26" class="admin-avatar">{{ (auth.user?.username || 'U')[0].toUpperCase() }}</el-avatar>
@@ -98,7 +98,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
@@ -118,11 +118,17 @@ const auth = useAuthStore()
 const caps = useCapabilitiesStore()
 caps.load()
 
-const rail = ref(false)
+// 窄屏（手机）默认收起侧栏：240px 固定宽度会把内容区挤到只剩一百多像素
+const rail = ref(window.innerWidth < 900)
 const aiDrawerOpen = ref(false)
 function toggleRail() {
   rail.value = !rail.value
 }
+function onResize() {
+  if (window.innerWidth < 900) rail.value = true
+}
+onMounted(() => window.addEventListener('resize', onResize))
+onUnmounted(() => window.removeEventListener('resize', onResize))
 
 // 菜单滚动条：浏览器原生（拖动灵敏丝滑），滑块平时隐藏，鼠标滑过/滚动时显示 1.6s 后隐藏
 const adminNavRef = ref<HTMLElement | null>(null)
@@ -369,6 +375,16 @@ const activeGroup = computed(
   /* 与内容区同底色（浅灰），一体；不压阴影 */
   background: var(--el-bg-color-page);
   box-shadow: none;
+  overflow: hidden;
+}
+/* 窄屏（手机）：顶栏隐藏次要控件，用户名只留头像 */
+@media (max-width: 900px) {
+  .topbar-optional {
+    display: none;
+  }
+  .user-menu .text-body-2 {
+    display: none;
+  }
 }
 /* 登录名左侧头像 */
 .admin-avatar {

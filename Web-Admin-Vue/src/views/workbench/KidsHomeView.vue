@@ -20,8 +20,8 @@
 
     <el-card class="mt-4" shadow="never">
       <template #header>
-        <div class="d-flex align-center justify-space-between">
-          <div class="d-flex align-center" style="gap: 12px">
+        <div class="d-flex align-center justify-space-between flex-wrap" style="gap: 12px">
+          <div class="d-flex align-center flex-wrap" style="gap: 12px; min-width: 0">
             <span class="text-h6">{{ cardTitle }}</span>
             <el-date-picker
               v-model="selectedDate"
@@ -29,7 +29,7 @@
               value-format="YYYY-MM-DD"
               :clearable="false"
               :editable="false"
-              style="width: 150px"
+              style="width: 150px; flex: 0 0 auto"
               @change="load"
             />
             <el-button v-if="selectedDate !== todayLocal" size="small" text @click="goToday">回到今天</el-button>
