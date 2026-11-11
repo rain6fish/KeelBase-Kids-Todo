@@ -152,8 +152,8 @@ Flutter App                    Backend
    Android: configure WXEntryActivity in AndroidManifest
 
 ```env
-WECHAT_APP_ID=wx1234567890abcdef
-WECHAT_APP_SECRET=abcdef1234567890abcdef1234567890
+WECHAT_APP_ID=wx_your_app_id
+WECHAT_APP_SECRET=your-app-secret
 ```
 
 ### 支付宝配置 / Alipay Configuration
@@ -333,7 +333,7 @@ Complete the following steps one by one before formal integration testing. Once 
 | # | 步骤 / Step | 操作位置 / Location | 完成 / Done |
 |---|------|----------|------|
 | 3.4 | 打开 `ios/Runner.xcworkspace` / Open `ios/Runner.xcworkspace` | Xcode | ☐ |
-| 3.5 | 微信：在 `Info.plist` 添加 `CFBundleURLTypes`，URL Schemes 填入 `wx{AppID}`（如 `wx1234567890abcdef`） / WeChat: add `CFBundleURLTypes` in `Info.plist`, fill URL Schemes with `wx{AppID}` (e.g. `wx1234567890abcdef`) | `ios/Runner/Info.plist` | ☐ |
+| 3.5 | 微信：在 `Info.plist` 添加 `CFBundleURLTypes`，URL Schemes 填入 `wx{AppID}`（如 `wx_your_app_id`） / WeChat: add `CFBundleURLTypes` in `Info.plist`, fill URL Schemes with `wx{AppID}` (e.g. `wx_your_app_id`) | `ios/Runner/Info.plist` | ☐ |
 | 3.7 | 微信：在 `Info.plist` 添加 `LSApplicationQueriesSchemes` 包含 `weixin` 和 `weixinULAPI` / WeChat: add `LSApplicationQueriesSchemes` in `Info.plist` containing `weixin` and `weixinULAPI` | `ios/Runner/Info.plist` | ☐ |
 | 3.8 | Apple Sign-In：Target → Signing & Capabilities → "+" → "Sign In with Apple" / Apple Sign-In: Target → Signing & Capabilities → "+" → "Sign In with Apple" | Xcode | ☐ |
 | 3.9 | Google Sign-In：下载 `GoogleService-Info.plist` 拖入 Runner target，并添加 `CFBundleURLTypes`（REVERSED_CLIENT_ID） / Google Sign-In: download `GoogleService-Info.plist`, drag it into the Runner target, and add `CFBundleURLTypes` (REVERSED_CLIENT_ID) | Xcode | ☐ |
@@ -348,7 +348,7 @@ Sample `Info.plist` snippet (WeChat URL Scheme):
   <dict>
     <key>CFBundleURLSchemes</key>
     <array>
-      <string>wx1234567890abcdef</string>
+      <string>wx_your_app_id</string>
     </array>
   </dict>
 </array>
