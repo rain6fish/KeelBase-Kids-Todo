@@ -40,6 +40,17 @@
   <div id="flutter-loader" style="display:flex;justify-content:center;align-items:center;height:100vh;">
     <div style="font-family:sans-serif;font-size:18px;color:#888;">Loading...</div>
   </div>
+  <script>
+    // Android WebView: 引擎残留的输入框若仍聚焦，每次触摸页面都会重新弹出输入法。
+    // 点在输入框以外时先 blur 掉它；点在输入框本身（e.target 为它）时不处理。
+    document.addEventListener('pointerdown', function (e) {
+      var el = document.activeElement;
+      if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') &&
+          e.target !== el && !el.contains(e.target)) {
+        el.blur();
+      }
+    }, true);
+  </script>
   <script src="flutter_bootstrap.js" async></script>
 </body>
 </html>
