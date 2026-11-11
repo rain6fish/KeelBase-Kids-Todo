@@ -112,6 +112,7 @@ class _LoginPageState extends State<LoginPage> {
 
     if (!mounted) return;
     if (ok) {
+      FocusManager.instance.primaryFocus?.unfocus();
       AppToast.success(context, l10n.loginSuccess);
     } else {
       if (auth.cooldownRemaining == 0) {
@@ -213,6 +214,7 @@ class _LoginPageState extends State<LoginPage> {
       child: CupertinoTextField(
         controller: ctrl,
         focusNode: focusNode,
+        onTapOutside: (_) => focusNode.unfocus(),
         placeholder: placeholder,
         placeholderStyle: TextStyle(fontSize: 16, color: CupertinoColors.systemGrey.resolveFrom(context)),
         style: TextStyle(fontSize: 16, color: t.textTheme.textStyle.color),

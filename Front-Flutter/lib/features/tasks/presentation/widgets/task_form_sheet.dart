@@ -483,6 +483,7 @@ class _TaskFormSheetState extends State<TaskFormSheet> {
       ),
       child: CupertinoTextField(
         controller: controller,
+        onTapOutside: (_) => FocusManager.instance.primaryFocus?.unfocus(),
         placeholder: hint,
         maxLines: maxLines,
         keyboardType: keyboardType,

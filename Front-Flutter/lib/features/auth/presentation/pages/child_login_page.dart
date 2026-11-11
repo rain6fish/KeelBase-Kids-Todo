@@ -51,6 +51,7 @@ class _ChildLoginPageState extends State<ChildLoginPage> {
     );
     if (!mounted) return;
     if (ok) {
+      FocusManager.instance.primaryFocus?.unfocus();
       AppToast.success(context, l10n.loginSuccess);
     } else {
       AppToast.error(context, auth.error ?? l10n.unknownError);
@@ -72,6 +73,7 @@ class _ChildLoginPageState extends State<ChildLoginPage> {
       ),
       child: CupertinoTextField(
         controller: controller,
+        onTapOutside: (_) => FocusManager.instance.primaryFocus?.unfocus(),
         placeholder: placeholder,
         obscureText: obscure,
         keyboardType: keyboardType,

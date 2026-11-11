@@ -647,6 +647,9 @@ class _TaskDetailPageState extends State<TaskDetailPage> {
                         Expanded(
                           child: CupertinoTextField(
                             controller: _inputCtrl,
+                            onTapOutside: (_) => FocusManager
+                                .instance.primaryFocus
+                                ?.unfocus(),
                             placeholder: l10n.taskNoteHint,
                             padding: const EdgeInsets.symmetric(
                                 horizontal: 14, vertical: 10),

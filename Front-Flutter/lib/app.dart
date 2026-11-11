@@ -72,6 +72,21 @@ class _AppState extends State<App> {
     }
   }
 
+  /// 点在任何输入框之外时主动失焦：Flutter Web 在 Android WebView 里若残留一个
+  /// 聚焦的输入框，之后每次触摸页面都会把输入法重新拉起。这里按焦点框位置判断，
+  /// 点在当前输入框内保持焦点，点其它地方（按钮/空白）先失焦。
+  void _dismissKeyboardIfOutsideField(PointerDownEvent event) {
+    final focus = FocusManager.instance.primaryFocus;
+    if (focus == null || !focus.hasFocus) return;
+    final box = focus.context?.findRenderObject();
+    if (box is RenderBox && box.hasSize) {
+      if ((Offset.zero & box.size).contains(box.globalToLocal(event.position))) {
+        return;
+      }
+    }
+    focus.unfocus();
+  }
+
   @override
   Widget build(BuildContext context) {
     final themeProvider = context.watch<ThemeProvider>();
@@ -94,20 +109,23 @@ class _AppState extends State<App> {
             View.of(context).platformDispatcher.platformBrightness ==
                 Brightness.dark);
 
-    return CupertinoApp.router(
-      title: 'KeelBase',
-      debugShowCheckedModeBanner: false,
-      theme: isDark ? AppTheme.darkTheme : AppTheme.lightTheme,
-      routerConfig: _router!,
-      locale: localeProvider.locale,
-      supportedLocales: const [
-        Locale('en', 'US'),
-        Locale('zh', 'CN'),
-      ],
-      localizationsDelegates: [
-        AppLocalizations.delegate,
-        GlobalCupertinoLocalizations.delegate,
-      ],
+    return Listener(
+      onPointerDown: _dismissKeyboardIfOutsideField,
+      child: CupertinoApp.router(
+        title: 'KeelBase',
+        debugShowCheckedModeBanner: false,
+        theme: isDark ? AppTheme.darkTheme : AppTheme.lightTheme,
+        routerConfig: _router!,
+        locale: localeProvider.locale,
+        supportedLocales: const [
+          Locale('en', 'US'),
+          Locale('zh', 'CN'),
+        ],
+        localizationsDelegates: [
+          AppLocalizations.delegate,
+          GlobalCupertinoLocalizations.delegate,
+        ],
+      ),
     );
   }
 }
